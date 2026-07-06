@@ -31,6 +31,28 @@ hx connect          # approve this device (browser flow) + start the mirror
 source of truth for where to upload) and brings up the background mirror via
 launchd (macOS) or systemd (Linux).
 
+## Install from sources
+
+Prefer to build the binary yourself instead of downloading a prebuilt one? Clone
+the repo and run the from-source entrypoint — it reaches the same connected,
+mirroring `hx` as the one-line installer above, compiling locally instead of
+downloading:
+
+```sh
+git clone https://github.com/let-ai-oss/hx && cd hx
+./scripts/install-from-source.sh <gateway-url>
+```
+
+`<gateway-url>` is your workbench's hx gateway (e.g.
+`https://<your-workbench>/_api/hx-gateway`), shown next to the one-line installer
+in your workbench. The script requires [Bun](https://bun.sh) (it prints the
+install one-liner and stops if Bun is missing — it never auto-installs it),
+then: `bun install` → `bun run build` → installs `./dist/hx` to `~/.let/bin/hx`
+(ad-hoc code-signing it on macOS), seeds the gateway into `~/.let/hx/config.json`,
+and hands off to the same interactive `hx connect` device flow (browser approval
++ background mirror). `bun run install:connect <gateway-url>` runs the same
+entrypoint.
+
 ## Commands
 
 ```sh
