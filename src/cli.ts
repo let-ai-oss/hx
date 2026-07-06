@@ -705,7 +705,7 @@ async function cmdUpdate(): Promise<void> {
   }
   // Echo the now-installed version as the last line. This process is still the
   // old binary, so prefer the remote version we resolved over its own constant.
-  log(`hx version: ${r.remoteVersion ?? r.localVersion}.0.0`);
+  log(`hx version: ${r.remoteVersion ?? r.localVersion}`);
 }
 
 async function cmdUninstall(): Promise<void> {
