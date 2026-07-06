@@ -1,8 +1,21 @@
 # hx
 
-Laptop daemon (binary: `hx`) that watches local `~/.claude/projects/*.jsonl` and
-`~/.codex/sessions/**/*.jsonl` session files and ships changes to a session
-gateway. Per-user, per-device.
+Per-device background daemon (binary: `hx`) that watches local
+`~/.claude/projects/*.jsonl` and `~/.codex/sessions/**/*.jsonl` session files
+and ships changes to a session gateway. Per-user, per-device: one connection per
+machine.
+
+## Platforms
+
+The background service runs on **macOS** (per-user LaunchAgent, via launchd) and
+**Linux** (systemd user unit) — laptop, desktop, or server alike.
+
+Prebuilt binaries ship for four targets: `darwin-arm64`, `darwin-x64`,
+`linux-arm64`, `linux-x64` (x64 builds use Bun's `baseline` target for broad CPU
+compatibility).
+
+Windows has no daemon mode; `hx connect` and `hx start` are unavailable there.
+Foreground `hx watch` still runs on any platform Bun supports.
 
 ## Install
 
