@@ -9,9 +9,9 @@
 //   • the ccdSessionId ("local_<uuid>") ↔ cliSessionId (jsonl id) mapping,
 //     which is the key CCD's custom-group assignments reference
 //
-// This mirrors ~/work/glancer/server/ccd.mjs (trimmed to the fields hx-client
-// needs). macOS-only paths; on other platforms / when CCD isn't installed the
-// directory is absent and every reader degrades to an empty result.
+// Trimmed to the fields hx needs. macOS-only paths; on other platforms / when
+// CCD isn't installed the directory is absent and every reader degrades to an
+// empty result.
 
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -25,7 +25,7 @@ const CCD_DIR = path.join(
 export interface CcdSessionMeta {
   /** CCD's internal id, "local_<uuid>". */
   ccdSessionId: string;
-  /** The jsonl/CLI session id — matches hx-client's `sessionId`. */
+  /** The jsonl/CLI session id — matches hx's `sessionId`. */
   cliSessionId: string | null;
   title: string | null;
   /** CCD's provenance: "user" (renamed) | "ai" (generated). */

@@ -58,7 +58,7 @@ describe("resolveRoute", () => {
     else assert.fail("expected the cached fortress-direct route");
   });
 
-  // MC-2382: with fortress-direct retired, the cloud answers "cloud" and the
+  // With fortress-direct retired, the cloud answers "cloud" and the
   // client uploads through workbench (which relays to the fortress over the
   // tunnel). A subsequent call serves the cached cloud route without re-fetching.
   it("returns cloud when the cloud answers cloud, and caches it", async () => {

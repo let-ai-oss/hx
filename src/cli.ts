@@ -197,8 +197,8 @@ async function cmdConnect(): Promise<void> {
   // deliberate switch, so fall through and overwrite.
   //
   // Report the GATEWAY's device name, not the locally cached one: the approve
-  // page lets the user (re)name the device ("Mac (denis)") while the local
-  // cache keeps the hostname-derived default ("denbook10.local (denster)"),
+  // page lets the user (re)name the device ("Mac (alex)") while the local
+  // cache keeps the hostname-derived default ("host.local (alex)"),
   // so echoing the cache sent users hunting the Devices page for a row that
   // doesn't exist — or matches a stale duplicate they just disconnected. The
   // fresh name is written back so later messages agree with the Devices page.

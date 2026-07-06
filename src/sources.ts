@@ -1,7 +1,6 @@
 // Source-path discovery + family classification.
 //
-// Mirrors the watch surface used by `~/work/glancer` (we deliberately pick
-// the same set of paths so coverage is identical):
+// A deliberately fixed watch surface — the exact set of paths hx mirrors:
 //
 //   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
 //     → Claude Code Desktop OR Claude Code CLI; family is decided by the
@@ -14,8 +13,7 @@
 //   ~/.codex/archived_sessions/...   (same shape, included if recent)
 //
 // We intentionally do not scrape `~/.claude/sessions/*.json` (the live PID
-// tracker used by glancer's UI) — it's transient liveness state, not the
-// transcript itself.
+// tracker) — it's transient liveness state, not the transcript itself.
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";

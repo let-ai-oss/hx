@@ -3,7 +3,7 @@
 // CCD persists its custom groups in a Zustand slice inside Chromium Local
 // Storage. We scan the leveldb .log/.ldb files raw for the value bytes — far
 // cheaper than a real leveldb client and it sidesteps Chromium's custom
-// comparator. This mirrors ~/work/glancer/server/ccd-prefs.mjs.
+// comparator.
 //
 // The slice was historically keyed `dframe-store`; newer CCD builds renamed it
 // to `frame-store` (the grouping config moved with it, while a vestigial

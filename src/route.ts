@@ -1,4 +1,4 @@
-// Per-repo upload route discovery (MC-2289). Before uploading a session's
+// Per-repo upload route discovery. Before uploading a session's
 // chunk, hx asks the cloud where that repo's sessions should land:
 //   • { mode: "cloud" }            → upload through the cloud gateway (default)
 //   • { mode: "fortress-direct" }  → upload straight to the org's Fortress with

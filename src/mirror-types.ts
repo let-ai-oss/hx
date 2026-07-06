@@ -1,7 +1,6 @@
-// Shape of the CCD sidebar group mirror the daemon uploads. Kept in hx-client
-// (not imported from the app DB) so the daemon has no app-side dependency; the
-// gateway's zod schema + Drizzle jsonb type (apps/workbench/.../hx-gateway.ts:
-// HxCcdGroupMirrorBlob) must stay in sync with this.
+// Shape of the CCD sidebar group mirror the daemon uploads. Defined here (not
+// imported from the server) so the daemon has no server-side dependency; the
+// gateway's own schema for this blob must stay in sync with this.
 
 export interface HxCcdGroup {
   /** CCD's group id (e.g. "cg-<uuid>"). */

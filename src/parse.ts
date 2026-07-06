@@ -1,4 +1,4 @@
-// Light-weight tail parser. We don't need glancer's full summary on each
+// Light-weight tail parser. We don't need a full summary on each
 // commit — just enough metadata to keep the gateway's sessions index
 // useful for display:
 //   - eventCount, userTextCount, assistantCount

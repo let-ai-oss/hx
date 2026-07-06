@@ -1,10 +1,9 @@
 // mtime-poll watcher.
 //
-// Mirrors glancer's strategy: poll the candidate directories at ~1.5s
-// intervals, walk the cache of per-file mtimes, and trigger an upload when
-// (mtime, size) move. fs.watch + chokidar were considered and rejected for
-// the same reasons as glancer — too many directories, FD pressure under
-// `~/.claude/projects/<encoded-path>/...`.
+// Strategy: poll the candidate directories at ~1.5s intervals, walk the cache
+// of per-file mtimes, and trigger an upload when (mtime, size) move. fs.watch +
+// chokidar were considered and rejected — too many directories, FD pressure
+// under `~/.claude/projects/<encoded-path>/...`.
 //
 // Per-file upload pipeline:
 //   1. read bytes from `state.offset → EOF`
@@ -276,7 +275,7 @@ async function ingestOne(
 
   // Discover where this repo's sessions upload. A fortress-direct route swaps the
   // base URL + bearer to the org's own Fortress gateway; everything else stays on
-  // the cloud. MC-2289 non-goal: NO cloud fallback — if the fortress upload below
+  // the cloud. Non-goal: NO cloud fallback — if the fortress upload below
   // throws, the chunk stays queued (offset unadvanced) and retries against the
   // Fortress next pass; it is never re-sent to the cloud.
   const route = await uploadConfigFor(cfg, head.repoSlug);
