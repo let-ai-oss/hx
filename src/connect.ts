@@ -8,7 +8,7 @@
 // Surfaced on the CLI as `hx connect` (with `hx login` as a hidden alias
 // for binaries / installers that pre-date the rename).
 
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import { writeConfig, ensureDeviceId, type HxConfig } from "./config.js";
 
@@ -37,14 +37,27 @@ type PollResponse = PollPending | PollApproved;
 
 function openBrowser(url: string): void {
   // Best-effort, fail silently — the URL is printed to the terminal regardless.
+  //
+  // `url` is verificationUriComplete straight off the gateway response, so it
+  // is untrusted: never hand it to a shell (a value like "https://x/$(...)"
+  // would execute), and only ever open http(s). Validate the scheme, then
+  // spawn with an argv array so the URL is a single non-shell argument.
+  try {
+    const scheme = new URL(url).protocol;
+    if (scheme !== "http:" && scheme !== "https:") return;
+  } catch {
+    return;
+  }
   const platform = os.platform();
-  const cmd =
+  const [cmd, args]: [string, string[]] =
     platform === "darwin"
-      ? `open ${JSON.stringify(url)}`
+      ? ["open", [url]]
       : platform === "win32"
-        ? `start "" ${JSON.stringify(url)}`
-        : `xdg-open ${JSON.stringify(url)}`;
-  exec(cmd, () => {});
+        ? ["explorer", [url]]
+        : ["xdg-open", [url]];
+  const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+  child.on("error", () => {});
+  child.unref();
 }
 
 // ── pairing-code card ───────────────────────────────────────────────────
