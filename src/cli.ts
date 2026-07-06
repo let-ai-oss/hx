@@ -26,7 +26,7 @@ function log(msg: string): void {
 
 // The single line `hx version` prints. Shared so `hx update` can echo it last.
 function versionLine(): string {
-  return `hx version: ${HX_VERSION}.0.0`;
+  return `hx version: ${HX_VERSION}`;
 }
 
 function flag(name: string, fallback?: string): string | undefined {
