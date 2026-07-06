@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import { planFanout } from "./fanout.js";
 import type { FileState } from "./state.js";

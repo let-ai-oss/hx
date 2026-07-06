@@ -126,20 +126,16 @@ function ldbDataBlocks(file: Buffer): Buffer[] {
   const blocks: Buffer[] = [];
   let q = 0;
   while (q < entriesEnd) {
-    let shared: number;
-    let nonShared: number;
-    let valueLen: number;
-    [shared, q] = readVarint(indexBlock, q);
-    [nonShared, q] = readVarint(indexBlock, q);
-    [valueLen, q] = readVarint(indexBlock, q);
-    q += nonShared; // skip key delta
-    const vStart = q;
-    q += valueLen;
-    let hp = vStart;
-    let dOff: number;
-    let dSize: number;
-    [dOff, hp] = readVarint(indexBlock, hp);
-    [dSize, hp] = readVarint(indexBlock, hp);
+    // Each index entry: shared-prefix len (unused here), non-shared key len,
+    // value len, then the key delta and the value (a block handle).
+    const [, qAfterShared] = readVarint(indexBlock, q);
+    const [nonShared, qAfterNonShared] = readVarint(indexBlock, qAfterShared);
+    const [valueLen, qAfterValueLen] = readVarint(indexBlock, qAfterNonShared);
+    const vStart = qAfterValueLen + nonShared; // skip key delta
+    q = vStart + valueLen;
+    // The value is a block handle: offset varint followed by size varint.
+    const [dOff, hpAfterOff] = readVarint(indexBlock, vStart);
+    const [dSize] = readVarint(indexBlock, hpAfterOff);
     try {
       blocks.push(readBlock(file, { offset: dOff, size: dSize }));
     } catch {

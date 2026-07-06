@@ -1,4 +1,4 @@
-import { describe, it, afterEach } from "node:test";
+import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
 import { requestAppendUrl } from "./uploader.js";
 import type { HxConfig } from "./config.js";
