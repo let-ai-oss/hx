@@ -7,7 +7,7 @@
 // across the boundary: its `hx update` parses "76.0.0" with parseInt → 76,
 // which is > 75, so it pulls the new binary. Keep the major >= 76 forever.
 //
-// Bumping: `bun run bump [patch|minor|major]` (default patch).
+// Bumping: edit the `version` field in package.json (stable semver X.Y.Z).
 import packageJson from "../package.json";
 
 export interface StableSemver {

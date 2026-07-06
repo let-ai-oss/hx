@@ -13,7 +13,6 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "bun test",
-    "bump": "bun run scripts/bump.ts",
     "build": "mkdir -p ./dist && bun build ./src/cli.ts --compile --outfile ./dist/hx"
   },
   "devDependencies": {
