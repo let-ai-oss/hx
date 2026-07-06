@@ -231,7 +231,7 @@ function alreadyLatest(
 async function fetchRemoteVersion(downloadBase: string): Promise<string | null> {
   try {
     const res = await fetch(`${downloadBase}/hx-version`, {
-      headers: { "User-Agent": `hx-client/${HX_VERSION}` },
+      headers: { "User-Agent": `hx/${HX_VERSION}` },
       redirect: "follow",
     });
     if (!res.ok) return null;
@@ -269,7 +269,7 @@ function detectTarget(): string {
 
 async function fetchBytes(url: string): Promise<Buffer> {
   const res = await fetch(url, {
-    headers: { "User-Agent": `hx-client/${HX_VERSION}` },
+    headers: { "User-Agent": `hx/${HX_VERSION}` },
     redirect: "follow",
   });
   if (!res.ok) {
@@ -292,7 +292,7 @@ async function fetchBytesWithProgress(
   onChunk: (received: number, total: number) => void,
 ): Promise<Buffer> {
   const res = await fetch(url, {
-    headers: { "User-Agent": `hx-client/${HX_VERSION}` },
+    headers: { "User-Agent": `hx/${HX_VERSION}` },
     redirect: "follow",
   });
   if (!res.ok) {

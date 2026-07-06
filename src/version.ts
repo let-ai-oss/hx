@@ -1,12 +1,6 @@
 // The one source of truth for "which build of hx is this" is the package
 // version (semver X.Y.Z). `hx version` prints it as "hx version: <X.Y.Z>".
 //
-// History: hx used to version with a monotonic integer (last integer: 75,
-// displayed as "75.0.0"). The first semver release is 76.0.0 — major seeded
-// from that integer + 1 — so a client still running the integer build updates
-// across the boundary: its `hx update` parses "76.0.0" with parseInt → 76,
-// which is > 75, so it pulls the new binary. Keep the major >= 76 forever.
-//
 // Bumping: edit the `version` field in package.json (stable semver X.Y.Z).
 import packageJson from "../package.json";
 

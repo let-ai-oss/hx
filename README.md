@@ -93,13 +93,8 @@ of truth in [`src/version.ts`](src/version.ts) (read from `package.json`).
 Bump the `version` field in [`package.json`](package.json) whenever a change is
 something an hx user could observe — a new or changed command, upload/daemon
 behavior, a fixed bug. `release.yml` publishes whatever version is committed on
-`main`.
-
-The major version stays `>= 76`: hx previously versioned with a monotonic
-integer (last integer: 75), and `hx update` compares the remote version with
-`parseInt`, so the first semver `76.0.0` reads as `76 > 75` for any client
-still on the old scheme — they update across the boundary with no reinstall.
-Keep the major at 76 unless a real breaking change warrants bumping it.
+`main`, and `hx update` pulls it when the remote semver is newer than the
+running binary's.
 
 ## Releases
 

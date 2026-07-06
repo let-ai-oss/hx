@@ -133,8 +133,8 @@ export async function connect(opts: ConnectOptions): Promise<void> {
   // by a prior removal/disconnect to the token it's about to issue.
   const deviceId = await ensureDeviceId();
   // Report this machine's REAL platform so the workbench Devices page shows the
-  // actual OS — historically it was sniffed from the approving browser's
-  // userAgent, which mislabels e.g. a headless Linux VM approved from a Mac.
+  // actual OS rather than sniffing the approving browser's userAgent, which
+  // mislabels e.g. a headless Linux VM approved from a Mac.
   const codeRes = await fetch(`${opts.gatewayBaseUrl}/devices/code`, {
     method: "POST",
     headers: { "content-type": "application/json" },

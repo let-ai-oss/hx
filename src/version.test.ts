@@ -1,10 +1,8 @@
 import { test, expect } from "bun:test";
 import { HX_VERSION, parseStableSemver, compareStableSemver } from "./version.js";
 
-test("HX_VERSION is the package semver, major >= 76 (update bridge)", () => {
-  const v = parseStableSemver(HX_VERSION);
-  expect(v).not.toBeNull();
-  expect(v!.major).toBeGreaterThanOrEqual(76);
+test("HX_VERSION is a valid stable semver", () => {
+  expect(parseStableSemver(HX_VERSION)).not.toBeNull();
 });
 
 test("parseStableSemver rejects non-semver", () => {
