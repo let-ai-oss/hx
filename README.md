@@ -1,1 +1,120 @@
 # hx
+
+Per-device background daemon (binary: `hx`) that watches local
+`~/.claude/projects/*.jsonl` and `~/.codex/sessions/**/*.jsonl` session files
+and ships changes to a session gateway. Per-user, per-device: one connection per
+machine.
+
+## Platforms
+
+The background service runs on **macOS** (per-user LaunchAgent, via launchd) and
+**Linux** (systemd user unit) — laptop, desktop, or server alike.
+
+Prebuilt binaries ship for four targets: `darwin-arm64`, `darwin-x64`,
+`linux-arm64`, `linux-x64` (x64 builds use Bun's `baseline` target for broad CPU
+compatibility).
+
+Windows has no daemon mode; `hx connect` and `hx start` are unavailable there.
+Foreground `hx watch` still runs on any platform Bun supports.
+
+## Install
+
+End users install a prebuilt binary with the one-line installer their workbench
+provides:
+
+```sh
+curl -fsSL <your-workbench>/install.sh | sh
+hx connect          # approve this device (browser flow) + start the mirror
+```
+
+`hx connect` seeds the gateway URL into `~/.let/hx/config.json` (hx's single
+source of truth for where to upload) and brings up the background mirror via
+launchd (macOS) or systemd (Linux).
+
+## Commands
+
+```sh
+hx connect [--local] [--device-name NAME]   # approve device + start mirror
+hx status                                    # connection status + link quality
+hx logs                                      # tail the daemon
+hx start | stop | restart                    # background-mirror service
+hx update                                    # fetch the latest binary, restart daemon
+hx disconnect [--local]                      # forget the device token
+hx uninstall [--purge]                       # remove daemon + binary
+hx --version
+
+# Foreground (debug):
+hx watch [--local] [--once] [--only /abs/path.jsonl]
+hx tick  [--local]                           # one upload pass, exit
+```
+
+`--local` is **additive**: regular behavior is untouched, and sessions are
+*also* mirrored to a local dev gateway (`http://localhost:9000`). `hx connect
+--local` pairs the device with the dev gateway as a second connection
+(`config.local.json` — the main config is never re-pointed), then `hx watch
+--local` / `hx tick --local` upload every chunk to both gateways. The tee lane
+keeps its own offsets (`state.local.json`), so a dev stack that's down only
+stalls the local mirror, never the real one. (`hx update --local` is the one
+non-tee use: it fetches the binary *from* the dev gateway.)
+
+The daemon keeps two files in `~/.let/hx/`:
+
+- `config.json` — device token + gateway URL (mode 0600).
+- `state.json` — per-file byte offset, so a restart doesn't re-upload.
+
+## What it watches
+
+| Family | Path | Detected by |
+|---|---|---|
+| `claude-desktop` | `~/.claude/projects/<encoded-cwd>/*.jsonl` | `entrypoint: "claude-desktop"` |
+| `claude-cli` | same dir | `entrypoint: "cli" \| "claude-code-vscode"` |
+| `codex-desktop` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `session_meta.originator` contains `desktop` |
+| `codex-cli` | same | `session_meta.originator` contains `cli` (default) |
+
+Watch mechanism is mtime-polling at ~1.5s (chokidar 4 drops fsevents, and a
+recursive watch on `~/.claude/projects/<encoded-path>/` would blow the FD
+limit).
+
+## Upload pipeline
+
+For each change, the chunk between `state.offset` and EOF (trimmed at the last
+`\n` so a JSON line isn't split):
+
+1. `POST /api/sessions/append-url` → mint a V4 signed PUT URL for a staging object.
+2. `PUT <signedUrl>` — bytes go directly to object storage; never traverse the gateway.
+3. `POST /api/sessions/commit` — the gateway composes staging into the canonical object and updates the `sessions` row.
+4. Bump `state.offset`.
+
+## Develop
+
+Requires [Bun](https://bun.sh) `1.3.14`.
+
+```sh
+bun install
+bun run dev -- <subcmd>   # run from source, e.g. bun run dev -- status
+bun test                  # run the suite
+bun run typecheck
+bun run lint
+bun run build             # compile a native binary to ./dist/hx
+```
+
+## Versioning
+
+`hx version` prints `hx version: <X.Y.Z>` — a stable semver, the single source
+of truth in [`src/version.ts`](src/version.ts) (read from `package.json`).
+
+Bump the `version` field in [`package.json`](package.json) whenever a change is
+something an hx user could observe — a new or changed command, upload/daemon
+behavior, a fixed bug. `release.yml` publishes whatever version is committed on
+`main`, and `hx update` pulls it when the remote semver is newer than the
+running binary's.
+
+## Releases
+
+`hx update` never talks to GitHub directly. A workbench-side download proxy
+authenticates to GitHub with a token and streams the requested asset back, so
+laptops only ever talk to their own gateway. CI publishes:
+
+- `builds/hx-X.Y.Z` — rolling, overwritten on every push to `main`.
+- `releases/hx-X.Y.Z` — immutable, cut on manual dispatch.
+- `dev/hx-<branch>` — per-branch dev builds (manual dispatch), for local testing only.
