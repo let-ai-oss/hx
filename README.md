@@ -40,17 +40,17 @@ downloading:
 
 ```sh
 git clone https://github.com/let-ai-oss/hx && cd hx
-./scripts/install-from-source.sh <gateway-url>
+./install-from-source.sh
 ```
 
-`<gateway-url>` is your workbench's hx gateway (e.g.
-`https://<your-workbench>/_api/hx-gateway`), shown next to the one-line installer
-in your workbench. The script requires [Bun](https://bun.sh) (it prints the
-install one-liner and stops if Bun is missing — it never auto-installs it),
-then: `bun install` → `bun run build` → installs `./dist/hx` to `~/.let/bin/hx`
-(ad-hoc code-signing it on macOS), seeds the gateway into `~/.let/hx/config.json`,
-and hands off to the same interactive `hx connect` device flow (browser approval
-+ background mirror). `bun run install:connect <gateway-url>` runs the same
+The gateway URL is optional and defaults to beta (`https://beta.let.ai/_api/hx-gateway`,
+current prod). Pass your workbench's hx gateway explicitly instead (e.g.
+`./install-from-source.sh https://<your-workbench>/_api/hx-gateway`) to connect to a
+different environment. The script requires [Bun](https://bun.sh) — if it's missing it
+offers to install it for you — then: `bun install` → `bun run build` → installs
+`./dist/hx` to `~/.let/bin/hx` (ad-hoc code-signing it on macOS), seeds the gateway into
+`~/.let/hx/config.json`, and hands off to the same interactive `hx connect` device flow
+(browser approval + background mirror). `bun run install:connect` runs the same
 entrypoint.
 
 ## Commands

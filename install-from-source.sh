@@ -7,30 +7,30 @@
 # URL into ~/.let/hx/config.json and the interactive `hx connect` device flow
 # (which opens your browser) — is identical to the binary installer.
 #
-# Usage (the gateway URL comes from your workbench, same as the binary path):
+# Usage (the gateway URL is optional and defaults to beta, i.e. current prod):
 #
-#   ./scripts/install-from-source.sh <gateway-url>
+#   ./install-from-source.sh [gateway-url]
 #
 # where <gateway-url> is your workbench's hx gateway, e.g.
 # https://<your-workbench>/_api/hx-gateway.
-#
-# Prerequisite: Bun (https://bun.sh). This script does not install it for you.
 set -eu
 
 INSTALL_DIR="${HOME}/.let/bin"
 BIN="${INSTALL_DIR}/hx"
 HX_DIR="${HOME}/.let/hx"
 CONFIG="${HX_DIR}/config.json"
+DEFAULT_GATEWAY_URL="https://beta.let.ai/_api/hx-gateway"
 
 usage() {
-  echo "usage: ./scripts/install-from-source.sh <gateway-url>" >&2
+  echo "usage: ./install-from-source.sh [gateway-url]" >&2
   exit 2
 }
 
 # --- parse args --------------------------------------------------------
-# A single positional <gateway-url>. `hx connect` has no --gateway flag and no
-# env var: the gateway is read only from config.json, so we seed it below.
-GATEWAY_URL=""
+# A single optional positional <gateway-url>, defaulting to beta. `hx connect`
+# has no --gateway flag and no env var: the gateway is read only from
+# config.json, so we seed it below.
+GATEWAY_URL="$DEFAULT_GATEWAY_URL"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --)
@@ -41,28 +41,32 @@ while [ "$#" -gt 0 ]; do
       usage
       ;;
     *)
-      [ -z "$GATEWAY_URL" ] || usage
-      GATEWAY_URL="$1"
+      GATEWAY_URL="$1"   # last positional wins; default already set
       shift
       ;;
   esac
 done
 
-[ -n "$GATEWAY_URL" ] || usage
-
-# --- require Bun -------------------------------------------------------
+# --- require Bun (offer to install) -------------------------------------
 if ! command -v bun >/dev/null 2>&1; then
-  echo "hx: Bun is required to build from source but was not found." >&2
-  echo "Install it, then re-run this script:" >&2
-  echo "  curl -fsSL https://bun.sh/install | bash" >&2
-  exit 1
+  printf "Bun is required to build from source. Install Bun now? (Y/n) " >&2
+  read ans </dev/tty || ans=""
+  case "$ans" in
+    [nN]*) echo "Install Bun then re-run:  curl -fsSL https://bun.sh/install | bash" >&2; exit 1 ;;
+    *)
+      curl -fsSL https://bun.sh/install | bash
+      # The installer edits shell rc, NOT this process — add bun to PATH now.
+      export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+      export PATH="$BUN_INSTALL/bin:$PATH"
+      command -v bun >/dev/null 2>&1 || { echo "hx: Bun install failed." >&2; exit 1; }
+      ;;
+  esac
 fi
 
 # --- build -------------------------------------------------------------
 # Run from the repo root regardless of where the script was invoked from.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-cd "$REPO_ROOT"
+cd "$SCRIPT_DIR"
 
 echo "Installing dependencies…"
 bun install
@@ -72,7 +76,7 @@ bun run build
 
 # --- install -----------------------------------------------------------
 mkdir -p "$INSTALL_DIR"
-cp "$REPO_ROOT/dist/hx" "$BIN"
+cp "$SCRIPT_DIR/dist/hx" "$BIN"
 
 # Ad-hoc code signature (macOS only). `--sign -` is an ad-hoc signature — the
 # only no-cost option for a locally built binary. Without it the kernel can
