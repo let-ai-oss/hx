@@ -14,7 +14,7 @@
     "lint": "eslint .",
     "test": "bun test",
     "build": "mkdir -p ./dist && bun build ./src/cli.ts --compile --outfile ./dist/hx",
-    "install:connect": "sh scripts/install-from-source.sh"
+    "install:connect": "sh install-from-source.sh"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
