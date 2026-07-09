@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import os from "node:os";
 import { writeConfig, ensureDeviceId, type HxConfig } from "./config.js";
+import { assertSecureFetchUrl } from "./net.js";
 
 interface CodeResponse {
   deviceCode: string;
@@ -145,6 +146,9 @@ export async function connect(opts: ConnectOptions): Promise<void> {
   // Reuse this machine's stable id so the server can re-link sessions hidden
   // by a prior removal/disconnect to the token it's about to issue.
   const deviceId = await ensureDeviceId();
+  // The poll step receives the device access token from the gateway, so refuse
+  // to run the pairing handshake over cleartext to a non-loopback host.
+  assertSecureFetchUrl(opts.gatewayBaseUrl, "hx connect");
   // Report this machine's REAL platform so the workbench Devices page shows the
   // actual OS rather than sniffing the approving browser's userAgent, which
   // mislabels e.g. a headless Linux VM approved from a Mac.

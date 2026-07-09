@@ -32,7 +32,8 @@
 // is safe — the running daemon keeps its old code until we restart it.
 
 import { platform, arch } from "node:os";
-import { rename, writeFile, mkdir, chmod, unlink, readFile } from "node:fs/promises";
+import { rename, writeFile, mkdir, chmod, unlink, readFile, readdir } from "node:fs/promises";
+import { basename } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { dirname } from "node:path";
@@ -178,6 +179,11 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   }
 
   await mkdir(dirname(binPath), { recursive: true });
+  // Sweep any staging files orphaned by an earlier run that was killed between
+  // write and rename. The randomized name (below) means a crashed run can't be
+  // found by a fixed path, so clean them here as a best-effort GC — otherwise
+  // interrupted updates would accrete ~24 MB binaries next to the installed one.
+  await sweepStaleTempFiles(binPath);
   // Create the staging file EXCLUSIVELY at an unpredictable name. `flag: "wx"`
   // (O_CREAT|O_EXCL) refuses to open an existing path, so a same-uid attacker
   // can't pre-plant `hx.new` as a symlink and have us clobber its target; the
@@ -262,15 +268,32 @@ function alreadyLatest(
  */
 async function fetchRemoteVersion(downloadBase: string): Promise<string | null> {
   try {
-    const res = await fetch(`${downloadBase}/hx-version`, {
-      headers: { "User-Agent": `hx/${HX_VERSION}` },
-      redirect: "follow",
-    });
+    const res = await secureFetch(`${downloadBase}/hx-version`);
     if (!res.ok) return null;
     const raw = (await res.text()).trim();
     return parseStableSemver(raw) ? raw : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Best-effort GC of staging files (`<bin>.new.<uuid>`) left by a prior run that
+ * died between write and rename. Never throws — a failed sweep must not block an
+ * update. Only removes siblings matching the exact `<binName>.new.` prefix.
+ */
+async function sweepStaleTempFiles(binPath: string): Promise<void> {
+  try {
+    const dir = dirname(binPath);
+    const prefix = `${basename(binPath)}.new.`;
+    const entries = await readdir(dir);
+    await Promise.all(
+      entries
+        .filter((name) => name.startsWith(prefix))
+        .map((name) => unlink(`${dir}/${name}`).catch(() => {})),
+    );
+  } catch {
+    // Directory unreadable or gone — nothing to sweep.
   }
 }
 
@@ -299,11 +322,36 @@ function detectTarget(): string {
   return `${os}-${a}`;
 }
 
+/**
+ * A `fetch` that follows redirects MANUALLY so every hop is scheme-checked. The
+ * plain `redirect: "follow"` would silently chase an https gateway's 30x to an
+ * `http://` (or otherwise attacker-chosen) host — defeating the pre-request
+ * `assertSecureFetchUrl` guard, since the SHA is served from the same redirected
+ * origin. Here we assert each Location is a secure URL before following it, so
+ * the update binary and its sha can never be fetched over a downgraded hop.
+ */
+export async function secureFetch(url: string): Promise<Response> {
+  const MAX_REDIRECTS = 5;
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    assertSecureFetchUrl(current, "hx update");
+    const res = await fetch(current, {
+      headers: { "User-Agent": `hx/${HX_VERSION}` },
+      redirect: "manual",
+    });
+    // 3xx with a Location = a redirect the runtime did not follow (manual mode).
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    if (!location) return res;
+    if (hop >= MAX_REDIRECTS) {
+      throw new Error(`hx update: too many redirects fetching ${url}`);
+    }
+    // Resolve relative Locations against the current URL before re-checking.
+    current = new URL(location, current).toString();
+  }
+}
+
 async function fetchBytes(url: string): Promise<Buffer> {
-  const res = await fetch(url, {
-    headers: { "User-Agent": `hx/${HX_VERSION}` },
-    redirect: "follow",
-  });
+  const res = await secureFetch(url);
   if (!res.ok) {
     throw new Error(`GET ${url} → ${res.status} ${res.statusText}`);
   }
@@ -323,10 +371,7 @@ async function fetchBytesWithProgress(
   url: string,
   onChunk: (received: number, total: number) => void,
 ): Promise<Buffer> {
-  const res = await fetch(url, {
-    headers: { "User-Agent": `hx/${HX_VERSION}` },
-    redirect: "follow",
-  });
+  const res = await secureFetch(url);
   if (!res.ok) {
     throw new Error(`GET ${url} → ${res.status} ${res.statusText}`);
   }

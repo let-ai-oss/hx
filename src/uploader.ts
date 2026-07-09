@@ -86,6 +86,12 @@ async function throwHttp(res: Response, label: string): Promise<never> {
 }
 
 function authHeaders(cfg: HxConfig): Record<string, string> {
+  // Chokepoint for every token-bearing gateway POST in this module: the device
+  // bearer token must never leave over cleartext. Assert the configured gateway
+  // is https (loopback http excepted) here so a downgraded/hand-edited
+  // `cfg.gatewayBaseUrl` fails closed before the token is put on the wire,
+  // matching the guard resolveRoute already applies to the same URL.
+  assertSecureFetchUrl(cfg.gatewayBaseUrl, "gateway request");
   return {
     authorization: `Bearer ${cfg.accessToken}`,
     "content-type": "application/json",

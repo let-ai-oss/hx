@@ -19,6 +19,7 @@ import { ProgressBar } from "./progress.js";
 import { runUninstall } from "./uninstall.js";
 import { HX_VERSION } from "./version.js";
 import { unlink } from "node:fs/promises";
+import { assertSecureFetchUrl } from "./net.js";
 
 function log(msg: string): void {
   process.stdout.write(`${msg}\n`);
@@ -351,6 +352,8 @@ type WhoamiResult = WhoamiOk | { ok: false; unauthorized: boolean };
 // an undrained response keeps the event loop alive (the same trap that hung
 // `hx disconnect`). The .json() success path drains too.
 async function fetchWhoami(cfg: HxConfig): Promise<WhoamiResult> {
+  // Never send the bearer token to a cleartext gateway (loopback excepted).
+  assertSecureFetchUrl(cfg.gatewayBaseUrl, "hx whoami");
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), WHOAMI_TIMEOUT_MS);
   try {
@@ -536,6 +539,10 @@ async function cmdDisconnect(): Promise<void> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), DISCONNECT_TIMEOUT_MS);
     try {
+      // Best-effort notify, but never over cleartext — a throw here is caught
+      // and we still clear local state below, so the token isn't leaked to an
+      // http gateway just to announce a disconnect.
+      assertSecureFetchUrl(cfg.gatewayBaseUrl, "hx disconnect");
       const res = await fetch(`${cfg.gatewayBaseUrl}/devices/disconnect`, {
         method: "POST",
         headers: { authorization: `Bearer ${cfg.accessToken}` },
@@ -575,6 +582,8 @@ async function cmdDisconnectLocal(): Promise<void> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DISCONNECT_TIMEOUT_MS);
   try {
+    // Best-effort notify, but never leak the token over cleartext (loopback ok).
+    assertSecureFetchUrl(cfg.gatewayBaseUrl, "hx disconnect");
     const res = await fetch(`${cfg.gatewayBaseUrl}/devices/disconnect`, {
       method: "POST",
       headers: { authorization: `Bearer ${cfg.accessToken}` },
