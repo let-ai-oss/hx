@@ -10,6 +10,20 @@
 // authenticates to GitHub with a PAT and streams the asset back. So
 // `hx update` just talks to its own gateway, no auth needed.
 //
+// ── Update trust boundary (read before touching the fetch/verify path) ──────
+// What the client trusts today: (1) the transport — every update URL must be
+// https (`assertSecureFetchUrl`), the only exception being the loopback
+// `--local` dev gateway; and (2) the gateway's honesty — we fetch the binary
+// and its SHA-256 from the SAME download proxy, so the sha proves integrity in
+// transit (no truncation/bit-flip) but NOT provenance: a gateway that is
+// compromised or successfully impersonated can serve attacker bytes together
+// with a matching sha, and this client would install them and run them as the
+// user. There is currently NO publisher signature over the release verified
+// against a key pinned in the client. Closing that gap (e.g. cosign/sigstore or
+// an Ed25519 signature over the asset, checked against a compiled-in public key
+// before write) is the remaining hardening for the self-update path; until it
+// lands, gateway trust + TLS is the whole trust chain. See SECURITY.md.
+//
 // Atomic swap rationale: on POSIX, `rename(2)` on the same filesystem
 // replaces the destination inode in one operation. A process already
 // executing the old binary keeps its open file descriptor on the old
@@ -19,11 +33,12 @@
 
 import { platform, arch } from "node:os";
 import { rename, writeFile, mkdir, chmod, unlink, readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { dirname } from "node:path";
 import { getDaemonOps, type DaemonOps, type DaemonState } from "./daemon.js";
 import { HX_VERSION, parseStableSemver, compareStableSemver } from "./version.js";
+import { assertSecureFetchUrl } from "./net.js";
 
 /**
  * A single progress tick emitted while `hx update` fetches + unpacks the new
@@ -101,6 +116,13 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   const onProgress = opts.onProgress ?? noopProgress;
   const downloadBase = `${opts.gatewayBaseUrl.replace(/\/+$/, "")}/download`;
 
+  // Refuse to fetch the self-update binary over a downgraded transport. The
+  // update path is the highest-value target (attacker bytes here run as the
+  // user), so the SHA guard below is not enough on its own — a gateway that can
+  // serve the binary can serve a matching sha too. Require https before any
+  // update fetch (http allowed only for the loopback `--local` dev gateway).
+  assertSecureFetchUrl(downloadBase, "hx update");
+
   const target = detectTarget();
   const asset = `hx-${target}`;
   const localVersion = HX_VERSION; // string, e.g. "76.0.0"
@@ -156,12 +178,22 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   }
 
   await mkdir(dirname(binPath), { recursive: true });
-  const tmpPath = `${binPath}.new`;
-  await writeFile(tmpPath, binBytes);
-  await chmod(tmpPath, 0o755);
+  // Create the staging file EXCLUSIVELY at an unpredictable name. `flag: "wx"`
+  // (O_CREAT|O_EXCL) refuses to open an existing path, so a same-uid attacker
+  // can't pre-plant `hx.new` as a symlink and have us clobber its target; the
+  // random suffix removes the predictable-path race entirely. Mode 0o755 so the
+  // swapped-in binary is executable. Clean up the temp file if the swap fails.
+  const tmpPath = `${binPath}.new.${randomUUID()}`;
+  await writeFile(tmpPath, binBytes, { flag: "wx", mode: 0o755 });
+  await chmod(tmpPath, 0o755); // belt-and-suspenders: normalize past any umask.
 
   // Atomic on same fs — no half-written binary even on power loss.
-  await rename(tmpPath, binPath);
+  try {
+    await rename(tmpPath, binPath);
+  } catch (err) {
+    await unlink(tmpPath).catch(() => {});
+    throw err;
+  }
   log(`installed → ${binPath}`);
 
   // Restart the daemon iff it was loaded. We don't auto-load if the user had
