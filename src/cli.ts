@@ -12,13 +12,14 @@ import {
 } from "./config.js";
 import { connect } from "./connect.js";
 import { backfillArtifacts, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
-import { getDaemonOps, tailLogs } from "./daemon.js";
+import { getDaemonOps, tailLogs, type DaemonOps, type DaemonState } from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
 import { ProgressBar } from "./progress.js";
 import { runUninstall } from "./uninstall.js";
 import { HX_VERSION } from "./version.js";
 import { unlink } from "node:fs/promises";
+import { createInterface } from "node:readline/promises";
 import { assertSecureFetchUrl } from "./net.js";
 
 function log(msg: string): void {
@@ -133,21 +134,58 @@ async function ensureLocalConfig(): Promise<HxConfig> {
 //
 // Failures here don't fail connect itself: the device is approved, so we surface
 // a (re)start failure as a note and tell them how to recover.
+// Ask before editing the user's shell dotfiles (the container shell-hook
+// backend). Returns "granted" without prompting when the backend doesn't touch
+// dotfiles, or they're already wired; declines silently when there's no TTY to
+// ask on (so a piped/non-interactive run never edits files behind the user's
+// back).
+async function resolveDotfileConsent(ops: DaemonOps): Promise<"granted" | "denied"> {
+  if (!ops.needsDotfileConsent) return "granted";
+  if (ops.dotfilesWired?.()) return "granted";
+  // Non-interactive opt-in, for scripted container setup: `hx start --yes`.
+  if (hasFlag("yes") || process.argv.includes("-y")) return "granted";
+  if (!process.stdin.isTTY) return "denied";
+  log("");
+  log("To keep running after this container restarts, hx adds one line to");
+  log("~/.bashrc and ~/.profile so it relaunches whenever a bash shell starts.");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const ans = (await rl.question("Allow hx to edit those files? [Y/n] ")).trim().toLowerCase();
+    return ans === "" || ans === "y" || ans === "yes" ? "granted" : "denied";
+  } finally {
+    rl.close();
+  }
+}
+
+// Success line after a (re)start, plus — for the container backend when the user
+// declined the dotfile edit — how to make it survive a restart.
+function reportStarted(ops: DaemonOps, ds: DaemonState, consent: "granted" | "denied"): void {
+  const pidStr = ds.pid ? `, pid ${ds.pid}` : "";
+  log(`hx started (${ops.managerName}${pidStr}).`);
+  if (ops.needsDotfileConsent && consent === "denied") {
+    log("");
+    log("hx is running now, but WON'T restart with the container. To persist it,");
+    log("add this line to ~/.bashrc and ~/.profile:");
+    log(`  [ -f "$HOME/.let/hx/bootstrap.sh" ] && . "$HOME/.let/hx/bootstrap.sh"`);
+    log("or re-run `hx start` and allow the edit.");
+  }
+}
+
 async function autoStartDaemon(
   gatewayBaseUrl: string,
   opts: { tokenRefreshed?: boolean } = {},
 ): Promise<void> {
-  const installOpts = { binPath: process.execPath, hxGatewayUrl: gatewayBaseUrl };
+  const binPath = process.execPath;
   try {
     const ops = getDaemonOps();
     const before = await ops.state();
     if (!before.loaded) {
       // First connect (or after `hx stop`): install + start. The fresh daemon
       // re-reads config and runs an immediate catch-up pass on its own.
-      await ops.install(installOpts);
+      const dotfileConsent = await resolveDotfileConsent(ops);
+      await ops.install({ binPath, dotfileConsent });
       const after = await ops.state();
-      const pidStr = after.pid ? `, pid ${after.pid}` : "";
-      log(`hx started (${ops.managerName}${pidStr}).`);
+      reportStarted(ops, after, dotfileConsent);
       log(`  status: hx status   logs: hx logs   stop: hx stop`);
       return;
     }
@@ -157,7 +195,8 @@ async function autoStartDaemon(
     const behind = snap ? snap.done < snap.total : false;
     const remaining = snap ? Math.max(0, snap.total - snap.done) : 0;
     if (opts.tokenRefreshed || behind) {
-      await ops.restart(installOpts);
+      const dotfileConsent = await resolveDotfileConsent(ops);
+      await ops.restart({ binPath, dotfileConsent });
       if (behind) {
         const s = remaining === 1 ? "" : "s";
         log(`hx restarted (${ops.managerName}) — resuming sync (${remaining} session${s} left).`);
@@ -608,13 +647,10 @@ async function cmdStart(): Promise<void> {
   await ensureConfig();
   const ops = getDaemonOps();
   const binPath = process.execPath;
-  await ops.install({ binPath });
+  const dotfileConsent = await resolveDotfileConsent(ops);
+  await ops.install({ binPath, dotfileConsent });
   const ds = await ops.state();
-  if (ds.pid) {
-    log(`hx started (${ops.managerName}, pid ${ds.pid}).`);
-  } else {
-    log(`hx loaded (${ops.managerName}). It will respawn on demand.`);
-  }
+  reportStarted(ops, ds, dotfileConsent);
   log(`logs:   hx logs`);
   log(`status: hx status`);
 }
@@ -635,7 +671,8 @@ async function cmdRestart(): Promise<void> {
   await ensureConfig();
   const ops = getDaemonOps();
   const binPath = process.execPath;
-  await ops.install({ binPath });
+  const dotfileConsent = await resolveDotfileConsent(ops);
+  await ops.install({ binPath, dotfileConsent });
   log(`hx restarted (${ops.managerName}).`);
 }
 

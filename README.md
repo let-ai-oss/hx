@@ -8,7 +8,9 @@ machine.
 ## Platforms
 
 The background service runs on **macOS** (per-user LaunchAgent, via launchd) and
-**Linux** (systemd user unit) — laptop, desktop, or server alike.
+**Linux** (systemd user unit) — laptop, desktop, or server alike. On Linux
+without a systemd user session (Docker and other containers), it falls back to a
+[shell-startup hook](#running-in-a-container) automatically.
 
 Prebuilt binaries ship for four targets: `darwin-arm64`, `darwin-x64`,
 `linux-arm64`, `linux-x64` (x64 builds use Bun's `baseline` target for broad CPU
@@ -16,6 +18,36 @@ compatibility).
 
 Windows has no daemon mode; `hx connect` and `hx start` are unavailable there.
 Foreground `hx watch` still runs on any platform Bun supports.
+
+## Running in a container
+
+Install as usual — no special setup. A container has no systemd user session, so
+`hx start` (and the implicit start in `hx connect`) uses a **shell-startup hook**
+instead: it writes `~/.let/hx/bootstrap.sh` and sources it from `~/.bashrc` and
+`~/.profile`, so the mirror runs in the background and **relaunches whenever the
+container starts a bash shell — including on `docker restart`**. Editing those
+files needs your consent (hx asks; answer yes), so the mirror survives a restart
+without any change to your image or entrypoint.
+
+```sh
+# interactive
+hx connect          # approves the device, asks to edit ~/.bashrc + ~/.profile
+
+# scripted / non-interactive
+hx connect --no-start
+hx start --yes      # start + wire the dotfiles without prompting
+```
+
+Notes:
+
+- The container's start command must start (or `docker exec` into) a **bash**
+  shell for the restart hook to fire — the usual case. If it never starts a
+  shell (e.g. a raw entrypoint), run `hx watch` in the foreground instead.
+- Persist `~/.let` on a volume if the container is **recreated** (not just
+  restarted), so the device token isn't lost.
+- Declining the dotfile edit (or a non-interactive run without `--yes`) still
+  starts the mirror for the current session; hx prints the one line to add
+  yourself for restart persistence.
 
 ## Install
 
