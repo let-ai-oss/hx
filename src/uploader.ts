@@ -6,6 +6,7 @@
 import type { HxConfig } from "./config.js";
 import type { Family } from "./sources.js";
 import type { HxCcdGroupMirrorBlob } from "./mirror-types.js";
+import { assertSecureFetchUrl } from "./net.js";
 
 /** One fan-out target for a chunk. `ready` carries a signed staging URL; `held`
  *  means that org's vault is offline right now — skip it this pass and retry. */
@@ -85,6 +86,12 @@ async function throwHttp(res: Response, label: string): Promise<never> {
 }
 
 function authHeaders(cfg: HxConfig): Record<string, string> {
+  // Chokepoint for every token-bearing gateway POST in this module: the device
+  // bearer token must never leave over cleartext. Assert the configured gateway
+  // is https (loopback http excepted) here so a downgraded/hand-edited
+  // `cfg.gatewayBaseUrl` fails closed before the token is put on the wire,
+  // matching the guard resolveRoute already applies to the same URL.
+  assertSecureFetchUrl(cfg.gatewayBaseUrl, "gateway request");
   return {
     authorization: `Bearer ${cfg.accessToken}`,
     "content-type": "application/json",
@@ -153,6 +160,11 @@ export async function requestAppendUrl(
 }
 
 export async function putChunk(uploadUrl: string, bytes: Buffer): Promise<void> {
+  // `uploadUrl` is a signed target the gateway just handed us (append-url
+  // response / a fan-out destination). It carries the session bytes, so refuse
+  // to PUT it over cleartext to a non-loopback host — an impersonated gateway
+  // could otherwise redirect an upload to http and exfiltrate transcripts.
+  assertSecureFetchUrl(uploadUrl, "PUT chunk");
   const res = await fetch(uploadUrl, {
     method: "PUT",
     headers: { "content-type": "application/x-ndjson" },

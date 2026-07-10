@@ -82,6 +82,46 @@ describe("resolveRoute", () => {
     assert.equal(calls, 2); // cloud routes aren't memo-short-circuited; both re-checked
   });
 
+  it("drops a fortress-direct route whose gatewayUrl is plaintext http and falls back to cloud", async () => {
+    const fetcher = (async () =>
+      jsonResponse({
+        mode: "fortress-direct",
+        gatewayUrl: "http://f.example", // downgraded — must be rejected
+        token: "t",
+        expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      })) as unknown as typeof fetch;
+    const cache = new Map<string, Route>();
+    const r = await resolveRoute({
+      repo: "acme/app",
+      gatewayBaseUrl: "https://cloud/api/hx-gateway",
+      accessToken: "dev",
+      fetcher,
+      cache,
+    });
+    assert.equal(r.mode, "cloud");
+    // and it must NOT have been cached (a later call re-resolves).
+    assert.equal(cache.has("acme/app"), false);
+  });
+
+  it("refuses to send the bearer token to a plaintext-http gateway", async () => {
+    let called = false;
+    const fetcher = (async () => {
+      called = true;
+      return jsonResponse({ mode: "cloud" });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      resolveRoute({
+        repo: "acme/app",
+        gatewayBaseUrl: "http://cloud.example/api/hx-gateway",
+        accessToken: "dev",
+        fetcher,
+        cache: new Map(),
+      }),
+      /insecure transport/,
+    );
+    assert.equal(called, false); // guarded before any fetch
+  });
+
   it("defaults to cloud when there is no cache and the cloud is unreachable", async () => {
     const fetcher = (async () => {
       throw new Error("network down");

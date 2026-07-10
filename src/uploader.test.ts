@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { requestAppendUrl } from "./uploader.js";
+import { requestAppendUrl, putChunk } from "./uploader.js";
 import type { HxConfig } from "./config.js";
 
 const realFetch = globalThis.fetch;
@@ -36,6 +36,31 @@ describe("requestAppendUrl with a fortress-direct target", () => {
     assert.equal(res.uploadUrl, "https://bucket/p");
     assert.equal(calls[0]?.url, "https://f.example/sessions/append-url");
     assert.equal(calls[0]?.auth, "Bearer captoken");
+  });
+});
+
+describe("putChunk transport guard", () => {
+  it("refuses to PUT session bytes to a plaintext-http upload URL", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+      called = true;
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      putChunk("http://bucket.example/p?sig=x", Buffer.from("secret")),
+      /insecure transport/,
+    );
+    assert.equal(called, false); // guarded before any fetch — bytes never leave
+  });
+
+  it("allows an https upload URL", async () => {
+    let seen = "";
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      seen = String(url);
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+    await putChunk("https://bucket.example/p", Buffer.from("bytes"));
+    assert.equal(seen, "https://bucket.example/p");
   });
 });
 

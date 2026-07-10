@@ -6,6 +6,8 @@
 // Discovery is OFF the hot path: results are cached per repo, and when the cloud
 // is unreachable we reuse the last good route rather than blocking an upload.
 
+import { isSecureFetchUrl, assertSecureFetchUrl } from "./net.js";
+
 export type Route =
   | { mode: "cloud" }
   | { mode: "fortress-direct"; gatewayUrl: string; token: string; expiresAt: string };
@@ -39,12 +41,22 @@ export async function resolveRoute(opts: ResolveRouteOpts): Promise<Route> {
   ) {
     return cached;
   }
+  // The route request carries the bearer token; never send it over cleartext to
+  // a non-loopback host (a downgraded/impersonated gateway URL from config).
+  assertSecureFetchUrl(gatewayBaseUrl, "route discovery");
   try {
     const res = await fetcher(`${gatewayBaseUrl}/route?repo=${encodeURIComponent(repo)}`, {
       headers: { authorization: `Bearer ${accessToken}` },
     });
     if (!res.ok) return cached ?? { mode: "cloud" };
     const route = (await res.json()) as Route;
+    // A fortress-direct route sends session bytes + a capability token straight
+    // to `route.gatewayUrl`. That URL comes from the gateway response, so treat
+    // it as untrusted: if it isn't https (loopback http excepted), drop the
+    // route and fall back to cloud rather than uploading over cleartext.
+    if (route.mode === "fortress-direct" && !isSecureFetchUrl(route.gatewayUrl)) {
+      return cached ?? { mode: "cloud" };
+    }
     cache.set(repo, route);
     return route;
   } catch {
