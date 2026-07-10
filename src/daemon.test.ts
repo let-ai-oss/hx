@@ -25,6 +25,15 @@ test("renderBootstrap emits the guarded, self-healing launcher", () => {
   expect(out).toContain("/proc/");
 });
 
+test("renderBootstrap guards the supervisor with a lifetime-held flock singleton", () => {
+  const out = renderBootstrap("/home/user/.let/bin/hx");
+  // Atomic "at most one supervisor": take an flock before writing the pidfile;
+  // bow out if another holds it. Kernel releases on death, so no stale leak.
+  expect(out).toContain("flock -n 9");
+  // Guarded so an image without flock still starts (fast-path-only fallback).
+  expect(out).toContain("if command -v flock");
+});
+
 test("renderBootstrap shell-escapes the binary path", () => {
   const evil = "/tmp/weird '; rm -rf ~; '/hx";
   const out = renderBootstrap(evil);
