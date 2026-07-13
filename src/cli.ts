@@ -11,7 +11,7 @@ import {
   type HxConfig,
 } from "./config.js";
 import { connect } from "./connect.js";
-import { backfillArtifacts, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
+import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
 import { getDaemonOps, tailLogs, type DaemonOps, type DaemonState } from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
@@ -306,15 +306,24 @@ async function cmdConnectLocal(): Promise<void> {
   }
 
   const deviceName = flag("device-name");
+  // Dev stacks don't all listen on 9000 (agent stacks boot on a different port
+  // base). --local-port swaps ONLY the loopback port — the host stays
+  // hard-coded, so this cannot become a remote-gateway hijack vector (the
+  // resolution model deliberately has no --gateway flag / env override).
+  const portFlag = flag("local-port");
+  const gatewayBaseUrl =
+    portFlag && /^\d{1,5}$/.test(portFlag)
+      ? `http://localhost:${portFlag}/workbench/_api/hx-gateway`
+      : LOCAL_GATEWAY_URL;
   await connect({
-    gatewayBaseUrl: LOCAL_GATEWAY_URL,
+    gatewayBaseUrl,
     deviceName,
     log,
     persist: writeLocalConfig,
   });
   log("");
   log(`Local tee ready: \`hx watch --local\` and \`hx tick --local\` now mirror`);
-  log(`sessions to ${LOCAL_GATEWAY_URL} in addition to the regular gateway.`);
+  log(`sessions to ${gatewayBaseUrl} in addition to the regular gateway.`);
 }
 
 // The `--local` tee's log lines carry a prefix so the two lanes' output stays
@@ -499,15 +508,41 @@ async function cmdStatus(): Promise<void> {
 
   // Catch-up progress: percentage first, then sessions, then the total size of
   // all sessions on disk.
-  const snap = await computeSyncSnapshot().catch(() => null);
+  const report = await computeSyncReport().catch(() => null);
+  const snap = report?.snapshot ?? null;
   if (snap && snap.total > 0) {
     const size = formatSize(snap.totalBytes);
     rows.push([
       "Sync",
       snap.done >= snap.total
         ? `100% — ${snap.total} session${snap.total === 1 ? "" : "s"} · ${size}`
-        : `${Math.round((snap.done / snap.total) * 100)}% — ${snap.done} / ${snap.total} sessions · ${size}`,
+        // Floor, never round: a 199/200 backlog must read 99%, not a lying
+        // "100%" next to an unfinished count.
+        : `${Math.floor((snap.done / snap.total) * 100)}% — ${snap.done} / ${snap.total} sessions · ${size}`,
     ]);
+  }
+  // Sessions the bar can no longer see: their source file vanished (or left
+  // the scan window) before the upload finished, so the server copy is
+  // permanently partial. Without this row the status silently claims 100%.
+  if (report && report.behind.length > 0) {
+    // Classify each session ONCE: a session with both a deleted path and an
+    // aged-out path counts as "deleted" (the stronger signal), never in both
+    // buckets — otherwise the two counts could sum to more than the sessions.
+    const goneSessions = new Set(
+      report.behind.filter((b) => b.sourceGone).map((b) => b.sessionId),
+    );
+    const agedSessions = new Set<string>();
+    for (const b of report.behind) {
+      if (!b.sourceGone && !goneSessions.has(b.sessionId)) agedSessions.add(b.sessionId);
+    }
+    const parts: string[] = [];
+    if (goneSessions.size > 0) {
+      parts.push(`${goneSessions.size} partial on server (local file deleted)`);
+    }
+    if (agedSessions.size > 0) {
+      parts.push(`${agedSessions.size} partial on server (last change over 30 days ago)`);
+    }
+    if (parts.length > 0) rows.push(["Sync gaps", parts.join("; ")]);
   }
   printStatusTable(rows);
 }

@@ -78,6 +78,14 @@ export class HxHttpError extends Error {
   get serverUnavailable(): boolean {
     return this.status === 429 || this.status >= 500;
   }
+
+  /** A 503 whose body names vault_offline: THIS session's vault is down while
+   *  the gateway itself is healthy. Callers should skip just this file with a
+   *  long per-file backoff instead of pausing the whole pass — other sessions
+   *  (and other stores) keep uploading. */
+  get vaultOffline(): boolean {
+    return this.status === 503 && this.message.includes("vault_offline");
+  }
 }
 
 async function throwHttp(res: Response, label: string): Promise<never> {

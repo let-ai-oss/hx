@@ -12,6 +12,7 @@
 //   4. POST commit (gateway composes into canonical)
 //   5. bump state.offset
 
+import { existsSync } from "node:fs";
 import { stat, open } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -30,11 +31,17 @@ import {
   type FileState,
   type HxState,
   type StateScope,
+  clearFileFailure,
+  clearHeal,
+  destKey,
   getArtifactHash,
   getFileState,
   loadState,
+  recordFileFailure,
   minOffset,
   offsetFor,
+  recordHeal,
+  reconcileDestinations,
   setArtifactHash,
   setOffsetFor,
   touchMtime,
@@ -83,6 +90,16 @@ const FAST_POLL_MS = 1_500;
 // pass that makes progress. Heartbeats keep their own timer, so liveness holds.
 const UPLOAD_BACKOFF_BASE_MS = 5_000;
 const UPLOAD_BACKOFF_MAX_MS = 5 * 60_000;
+// Per-FILE retry pacing (state.ts recordFileFailure doubles these per failure,
+// capped at 30 min): an ordinary per-request fault backs off from 30 s; a
+// session whose OWN vault is offline waits minutes — the vault coming back is
+// an ops event, not something polling faster will hurry.
+const FILE_RETRY_BASE_MS = 30_000;
+const VAULT_OFFLINE_RETRY_BASE_MS = 5 * 60_000;
+// How many chunk rounds ONE file may drain within a single pass (x 4 MB chunk
+// limit = up to 64 MB per destination per pass). Enough that a big backlog
+// moves at line speed, capped so one huge file can't starve the rest.
+const DRAIN_ROUNDS_PER_PASS = 16;
 // How often the daemon announces liveness when idle. Uploads already refresh
 // lastSeenAt, so a beat only fires when nothing has contacted the gateway for
 // this long — keeping idle traffic to ~1 tiny request/minute. The gateway's
@@ -225,8 +242,9 @@ function trimAtLastNewline(buf: Buffer, startOffset: number): { trimmed: Buffer;
 async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise<FileState> {
   const existing = await getFileState(file.path, scope);
   if (existing) {
-    if (existing.lastMtimeMs !== file.mtimeMs) {
+    if (existing.lastMtimeMs !== file.mtimeMs || existing.lastKnownSize !== file.size) {
       existing.lastMtimeMs = file.mtimeMs;
+      existing.lastKnownSize = file.size;
       await upsertFileState(existing, scope);
     }
     return existing;
@@ -237,6 +255,7 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
     family: head.family,
     sessionId: head.sessionId ?? path.basename(file.path, ".jsonl"),
     offsets: {},
+    lastKnownSize: file.size,
     lastMtimeMs: file.mtimeMs,
     lastUploadAtMs: 0,
   };
@@ -281,19 +300,6 @@ async function ingestOne(
   const route = await uploadConfigFor(cfg, head.repoSlug);
   const uploadCfg = route.cfg;
 
-  // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
-  // the gateway attribute + resolve the destination set; each is echoed back as
-  // its own vaultOrgId so commit replays it into the same store. A gateway that
-  // predates fan-out returns a single destination (legacy fields) and planFanout
-  // degrades to one step.
-  const append = await requestAppendUrl(uploadCfg, {
-    family: fState.family as never,
-    sessionId: fState.sessionId,
-    byteCount: st.size - baseOffset,
-    repoSlug: head.repoSlug,
-  });
-  const steps = planFanout(append, fState);
-
   // CCD session metadata (title + group id) is byte-independent — resolve once.
   const ccdByCli = await getCcdRecentsByCliId(Date.now()).catch(() => null);
   const ccdMeta = ccdByCli?.get(fState.sessionId) ?? null;
@@ -301,93 +307,167 @@ async function ingestOne(
   let anyProgress = false;
   let lastUnavailable: HxHttpError | null = null;
   let artifactText: string | null = null;
-  for (const step of steps) {
-    // Each destination uploads from its OWN committed offset — a late-joining or
-    // previously-offline vault back-fills from zero (replace) while the others
-    // append, so one store's lag never blocks another.
-    const stepOffset = offsetFor(fState, step.vaultOrgId);
-    const want = Math.min(st.size - stepOffset, opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT);
-    if (want <= 0) continue;
-    const slice = await readSlice(file.path, stepOffset, want);
-    const { trimmed, endOffset } = trimAtLastNewline(slice, stepOffset);
-    if (trimmed.length === 0) continue;
-    const text = trimmed.toString("utf8");
-    const summary = summariseChunk(text);
-    const title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
-    let titleSource: "user" | "ai" | "fallback" | undefined;
-    if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
-    else if (summary.title) titleSource = summary.titleSource ?? undefined;
+  // A destination that answered "unavailable" this pass is skipped for the
+  // rest of the pass — its offset stays put and the next pass retries it.
+  const unavailableDests = new Set<string>();
 
-    try {
-      // Upload bytes directly to this destination's store, then compose.
-      await putChunk(step.uploadUrl, trimmed);
-      const commit = await commitChunk(uploadCfg, {
-        family: fState.family as never,
-        sessionId: fState.sessionId,
-        chunkId: step.chunkId,
-        // A from-zero upload REPLACES this store's canonical instead of appending:
-        // at offset 0 anything it still holds can't be content this device hasn't
-        // sent (stale/duplicated canonical, or a freshly-joined vault). Old
-        // gateways ignore the flag and append, same result for a new session.
-        replace: step.replace,
-        vaultOrgId: step.vaultOrgId,
-        meta: {
-          sourcePath: file.path,
-          title,
-          titleSource,
-          ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
-          cwd: head.cwd,
-          gitBranch: head.gitBranch,
-          repoSlug: head.repoSlug,
-          entrypoint: head.entrypoint,
-          originator: head.originator,
-          modelProvider: head.modelProvider,
-          lastUserText: summary.lastUserText,
-          lastAssistantText: summary.lastAssistantText,
-          eventCount: summary.eventCount,
-          userTextCount: summary.userTextCount,
-          assistantCount: summary.assistantCount,
-          lastActivityAt: summary.lastActivityAt,
-        },
-      });
-      // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
-      // protocol live there): a size mismatch means the store lost the canonical
-      // mid-session; reset just this destination to zero so the next pass
-      // re-uploads it with replace. Chunks never split a line, so a healthy
-      // canonical matches endOffset byte-for-byte.
-      const diverged =
-        !route.fortress &&
-        SELF_HEAL.get(scope) === true &&
-        step.vaultOrgId === null &&
-        commit.totalBytes !== endOffset;
-      if (diverged) {
-        log(
-          `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
-        );
-        await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
-      } else {
-        await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
-      }
-      // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
-      // to the session's store, so one sync off any destination's new tail is
-      // enough — capture the first.
-      if (artifactText === null) artifactText = text;
-      anyProgress = true;
-      log(
-        `  ${path.relative(process.env.HOME ?? "", file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
+  // Drain rounds: a backlogged file uploads chunk after chunk within ONE pass
+  // (fresh signed URLs each round) instead of one chunk per 1.5 s poll — the
+  // old pacing capped any session at ~2.7 MB/s regardless of bandwidth. The
+  // per-pass cap keeps one huge file from starving the rest of the backlog;
+  // whatever is left continues next pass.
+  for (let round = 0; round < DRAIN_ROUNDS_PER_PASS; round++) {
+    // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
+    // the gateway attribute + resolve the destination set; each is echoed back as
+    // its own vaultOrgId so commit replays it into the same store. A gateway that
+    // predates fan-out returns a single destination (legacy fields) and planFanout
+    // degrades to one step.
+    const append = await requestAppendUrl(uploadCfg, {
+      family: fState.family as never,
+      sessionId: fState.sessionId,
+      byteCount: st.size - minOffset(fState),
+      repoSlug: head.repoSlug,
+    });
+
+    // The destinations array is the gateway's current truth for this session's
+    // fan-out set (ready AND held). Drop offsets for destinations that left the
+    // set entirely — a stale key pins minOffset (and the sync bar) forever.
+    // Legacy single-destination responses are left alone: an old gateway can't
+    // enumerate the set, so pruning against it could drop a live vault's offset.
+    if (append.destinations) {
+      await reconcileDestinations(
+        file.path,
+        append.destinations.map((d) => destKey(d.vaultOrgId)),
+        scope,
       );
-    } catch (err) {
-      // One destination's vault being unavailable must not stall the others — log
-      // and move on; its offset stays put so the next pass retries just it.
-      if (err instanceof HxHttpError && err.serverUnavailable) {
-        lastUnavailable = err;
-        log(
-          `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
-        );
-        continue;
-      }
-      throw err;
     }
+
+    const steps = planFanout(append, fState).filter(
+      (step) => !unavailableDests.has(destKey(step.vaultOrgId)),
+    );
+
+    let roundProgress = false;
+    for (const step of steps) {
+      // Each destination uploads from its OWN committed offset — a late-joining or
+      // previously-offline vault back-fills from zero (replace) while the others
+      // append, so one store's lag never blocks another.
+      const stepOffset = offsetFor(fState, step.vaultOrgId);
+      const want = Math.min(st.size - stepOffset, opts.chunkLimitBytes ?? DEFAULT_CHUNK_LIMIT);
+      if (want <= 0) continue;
+      const slice = await readSlice(file.path, stepOffset, want);
+      const { trimmed, endOffset } = trimAtLastNewline(slice, stepOffset);
+      if (trimmed.length === 0) continue;
+      const text = trimmed.toString("utf8");
+      const summary = summariseChunk(text);
+      const title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+      let titleSource: "user" | "ai" | "fallback" | undefined;
+      if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
+      else if (summary.title) titleSource = summary.titleSource ?? undefined;
+
+      try {
+        // Upload bytes directly to this destination's store, then compose.
+        await putChunk(step.uploadUrl, trimmed);
+        const commit = await commitChunk(uploadCfg, {
+          family: fState.family as never,
+          sessionId: fState.sessionId,
+          chunkId: step.chunkId,
+          // A from-zero upload REPLACES this store's canonical instead of appending:
+          // at offset 0 anything it still holds can't be content this device hasn't
+          // sent (stale/duplicated canonical, or a freshly-joined vault). Old
+          // gateways ignore the flag and append, same result for a new session.
+          replace: step.replace,
+          vaultOrgId: step.vaultOrgId,
+          meta: {
+            sourcePath: file.path,
+            title,
+            titleSource,
+            ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
+            cwd: head.cwd,
+            gitBranch: head.gitBranch,
+            repoSlug: head.repoSlug,
+            entrypoint: head.entrypoint,
+            originator: head.originator,
+            modelProvider: head.modelProvider,
+            lastUserText: summary.lastUserText,
+            lastAssistantText: summary.lastAssistantText,
+            eventCount: summary.eventCount,
+            userTextCount: summary.userTextCount,
+            assistantCount: summary.assistantCount,
+            lastActivityAt: summary.lastActivityAt,
+          },
+        });
+        // Per-commit divergence check (let.ai-hosted only — the audit + self-heal
+        // protocol live there): a size mismatch means the store lost the canonical
+        // mid-session; reset just this destination to zero so the next pass
+        // re-uploads it with replace. Chunks never split a line, so a healthy
+        // canonical matches endOffset byte-for-byte.
+        const diverged =
+          !route.fortress &&
+          SELF_HEAL.get(scope) === true &&
+          step.vaultOrgId === null &&
+          commit.totalBytes !== endOffset;
+        if (diverged && (fState.healPausedUntilMs ?? 0) > Date.now()) {
+          // Heal is paused (a prior streak ping-ponged) — accept our own offset
+          // so the file stops re-uploading; the periodic audit keeps reporting
+          // the divergence and healing resumes when the pause lapses.
+          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+        } else if (diverged) {
+          const streak = await recordHeal(file.path, scope);
+          log(
+            `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${commit.totalBytes}B ≠ uploaded ${endOffset}B — re-uploading from zero`,
+          );
+          if ((fState.healPausedUntilMs ?? 0) > Date.now()) {
+            log(
+              `  [heal] ${fState.sessionId.slice(0, 8)}… diverged ${streak}x in a row — pausing self-heal for this file`,
+            );
+          }
+          await setOffsetFor(file.path, step.vaultOrgId, 0, st.mtimeMs, scope);
+        } else {
+          await setOffsetFor(file.path, step.vaultOrgId, endOffset, st.mtimeMs, scope);
+          // Only a clean APPEND (stepOffset > 0) ends a heal streak. The
+          // from-zero re-upload a heal triggers is ALSO clean by construction
+          // (we resend the whole file, so totalBytes == endOffset) — clearing
+          // on it would reset the counter every heal and the ping-pong latch
+          // could never reach its threshold. A clean append means the store
+          // accepted our tail without diverging: genuinely healthy.
+          if (stepOffset > 0 && fState.healCount !== undefined) {
+            await clearHeal(file.path, scope);
+          }
+        }
+        // Sidecars (tasks/plan) are whole-file + hash-gated and route server-side
+        // to the session's store, so one sync off any destination's new tail is
+        // enough — capture the first.
+        if (artifactText === null) artifactText = text;
+        anyProgress = true;
+        roundProgress = true;
+        log(
+          `  ${path.relative(process.env.HOME ?? "", file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
+        );
+      } catch (err) {
+        // One destination's vault being unavailable must not stall the others — log
+        // and move on; its offset stays put so the next pass retries just it.
+        if (err instanceof HxHttpError && err.serverUnavailable) {
+          lastUnavailable = err;
+          unavailableDests.add(destKey(step.vaultOrgId));
+          log(
+            `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!roundProgress) break;
+    // Caught up on every reachable destination? Then this pass is done. A
+    // diverged/healing destination (offset reset to 0) simply drains in the
+    // remaining rounds like any other backlog.
+    const remaining = steps.some(
+      (step) =>
+        !unavailableDests.has(destKey(step.vaultOrgId)) &&
+        offsetFor(fState, step.vaultOrgId) < st.size,
+    );
+    if (!remaining) break;
   }
 
   // Nothing landed: if a vault was unavailable, surface it so the pass-level
@@ -717,6 +797,7 @@ async function auditCanonicals(
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
   const state = await loadState(scope);
+  files = electUploaders(files, state);
   const candidates: Array<{ path: string; fState: FileState }> = [];
   for (const f of files) {
     const fs = state.files[f.path];
@@ -758,7 +839,9 @@ async function auditCanonicals(
     for (const { path: filePath, fState } of batch) {
       const r = byKey.get(`${fState.family}:${fState.sessionId}`);
       if (r?.status !== "divergent") continue;
+      if ((fState.healPausedUntilMs ?? 0) > Date.now()) continue; // ping-pong latch
       healed += 1;
+      await recordHeal(filePath, scope);
       // Log before the reset — setOffsetFor mutates this same fState object.
       log(
         `  [heal] ${fState.sessionId.slice(0, 8)}… canonical ${r.storeBytes ?? 0}B ≠ uploaded ${offsetFor(fState, null)}B — re-uploading from zero`,
@@ -767,6 +850,55 @@ async function auditCanonicals(
     }
   }
   if (healed > 0) log(`[hx] canonical audit: re-uploading ${healed} diverged session(s)`);
+}
+
+// Shadowed-twin log dedupe: each hidden path is announced once per process.
+const loggedShadowed = new Set<string>();
+
+/**
+ * One uploader per canonical. Several local files can map to the same
+ * (family, sessionId) — a transcript duplicated under a second project dir
+ * when the session's cwd changed, or a codex archive move. Uploading BOTH into
+ * one canonical makes every commit's totalBytes mismatch the other file's
+ * offset, and the per-commit self-heal then ping-pongs full re-uploads forever
+ * (observed live: one session healed from zero 15 times). Elect the
+ * most-recently-written file per key (tie: largest) — mtime tracks the LIVE
+ * writer (a stale twin's mtime is frozen, so it can't shadow the file new
+ * content is actually landing in), which "largest wins" got wrong when a
+ * complete-but-dead copy outsized a freshly-restarted live file. The twins
+ * are shadowed — skipped by uploads, the audit, and the sync snapshot.
+ */
+function electUploaders(
+  files: DiscoveredFile[],
+  state: HxState,
+  log?: (msg: string) => void,
+): DiscoveredFile[] {
+  const byKey = new Map<string, DiscoveredFile[]>();
+  const active: DiscoveredFile[] = [];
+  for (const f of files) {
+    const fs = state.files[f.path];
+    // Not seeded yet — passes through this tick (ingestOne seeds it) and joins
+    // the election next tick, once its sessionId is known.
+    if (!fs) {
+      active.push(f);
+      continue;
+    }
+    const key = `${fs.family}:${fs.sessionId}`;
+    const list = byKey.get(key) ?? [];
+    list.push(f);
+    byKey.set(key, list);
+  }
+  for (const list of byKey.values()) {
+    list.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size);
+    active.push(list[0]!);
+    for (const twin of list.slice(1)) {
+      if (log && !loggedShadowed.has(twin.path)) {
+        loggedShadowed.add(twin.path);
+        log(`[hx] ${twin.path} shadows ${list[0]!.path} (same session); not uploading the twin`);
+      }
+    }
+  }
+  return active;
 }
 
 /**
@@ -804,7 +936,61 @@ export async function computeSyncSnapshot(only?: string): Promise<SyncSnapshot> 
   let files = [...claude, ...codex];
   if (only) files = files.filter((f) => f.path === only);
   const state = await loadState();
-  return snapshotFrom(files, state);
+  return snapshotFrom(electUploaders(files, state), state);
+}
+
+/** A state entry that is no longer discoverable on disk yet never finished
+ *  uploading — the server copy is partial and will stay that way. */
+export interface SyncBehindEntry {
+  path: string;
+  sessionId: string;
+  uploaded: number;
+  lastKnownSize: number;
+  /** true = the local file is gone; false = it merely aged out of the
+   *  30-day discovery window. */
+  sourceGone: boolean;
+}
+
+/** Sync snapshot PLUS the sessions the snapshot can no longer see: entries
+ *  whose source file vanished (or aged out of discovery) mid-upload. Backs the
+ *  honest `hx status` output — without these the bar reads 100% while the
+ *  server holds partial transcripts. */
+export async function computeSyncReport(): Promise<{
+  snapshot: SyncSnapshot;
+  behind: SyncBehindEntry[];
+}> {
+  const [claude, codex] = await Promise.all([
+    discoverClaudeFiles(),
+    discoverCodexFiles(),
+  ]);
+  const all = [...claude, ...codex];
+  const state = await loadState();
+  const discovered = new Set(all.map((f) => f.path));
+  // Sessions still represented by a discovered file (its family:sessionId). A
+  // state entry absent from discovery is only a real "gap" if NO current file
+  // covers its session — otherwise it's a shadowed twin whose content actually
+  // uploaded through the elected file, and whose offsets are frozen BY DESIGN.
+  const liveSessions = new Set<string>();
+  for (const f of all) {
+    const fs = state.files[f.path];
+    if (fs) liveSessions.add(`${fs.family}:${fs.sessionId}`);
+  }
+  const behind: SyncBehindEntry[] = [];
+  for (const [p, fs] of Object.entries(state.files)) {
+    if (discovered.has(p)) continue;
+    if (liveSessions.has(`${fs.family}:${fs.sessionId}`)) continue; // shadowed twin
+    if (fs.lastKnownSize === undefined) continue; // legacy entry — size unknown
+    const uploaded = minOffset(fs);
+    if (uploaded >= fs.lastKnownSize) continue;
+    behind.push({
+      path: p,
+      sessionId: fs.sessionId,
+      uploaded,
+      lastKnownSize: fs.lastKnownSize,
+      sourceGone: !existsSync(p),
+    });
+  }
+  return { snapshot: snapshotFrom(electUploaders(all, state), state), behind };
 }
 
 export async function tickOnce(
@@ -824,25 +1010,44 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
+  files = electUploaders(files, state, log);
   onProgress?.(snapshotFrom(files, state));
 
   let uploaded = 0;
   let failed = 0;
   for (let i = 0; i < files.length; i++) {
     const f = files[i]!;
+    // Per-file backoff: a file that keeps failing (bad request, offline vault)
+    // sits out its window instead of burning a gateway round trip every poll.
+    const pending = state.files[f.path];
+    if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
+      if (pending?.consecutiveFailures !== undefined || pending?.nextAttemptAtMs !== undefined) {
+        await clearFileFailure(f.path, scope);
+      }
     } catch (err) {
       failed += 1;
       log(`  [error] ${f.path}: ${(err as Error).message}`);
+      if (err instanceof HxHttpError && err.vaultOffline) {
+        // THIS session's vault is down; the gateway is fine. Skip just this
+        // file for minutes — everything else keeps uploading.
+        const delay = await recordFileFailure(f.path, VAULT_OFFLINE_RETRY_BASE_MS, scope);
+        log(`  [hx] session vault offline; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
+        continue;
+      }
       if (err instanceof HxHttpError && err.serverUnavailable) {
-        // The gateway/storage is refusing uploads wholesale — don't keep
-        // POSTing the rest of this pass's backlog at it. The watcher backs off
-        // before the next pass; bail out of this one now.
+        // The gateway/storage is refusing uploads wholesale — this is NOT this
+        // file's fault, so do NOT saddle it with a per-file backoff (that would
+        // make this one file lag behind the rest once the gateway recovers).
+        // The pass-level exponential backoff in run() handles the outage.
         log(`  [hx] gateway unavailable (${err.status}); pausing this pass`);
         break;
       }
+      // A genuine per-file fault (4xx, parse error, a doomed sidecar): back it
+      // off so it doesn't burn a gateway round trip every poll.
+      await recordFileFailure(f.path, FILE_RETRY_BASE_MS, scope);
     }
     if (onProgress && (i + 1) % SYNC_PROGRESS_EVERY === 0) {
       onProgress(snapshotFrom(files, state));
@@ -862,14 +1067,30 @@ export async function tickOnce(
     try {
       const { children, runs } = await discoverClaudeChildren();
       for (const c of children) {
+        const pendingChild = state.files[c.path];
+        if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) continue;
         try {
           const did = await ingestChildOne(cfg, c, familyBySession, opts, log);
           if (did) uploaded += 1;
+          if (
+            pendingChild?.consecutiveFailures !== undefined ||
+            pendingChild?.nextAttemptAtMs !== undefined
+          ) {
+            await clearFileFailure(c.path, scope);
+          }
         } catch (err) {
           failed += 1;
           log(`  [error] ${c.path}: ${(err as Error).message}`);
+          if (err instanceof HxHttpError && err.vaultOffline) {
+            await recordFileFailure(c.path, VAULT_OFFLINE_RETRY_BASE_MS, scope);
+            continue;
+          }
+          // A wholesale lane pause (404/401/403) or gateway-wide outage is not
+          // this child's fault — don't give it a per-file backoff that would
+          // make it lag once the gateway recovers.
           if (latchChildLanePause(err, scope, log)) break;
           if (err instanceof HxHttpError && err.serverUnavailable) break;
+          await recordFileFailure(c.path, FILE_RETRY_BASE_MS, scope);
         }
       }
       for (const r of runs) {

@@ -232,6 +232,25 @@ export async function discoverClaudeChildren(): Promise<{
         await collectAgentFiles(runDir, sessionId, runId, now, children);
         const journalPath = path.join(runDir, "journal.jsonl");
         const jst = await statSafe(journalPath);
+        // One session can appear under SEVERAL project dirs (the cwd changed
+        // mid-session — e.g. into a worktree), splitting a run's artifacts:
+        // journal under one project dir, script under another. Merge into any
+        // entry the script scan already created instead of pushing a twin —
+        // two entries share the upload key (sessionId+runId) and alternating
+        // content hashes re-upload the sidecar every pass, forever.
+        const existing = runs.find(
+          (r) => r.parentSessionId === sessionId && r.runId === runId,
+        );
+        if (existing) {
+          // Only fill a MISSING journal — don't clobber a journal already found
+          // under another project dir (a run split across dirs can have a
+          // journal in each; keep the first and let mtime track the newest).
+          if (jst && !jst.isDir) {
+            if (!existing.journalPath) existing.journalPath = journalPath;
+            existing.mtimeMs = Math.max(existing.mtimeMs, jst.mtimeMs);
+          }
+          continue;
+        }
         runs.push({
           parentSessionId: sessionId,
           runId,
