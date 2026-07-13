@@ -36,6 +36,24 @@ export interface FileState {
   lastMtimeMs: number;
   /** Last upload attempt timestamp (ms). For logging/inspection. */
   lastUploadAtMs: number;
+  /** Size (bytes) the file had when we last saw it on disk. Lets `hx status`
+   *  report sessions whose source vanished (or aged out of the scan window)
+   *  before their upload finished — the server copy stays partial forever, and
+   *  without this record the status would silently claim 100%. */
+  lastKnownSize?: number;
+  /** Consecutive canonical self-heals (from-zero re-uploads) without a clean
+   *  commit in between. A mismatch that heals and immediately re-diverges is
+   *  ping-ponging (e.g. two writers on one canonical) — after a few rounds the
+   *  heal pauses instead of re-uploading the whole file forever. */
+  healCount?: number;
+  /** Self-heal is paused for this file until this timestamp (ms). */
+  healPausedUntilMs?: number;
+  /** Consecutive failed upload attempts (cleared by any clean pass). Drives a
+   *  per-file retry backoff so one permanently-broken file can't burn a
+   *  gateway round trip every poll while everything else is healthy. */
+  consecutiveFailures?: number;
+  /** Do not retry this file before this timestamp (ms since epoch). */
+  nextAttemptAtMs?: number;
 }
 
 /** On-disk shape before per-destination fan-out carried a single `offset`. */
@@ -79,6 +97,11 @@ export function migrateFileState(s: LegacyFileState): FileState {
     offsets,
     lastMtimeMs: s.lastMtimeMs,
     lastUploadAtMs: s.lastUploadAtMs,
+    lastKnownSize: (s as FileState).lastKnownSize,
+    consecutiveFailures: (s as FileState).consecutiveFailures,
+    nextAttemptAtMs: (s as FileState).nextAttemptAtMs,
+    healCount: (s as FileState).healCount,
+    healPausedUntilMs: (s as FileState).healPausedUntilMs,
   };
 }
 
@@ -178,6 +201,32 @@ export async function setOffsetFor(
   await schedulePersist(state, scope);
 }
 
+/**
+ * Reconcile a file's per-destination offsets against the gateway's CURRENT
+ * fan-out set for its session (both ready and held destinations — a held
+ * vault is expected back and must keep its offset). A destination that left
+ * the set (org detached, vault decommissioned) would otherwise pin
+ * minOffset — and with it the sync percentage — below done forever, since
+ * nothing ever wrote to it again and no other code path removes offset keys.
+ */
+export async function reconcileDestinations(
+  filePath: string,
+  activeKeys: string[],
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return;
+  const keep = new Set(activeKeys);
+  let changed = false;
+  for (const k of Object.keys(existing.offsets)) {
+    if (keep.has(k)) continue;
+    delete existing.offsets[k];
+    changed = true;
+  }
+  if (changed) await schedulePersist(state, scope);
+}
+
 /** Refresh a file's observed mtime without advancing any destination's offset
  *  (the file changed but produced no new committable bytes). */
 export async function touchMtime(
@@ -189,6 +238,80 @@ export async function touchMtime(
   const existing = state.files[filePath];
   if (!existing) return;
   existing.lastMtimeMs = mtimeMs;
+  await schedulePersist(state, scope);
+}
+
+/** Per-file retry backoff cap — a broken file retries at most every 30 min. */
+const FILE_BACKOFF_CAP_MS = 30 * 60_000;
+
+/** Record a failed upload attempt for one file and schedule its next try with
+ *  exponential backoff from `baseMs`. Returns the chosen delay (ms). */
+export async function recordFileFailure(
+  filePath: string,
+  baseMs: number,
+  scope: StateScope = "main",
+): Promise<number> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return 0;
+  const n = (existing.consecutiveFailures ?? 0) + 1;
+  existing.consecutiveFailures = n;
+  const delay = Math.min(FILE_BACKOFF_CAP_MS, baseMs * 2 ** (n - 1));
+  existing.nextAttemptAtMs = Date.now() + delay;
+  await schedulePersist(state, scope);
+  return delay;
+}
+
+/** How many consecutive self-heals one file may burn before the heal pauses. */
+export const HEAL_MAX_CONSECUTIVE = 3;
+/** How long a ping-ponging file's self-heal stays paused. */
+export const HEAL_PAUSE_MS = 6 * 60 * 60_000;
+
+/** Count a canonical self-heal for one file; pauses healing once the streak
+ *  hits HEAL_MAX_CONSECUTIVE. Returns the streak length. */
+export async function recordHeal(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<number> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return 0;
+  const n = (existing.healCount ?? 0) + 1;
+  existing.healCount = n;
+  if (n >= HEAL_MAX_CONSECUTIVE) {
+    existing.healPausedUntilMs = Date.now() + HEAL_PAUSE_MS;
+  }
+  await schedulePersist(state, scope);
+  return n;
+}
+
+/** A clean, size-matching commit ends any heal streak. */
+export async function clearHeal(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing || (existing.healCount === undefined && existing.healPausedUntilMs === undefined)) {
+    return;
+  }
+  delete existing.healCount;
+  delete existing.healPausedUntilMs;
+  await schedulePersist(state, scope);
+}
+
+/** Clear a file's failure backoff after a clean pass. */
+export async function clearFileFailure(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing || (existing.consecutiveFailures === undefined && existing.nextAttemptAtMs === undefined)) {
+    return;
+  }
+  delete existing.consecutiveFailures;
+  delete existing.nextAttemptAtMs;
   await schedulePersist(state, scope);
 }
 
