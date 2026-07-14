@@ -263,6 +263,41 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
   return seeded;
 }
 
+const FALLBACK_TITLE_MAX = 80;
+
+/** First line of `text`, whitespace-collapsed and word-boundary truncated with
+ *  an ellipsis. Null when there is nothing legible. */
+function firstLineLabel(text: string | null): string | null {
+  if (!text) return null;
+  const oneLine = (text.split("\n", 1)[0] ?? "").trim().replace(/\s+/g, " ");
+  if (!oneLine) return null;
+  if (oneLine.length <= FALLBACK_TITLE_MAX) return oneLine;
+  const clipped = oneLine.slice(0, FALLBACK_TITLE_MAX);
+  const lastSpace = clipped.lastIndexOf(" ");
+  const base = lastSpace >= FALLBACK_TITLE_MAX * 0.6 ? clipped.slice(0, lastSpace) : clipped;
+  return `${base.replace(/[\s.,;:!?—-]+$/, "")}…`;
+}
+
+/** A readable label for a session that carries no user/AI title of its own: the
+ *  opening user message, else the repo or working-directory name. Returns null
+ *  when even those are unavailable, so the caller leaves the title unset. */
+function deriveFallbackTitle(
+  firstUserText: string | null,
+  cwd: string | null,
+  repoSlug: string | null,
+): string | null {
+  const fromMessage = firstLineLabel(firstUserText);
+  if (fromMessage) return fromMessage;
+  const repo = repoSlug?.split("/").pop()?.trim();
+  if (repo) return repo;
+  const base = cwd
+    ?.split(/[/\\]+/)
+    .filter((seg) => seg && seg !== "." && seg !== "..")
+    .pop()
+    ?.trim();
+  return base && base.length > 0 ? base : null;
+}
+
 async function ingestOne(
   cfg: HxConfig,
   file: DiscoveredFile,
@@ -359,10 +394,23 @@ async function ingestOne(
       if (trimmed.length === 0) continue;
       const text = trimmed.toString("utf8");
       const summary = summariseChunk(text);
-      const title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
+      let title = ccdMeta?.title ?? summary.title ?? head.title ?? undefined;
       let titleSource: "user" | "ai" | "fallback" | undefined;
       if (ccdMeta?.title) titleSource = ccdMeta.titleSource ?? undefined;
       else if (summary.title) titleSource = summary.titleSource ?? undefined;
+      else if (head.title) titleSource = "ai";
+      // No user/AI title anywhere — synthesize a readable label so the session
+      // shows something meaningful instead of a bare id downstream. Only on a
+      // from-zero upload: a later appended chunk must not overwrite it with a
+      // mid-conversation message. Stamped "fallback" so the provenance stays
+      // honest.
+      if (!title && stepOffset === 0) {
+        const derived = deriveFallbackTitle(summary.firstUserText, head.cwd, head.repoSlug);
+        if (derived) {
+          title = derived;
+          titleSource = "fallback";
+        }
+      }
 
       try {
         // Upload bytes directly to this destination's store, then compose.
