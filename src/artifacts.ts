@@ -7,7 +7,7 @@
 // Both are whole small files rewritten in place, so the watcher uploads them
 // wholesale (hash-gated) rather than via the transcript's append/compose path.
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
@@ -114,8 +114,9 @@ export function findPlanPathInText(text: string): string | null {
 /** Read a plan markdown file off disk, or null if it's gone. */
 export async function readPlanFile(planFilePath: string): Promise<PlanArtifact | null> {
   try {
-    const st = await stat(planFilePath);
-    if (!st.isFile()) return null;
+    // Read directly and let the catch handle the non-file cases (ENOENT, or
+    // EISDIR when the path is a directory). A separate stat()-then-readFile
+    // would be a TOCTOU race and a redundant syscall.
     const content = await readFile(planFilePath, "utf8");
     return { planFilePath, content };
   } catch {
@@ -182,12 +183,19 @@ export async function readAgentMeta(metaPath: string | null): Promise<AgentMetaS
 /** Read a small text file, or null. Used for workflow scripts + journals. */
 export async function readTextFile(p: string | null, maxBytes = 500_000): Promise<string | null> {
   if (!p) return null;
+  // Open once and stat/read through the same handle so the size check and the
+  // read operate on the same inode — a bare stat()-then-readFile is a TOCTOU
+  // race. The maxBytes guard stays: we check size before reading the bytes.
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const st = await stat(p);
+    fh = await open(p, "r");
+    const st = await fh.stat();
     if (!st.isFile() || st.size > maxBytes) return null;
-    return await readFile(p, "utf8");
+    return await fh.readFile("utf8");
   } catch {
     return null;
+  } finally {
+    await fh?.close();
   }
 }
 

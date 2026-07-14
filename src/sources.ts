@@ -501,23 +501,23 @@ export async function detectRepoSlug(startDir: string): Promise<string | null> {
   let dir = startDir;
   for (let i = 0; i < 40; i += 1) {
     const gitPath = path.join(dir, ".git");
-    let st;
+    // Read `.git` directly rather than stat-then-read (a TOCTOU race + an extra
+    // syscall). It's a regular file for linked worktrees/submodules (a
+    // `gitdir: …` pointer) and a directory for a normal clone — which surfaces
+    // as EISDIR from readFile.
+    let pointer: string | null = null;
     try {
-      st = await stat(gitPath);
-    } catch {
-      st = null;
-    }
-    if (st?.isDirectory()) {
-      return readOriginSlug(path.join(gitPath, "config"));
-    }
-    if (st?.isFile()) {
-      // `.git` file points at the real gitdir; config may live in commondir.
-      let pointer = "";
-      try {
-        pointer = await readFile(gitPath, "utf8");
-      } catch {
-        pointer = "";
+      pointer = await readFile(gitPath, "utf8");
+    } catch (err) {
+      if ((err as { code?: string }).code === "EISDIR") {
+        // Normal clone: config lives directly inside the .git directory.
+        return readOriginSlug(path.join(gitPath, "config"));
       }
+      // No .git here (ENOENT) or it's unreadable — walk up to the parent.
+      pointer = null;
+    }
+    if (pointer !== null) {
+      // `.git` file points at the real gitdir; config may live in commondir.
       const m = /^gitdir:\s*(.+)$/m.exec(pointer);
       if (m) {
         const target = m[1].trim();
