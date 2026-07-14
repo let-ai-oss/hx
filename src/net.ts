@@ -47,7 +47,7 @@ export function assertSecureFetchUrl(url: string, label: string): void {
   if (!isSecureFetchUrl(url)) {
     // Don't echo the whole URL (may carry a signed query token); the scheme +
     // host is enough to diagnose a downgrade or a redirect to the wrong place.
-    let where = url;
+    let where: string;
     try {
       const u = new URL(url);
       where = `${u.protocol}//${u.host}`;

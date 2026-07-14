@@ -505,7 +505,7 @@ export async function detectRepoSlug(startDir: string): Promise<string | null> {
     // syscall). It's a regular file for linked worktrees/submodules (a
     // `gitdir: …` pointer) and a directory for a normal clone — which surfaces
     // as EISDIR from readFile.
-    let pointer: string | null = null;
+    let pointer: string | null;
     try {
       pointer = await readFile(gitPath, "utf8");
     } catch (err) {
