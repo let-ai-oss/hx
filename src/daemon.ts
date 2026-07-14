@@ -714,11 +714,12 @@ function runOrThrow(cmd: string, args: string[]): void {
  */
 export async function tailLogs(linesBack = 50): Promise<void> {
   await mkdir(HX_DIR, { recursive: true });
-  // Touch logs if they don't exist so tail doesn't error out.
+  // Touch logs if they don't exist so tail doesn't error out. Append-create
+  // (flag "a") is idempotent: it creates a missing log but never truncates one
+  // the daemon may have just started writing. The prior existsSync-then-write
+  // both raced and could clobber that concurrent output.
   for (const p of [STDOUT_LOG, STDERR_LOG]) {
-    if (!existsSync(p)) {
-      await writeFile(p, "");
-    }
+    await writeFile(p, "", { flag: "a" });
   }
   const proc = spawn(
     "tail",
