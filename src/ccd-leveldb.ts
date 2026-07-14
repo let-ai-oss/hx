@@ -109,14 +109,13 @@ function ldbDataBlocks(file: Buffer): Buffer[] {
   ) {
     return [];
   }
-  // Footer: metaindex_handle (varint off+size), index_handle (varint off+size).
+  // Footer: metaindex_handle (varint off+size) then index_handle (varint
+  // off+size). We only use the index handle, so parse past the metaindex one.
   let p = 0;
-  let off: number;
-  let size: number;
-  [off, p] = readVarint(footer, p); // metaindex offset
-  [size, p] = readVarint(footer, p); // metaindex size
-  [off, p] = readVarint(footer, p); // index offset
-  [size, p] = readVarint(footer, p); // index size
+  [, p] = readVarint(footer, p); // skip metaindex offset
+  [, p] = readVarint(footer, p); // skip metaindex size
+  const [off, pAfterOff] = readVarint(footer, p); // index offset
+  const [size] = readVarint(footer, pAfterOff); // index size
   const indexBlock = readBlock(file, { offset: off, size });
 
   // Walk index-block entries; each entry's VALUE is a data BlockHandle. We
@@ -168,7 +167,7 @@ export async function* leveldbScanBuffers(dir: string): AsyncGenerator<Buffer> {
     if (f.endsWith(".log")) {
       yield buf;
     } else {
-      let blocks: Buffer[] = [];
+      let blocks: Buffer[];
       try {
         blocks = ldbDataBlocks(buf);
       } catch {

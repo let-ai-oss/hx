@@ -227,6 +227,7 @@ export async function runUpdate(opts: UpdateOpts): Promise<UpdateResult> {
       throw new Error(
         `binary installed at ${binPath}, but the daemon failed to restart: ` +
           `${(err as Error).message}\n${next}`,
+        { cause: err },
       );
     }
     daemonRestarted = true;
