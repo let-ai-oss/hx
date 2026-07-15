@@ -28,6 +28,7 @@ import {
   readHead,
 } from "./sources.js";
 import {
+  type FileSkipReason,
   type FileState,
   type HxState,
   type StateScope,
@@ -91,11 +92,15 @@ const FAST_POLL_MS = 1_500;
 const UPLOAD_BACKOFF_BASE_MS = 5_000;
 const UPLOAD_BACKOFF_MAX_MS = 5 * 60_000;
 // Per-FILE retry pacing (state.ts recordFileFailure doubles these per failure,
-// capped at 30 min): an ordinary per-request fault backs off from 30 s; a
-// session whose OWN vault is offline waits minutes — the vault coming back is
-// an ops event, not something polling faster will hurry.
+// capped at 30 min): an ordinary per-request fault backs off from 30 s.
 const FILE_RETRY_BASE_MS = 30_000;
-const VAULT_OFFLINE_RETRY_BASE_MS = 5 * 60_000;
+// A session whose OWN store is temporarily unavailable (its vault is offline, or
+// a store it routes to directly is down) is skipped — the rest keep uploading.
+// Start short so a brief blip (a redeploy, a flaky link) is retried within
+// seconds; consecutive failures then double the wait toward the 30-min cap, so a
+// genuine outage stops burning round trips. This is the "a few quick retries,
+// then back off" the skip path wants, using the existing exponential.
+const SESSION_SKIP_RETRY_BASE_MS = 20_000;
 // How many chunk rounds ONE file may drain within a single pass (x 4 MB chunk
 // limit = up to 64 MB per destination per pass). Enough that a big backlog
 // moves at line speed, capped so one huge file can't starve the rest.
@@ -121,6 +126,66 @@ const SYNC_REPORT_MIN_MS = 1_500;
 // without restarting the daemon.
 const VERIFY_INTERVAL_MS = 30 * 60_000;
 const VERIFY_BATCH = 1_000;
+
+/**
+ * A session's OWN destination store is temporarily unavailable — its vault is
+ * offline, or a store it routes to directly is down. Distinct from the shared
+ * cloud gateway being down: the watcher skips just this file (short retries,
+ * then a longer backoff) and keeps uploading every other session, instead of
+ * pausing the whole pass. Thrown by `ingestOne`, handled in `tickOnce`.
+ */
+export class SessionUpstreamUnavailable extends Error {
+  constructor(
+    readonly reason: FileSkipReason,
+    /** HTTP status when the store answered; null for an outright network failure. */
+    readonly status: number | null,
+    cause: unknown,
+  ) {
+    super(`session store unavailable (${reason})`, { cause });
+    this.name = "SessionUpstreamUnavailable";
+  }
+}
+
+/**
+ * Decide whether `err` means THIS session's destination store is temporarily
+ * unavailable — a transient outage to skip past, not a shared-gateway failure
+ * and not this file's own fault. Returns a wrapped error to throw, or null to
+ * let the caller handle `err` unchanged.
+ *
+ * `fortress` = the session uploads straight to its org's own store. A 5xx or an
+ * outright network failure there is that one store being down. On the shared
+ * cloud gateway the same 5xx could be a wholesale outage affecting every
+ * session, so there only an explicit `vault_offline` (the gateway naming the
+ * session's vault) is treated as per-session; a bare 5xx falls through to the
+ * pass-level pause. A 4xx is never "unavailable" — it's a genuine per-file fault.
+ */
+export function classifyUpstreamError(
+  err: unknown,
+  fortress: boolean,
+): SessionUpstreamUnavailable | null {
+  if (err instanceof HxHttpError) {
+    if (err.vaultOffline) return new SessionUpstreamUnavailable("vault_offline", err.status, err);
+    if (fortress && err.serverUnavailable) {
+      return new SessionUpstreamUnavailable("store_unreachable", err.status, err);
+    }
+    return null;
+  }
+  // A non-HTTP throw (DNS failure, connection refused/reset, timeout) against a
+  // direct store route is that store being unreachable. On the cloud gateway the
+  // same symptom could be local connectivity affecting every session, so it is
+  // left to the generic per-file backoff rather than singled out here.
+  if (fortress && err instanceof Error) {
+    return new SessionUpstreamUnavailable("store_unreachable", null, err);
+  }
+  return null;
+}
+
+/** Human-readable form of a skip reason for the daemon log. */
+function describeSkip(reason: FileSkipReason): string {
+  return reason === "vault_offline"
+    ? "session vault temporarily unavailable"
+    : "session store unreachable";
+}
 
 export interface WatchOptions {
   /** Limit to a single file (debugging). */
@@ -351,6 +416,12 @@ async function ingestOne(
   // old pacing capped any session at ~2.7 MB/s regardless of bandwidth. The
   // per-pass cap keeps one huge file from starving the rest of the backlog;
   // whatever is left continues next pass.
+  //
+  // Wrap the whole drain: any error that means THIS session's store is
+  // unavailable (a direct-route store's 5xx/network failure, or the gateway's
+  // vault_offline) is re-thrown as SessionUpstreamUnavailable so tickOnce skips
+  // just this file and keeps the pass going. Everything else propagates as-is.
+  try {
   for (let round = 0; round < DRAIN_ROUNDS_PER_PASS; round++) {
     // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
     // the gateway attribute + resolve the destination set; each is echoed back as
@@ -517,12 +588,15 @@ async function ingestOne(
     );
     if (!remaining) break;
   }
+  } catch (err) {
+    throw classifyUpstreamError(err, route.fortress) ?? err;
+  }
 
-  // Nothing landed: if a vault was unavailable, surface it so the pass-level
-  // backoff in tickOnce kicks in (don't hammer it every poll). Otherwise there
-  // were simply no new committable bytes for any destination this pass.
+  // Nothing landed: if every destination we tried was unavailable, surface it so
+  // this file gets skipped (per-session) or the pass pauses (cloud-wide), per
+  // classifyUpstreamError. Otherwise there were simply no new committable bytes.
   if (!anyProgress) {
-    if (lastUnavailable) throw lastUnavailable;
+    if (lastUnavailable) throw classifyUpstreamError(lastUnavailable, route.fortress) ?? lastUnavailable;
     return false;
   }
 
@@ -999,13 +1073,41 @@ export interface SyncBehindEntry {
   sourceGone: boolean;
 }
 
+/** A discoverable session whose upload is paused because its destination store
+ *  is temporarily unavailable (skipReason set). Transient — it resumes on its
+ *  own once the store returns; surfaced so `hx status` explains the lag. */
+export interface SyncSkippedEntry {
+  path: string;
+  sessionId: string;
+  reason: FileSkipReason;
+  /** When the next upload attempt is due (ms since epoch), if scheduled. */
+  nextAttemptAtMs?: number;
+}
+
+/** The still-on-disk sessions currently waiting on a temporarily-unavailable
+ *  store. Pure over `files` (the elected uploaders) + `state`, so it's
+ *  unit-testable. Vanished/aged files are reported via `behind`, not here, so
+ *  the two sets never overlap. */
+export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSkippedEntry[] {
+  const discovered = new Set(files.map((f) => f.path));
+  const out: SyncSkippedEntry[] = [];
+  for (const [p, fs] of Object.entries(state.files)) {
+    if (!fs.skipReason) continue;
+    if (!discovered.has(p)) continue;
+    out.push({ path: p, sessionId: fs.sessionId, reason: fs.skipReason, nextAttemptAtMs: fs.nextAttemptAtMs });
+  }
+  return out;
+}
+
 /** Sync snapshot PLUS the sessions the snapshot can no longer see: entries
- *  whose source file vanished (or aged out of discovery) mid-upload. Backs the
+ *  whose source file vanished (or aged out of discovery) mid-upload — and the
+ *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
- *  server holds partial transcripts. */
+ *  server holds partial transcripts or a store is down. */
 export async function computeSyncReport(): Promise<{
   snapshot: SyncSnapshot;
   behind: SyncBehindEntry[];
+  skipped: SyncSkippedEntry[];
 }> {
   const [claude, codex] = await Promise.all([
     discoverClaudeFiles(),
@@ -1038,7 +1140,8 @@ export async function computeSyncReport(): Promise<{
       sourceGone: !existsSync(p),
     });
   }
-  return { snapshot: snapshotFrom(electUploaders(all, state), state), behind };
+  const elected = electUploaders(all, state);
+  return { snapshot: snapshotFrom(elected, state), behind, skipped: collectSkipped(elected, state) };
 }
 
 export async function tickOnce(
@@ -1078,18 +1181,20 @@ export async function tickOnce(
     } catch (err) {
       failed += 1;
       log(`  [error] ${f.path}: ${(err as Error).message}`);
-      if (err instanceof HxHttpError && err.vaultOffline) {
-        // THIS session's vault is down; the gateway is fine. Skip just this
-        // file for minutes — everything else keeps uploading.
-        const delay = await recordFileFailure(f.path, VAULT_OFFLINE_RETRY_BASE_MS, scope);
-        log(`  [hx] session vault offline; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
+      if (err instanceof SessionUpstreamUnavailable) {
+        // THIS session's store is temporarily unavailable; the shared gateway is
+        // fine. Skip just this file — short retries first, then a longer backoff
+        // (recordFileFailure doubles per failure) — and record the reason so
+        // `hx status` can show it. Everything else keeps uploading.
+        const delay = await recordFileFailure(f.path, SESSION_SKIP_RETRY_BASE_MS, scope, err.reason);
+        log(`  [hx] ${describeSkip(err.reason)}; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
         continue;
       }
       if (err instanceof HxHttpError && err.serverUnavailable) {
-        // The gateway/storage is refusing uploads wholesale — this is NOT this
-        // file's fault, so do NOT saddle it with a per-file backoff (that would
-        // make this one file lag behind the rest once the gateway recovers).
-        // The pass-level exponential backoff in run() handles the outage.
+        // The shared cloud gateway is refusing uploads wholesale — this is NOT
+        // this file's fault, so do NOT saddle it with a per-file backoff (that
+        // would make this one file lag behind the rest once the gateway
+        // recovers). The pass-level exponential backoff in run() handles it.
         log(`  [hx] gateway unavailable (${err.status}); pausing this pass`);
         break;
       }
@@ -1130,7 +1235,10 @@ export async function tickOnce(
           failed += 1;
           log(`  [error] ${c.path}: ${(err as Error).message}`);
           if (err instanceof HxHttpError && err.vaultOffline) {
-            await recordFileFailure(c.path, VAULT_OFFLINE_RETRY_BASE_MS, scope);
+            // The child's session vault is offline (child lanes route through the
+            // cloud gateway, never fortress-direct) — skip just this child with
+            // the same short-retries-then-backoff pacing as its parent.
+            await recordFileFailure(c.path, SESSION_SKIP_RETRY_BASE_MS, scope, "vault_offline");
             continue;
           }
           // A wholesale lane pause (404/401/403) or gateway-wide outage is not

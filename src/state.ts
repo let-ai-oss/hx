@@ -20,6 +20,13 @@ import { HX_DIR } from "./hx-home.js";
  *  "local" = the additive `--local` tee against the local dev gateway. */
 export type StateScope = "main" | "local";
 
+/** Why a file is being skipped this pass. Both mean "the destination store is
+ *  temporarily unavailable, not this file's fault": `vault_offline` = the
+ *  gateway reported the session's vault down (503 vault_offline); `store_unreachable`
+ *  = a store this session routes to directly answered with a 5xx or couldn't be
+ *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
+export type FileSkipReason = "vault_offline" | "store_unreachable";
+
 export interface FileState {
   /** Absolute jsonl path on disk. */
   path: string;
@@ -54,9 +61,15 @@ export interface FileState {
   consecutiveFailures?: number;
   /** Do not retry this file before this timestamp (ms since epoch). */
   nextAttemptAtMs?: number;
+  /** Set while the file is being skipped because its destination store is
+   *  temporarily unavailable (a transient outage, not a fault of this file).
+   *  Drives the `hx status` "waiting" row; cleared by any clean pass. */
+  skipReason?: FileSkipReason;
 }
 
-/** On-disk shape before per-destination fan-out carried a single `offset`. */
+/** On-disk shape before per-destination fan-out carried a single `offset`. The
+ *  optional recovery/skip fields may already be present on a non-legacy entry
+ *  being re-normalised; they carry through {@link migrateFileState} untouched. */
 export interface LegacyFileState {
   path: string;
   family: string;
@@ -65,6 +78,12 @@ export interface LegacyFileState {
   offsets?: Record<string, number>;
   lastMtimeMs: number;
   lastUploadAtMs: number;
+  lastKnownSize?: number;
+  consecutiveFailures?: number;
+  nextAttemptAtMs?: number;
+  skipReason?: FileSkipReason;
+  healCount?: number;
+  healPausedUntilMs?: number;
 }
 
 /** Stable per-destination state key. null (let.ai shared bucket) → "letai". */
@@ -97,11 +116,12 @@ export function migrateFileState(s: LegacyFileState): FileState {
     offsets,
     lastMtimeMs: s.lastMtimeMs,
     lastUploadAtMs: s.lastUploadAtMs,
-    lastKnownSize: (s as FileState).lastKnownSize,
-    consecutiveFailures: (s as FileState).consecutiveFailures,
-    nextAttemptAtMs: (s as FileState).nextAttemptAtMs,
-    healCount: (s as FileState).healCount,
-    healPausedUntilMs: (s as FileState).healPausedUntilMs,
+    lastKnownSize: s.lastKnownSize,
+    consecutiveFailures: s.consecutiveFailures,
+    nextAttemptAtMs: s.nextAttemptAtMs,
+    skipReason: s.skipReason,
+    healCount: s.healCount,
+    healPausedUntilMs: s.healPausedUntilMs,
   };
 }
 
@@ -245,11 +265,17 @@ export async function touchMtime(
 const FILE_BACKOFF_CAP_MS = 30 * 60_000;
 
 /** Record a failed upload attempt for one file and schedule its next try with
- *  exponential backoff from `baseMs`. Returns the chosen delay (ms). */
+ *  exponential backoff from `baseMs`. Returns the chosen delay (ms).
+ *
+ *  `skipReason` distinguishes a transient store outage (the file is fine, its
+ *  destination is temporarily unavailable) from an ordinary per-file fault: when
+ *  set it is stamped for `hx status`; when omitted any stale reason is cleared,
+ *  so a file that fails for a new reason never keeps advertising the old one. */
 export async function recordFileFailure(
   filePath: string,
   baseMs: number,
   scope: StateScope = "main",
+  skipReason?: FileSkipReason,
 ): Promise<number> {
   const state = await loadState(scope);
   const existing = state.files[filePath];
@@ -258,6 +284,8 @@ export async function recordFileFailure(
   existing.consecutiveFailures = n;
   const delay = Math.min(FILE_BACKOFF_CAP_MS, baseMs * 2 ** (n - 1));
   existing.nextAttemptAtMs = Date.now() + delay;
+  if (skipReason) existing.skipReason = skipReason;
+  else delete existing.skipReason;
   await schedulePersist(state, scope);
   return delay;
 }
@@ -300,18 +328,24 @@ export async function clearHeal(
   await schedulePersist(state, scope);
 }
 
-/** Clear a file's failure backoff after a clean pass. */
+/** Clear a file's failure backoff (and any skip reason) after a clean pass. */
 export async function clearFileFailure(
   filePath: string,
   scope: StateScope = "main",
 ): Promise<void> {
   const state = await loadState(scope);
   const existing = state.files[filePath];
-  if (!existing || (existing.consecutiveFailures === undefined && existing.nextAttemptAtMs === undefined)) {
+  if (
+    !existing ||
+    (existing.consecutiveFailures === undefined &&
+      existing.nextAttemptAtMs === undefined &&
+      existing.skipReason === undefined)
+  ) {
     return;
   }
   delete existing.consecutiveFailures;
   delete existing.nextAttemptAtMs;
+  delete existing.skipReason;
   await schedulePersist(state, scope);
 }
 

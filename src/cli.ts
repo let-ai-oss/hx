@@ -544,6 +544,16 @@ async function cmdStatus(): Promise<void> {
     }
     if (parts.length > 0) rows.push(["Sync gaps", parts.join("; ")]);
   }
+  // Sessions paused on a temporarily-unavailable store. Transient (they resume
+  // on their own), so this is a distinct, softer signal from the "Sync gaps"
+  // above — the upload isn't lost, it's waiting and retrying.
+  if (report && report.skipped.length > 0) {
+    const n = new Set(report.skipped.map((s) => s.sessionId)).size;
+    rows.push([
+      "Waiting",
+      `${n} session${n === 1 ? "" : "s"} — destination store temporarily unavailable (retrying)`,
+    ]);
+  }
   printStatusTable(rows);
 }
 
