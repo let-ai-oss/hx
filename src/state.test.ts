@@ -63,4 +63,17 @@ describe("migrateFileState", () => {
     });
     assert.deepEqual(out.offsets, {});
   });
+
+  it("carries a persisted skipReason through the migration", () => {
+    const out = migrateFileState({
+      path: "/p",
+      family: "claude-cli",
+      sessionId: "s",
+      offsets: { letai: 5 },
+      lastMtimeMs: 1,
+      lastUploadAtMs: 2,
+      skipReason: "vault_offline",
+    });
+    assert.equal(out.skipReason, "vault_offline");
+  });
 });
