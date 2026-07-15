@@ -21,6 +21,12 @@ import { HX_VERSION } from "./version.js";
 import { unlink } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { assertSecureFetchUrl } from "./net.js";
+import {
+  buildSyncDoctorReport,
+  formatStatusBlocker,
+  formatSyncDoctorText,
+} from "./diagnostics.js";
+import { clearBlockedFailures, resetStateCache } from "./state.js";
 
 function log(msg: string): void {
   process.stdout.write(`${msg}\n`);
@@ -495,9 +501,16 @@ async function cmdStatus(): Promise<void> {
     }
   }
 
+  // Local sync state remains useful even when the network probe is down: a
+  // persisted destination hold should still name the affected org/repo.
+  const report = await computeSyncReport().catch(() => null);
   const probe = await probeConnection(cfg);
   if (!probe.up) {
     rows.push(["Connection", `down — ${probe.reason}`]);
+    if (report && report.skipped.length > 0) {
+      rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
+      rows.push(["Details", "hx doctor sync"]);
+    }
     printStatusTable(rows);
     return;
   }
@@ -508,7 +521,6 @@ async function cmdStatus(): Promise<void> {
 
   // Catch-up progress: percentage first, then sessions, then the total size of
   // all sessions on disk.
-  const report = await computeSyncReport().catch(() => null);
   const snap = report?.snapshot ?? null;
   if (snap && snap.total > 0) {
     const size = formatSize(snap.totalBytes);
@@ -548,13 +560,63 @@ async function cmdStatus(): Promise<void> {
   // on their own), so this is a distinct, softer signal from the "Sync gaps"
   // above — the upload isn't lost, it's waiting and retrying.
   if (report && report.skipped.length > 0) {
-    const n = new Set(report.skipped.map((s) => s.sessionId)).size;
-    rows.push([
-      "Waiting",
-      `${n} session${n === 1 ? "" : "s"} — destination store temporarily unavailable (retrying)`,
-    ]);
+    rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
+    rows.push(["Details", "hx doctor sync"]);
   }
   printStatusTable(rows);
+}
+
+async function cmdDoctor(): Promise<void> {
+  if (process.argv[3] !== "sync") {
+    log("usage: hx doctor sync [--json]");
+    process.exitCode = 64;
+    return;
+  }
+  const cfg = await ensureConfig();
+  const report = await computeSyncReport();
+  const doctor = buildSyncDoctorReport(report, cfg.gatewayBaseUrl);
+  if (hasFlag("json")) log(JSON.stringify(doctor, null, 2));
+  else log(formatSyncDoctorText(doctor));
+  if (!doctor.ok) process.exitCode = 1;
+}
+
+async function cmdRetry(): Promise<void> {
+  if (!hasFlag("blocked")) {
+    log("usage: hx retry --blocked");
+    process.exitCode = 64;
+    return;
+  }
+  const cfg = await ensureConfig();
+  const report = await computeSyncReport();
+  if (report.skipped.length === 0) {
+    log("No blocked sessions to retry.");
+    return;
+  }
+
+  // state.json has a single-writer contract. Stop an installed daemon before
+  // mutating its backoffs, reload the final on-disk state, then bring the same
+  // service back immediately. A deliberately-stopped client gets one foreground
+  // retry pass but remains stopped afterward.
+  const ops = getDaemonOps();
+  const before = await ops.state().catch(() => ({ loaded: false, pid: null }));
+  if (before.loaded) await ops.stop();
+  resetStateCache();
+  const cleared = await clearBlockedFailures();
+
+  if (before.loaded) {
+    const dotfileConsent = await resolveDotfileConsent(ops);
+    await ops.install({ binPath: process.execPath, dotfileConsent });
+    log(
+      `Released ${cleared.sessions} blocked session${cleared.sessions === 1 ? "" : "s"}; daemon restarted for an immediate retry.`,
+    );
+  } else {
+    log(
+      `Released ${cleared.sessions} blocked session${cleared.sessions === 1 ? "" : "s"}; running one retry pass now.`,
+    );
+    const retried = await tickOnce(cfg, { oneShot: true }, log);
+    log(`Retry pass complete. uploaded=${retried.uploaded} failed=${retried.failed}`);
+  }
+  log("Check the result with `hx status`.");
 }
 
 function formatSize(bytes: number): string {
@@ -836,6 +898,12 @@ async function main(): Promise<void> {
     case "status":
       await cmdStatus();
       break;
+    case "doctor":
+      await cmdDoctor();
+      break;
+    case "retry":
+      await cmdRetry();
+      break;
     case "disconnect":
     case "logout": // pre-2026-05-28 alias; keep working for old docs / muscle memory
       await cmdDisconnect();
@@ -870,10 +938,12 @@ async function main(): Promise<void> {
       log("  stop       Pause the background service");
       log("  restart    Reload + restart the background service");
       log("  status     Show connection status and link quality");
+      log("  doctor sync  Explain blocked sessions (pass --json for automation)");
       log("  logs       Tail the daemon's stdout / stderr");
       log("");
       log("Maintenance:");
       log("  backfill   Upload tasks + plans for sessions already on disk");
+      log("  retry --blocked  Clear destination backoff and retry immediately");
       log("  update     Fetch the latest hx binary and restart the daemon");
       log("  disconnect Forget the device token");
       log("  uninstall  Remove daemon + binary (pass --purge to also remove ~/.let/hx/)");

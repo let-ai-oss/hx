@@ -6,13 +6,27 @@ import {
   classifyUpstreamError,
   collectSkipped,
   reconcileChildParent,
+  snapshotFrom,
 } from "./watch.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
 import type { DiscoveredFile } from "./sources.js";
 
 const vaultOffline = () =>
-  new HxHttpError(503, 'append-url failed: 503 {"error":"vault_offline"}');
+  new HxHttpError(503, 'append-url failed: 503 {"error":"vault_offline"}', {
+    reason: "vault_offline",
+    destinations: [{
+      vaultOrgId: "orgA",
+      reason: "vault_offline",
+      orgName: "Acme",
+      orgSlug: "acme",
+      projectId: "projA",
+      projectName: "Rocket",
+      projectSlug: "rocket",
+      repoSlug: "acme/rocket",
+      lastSeenAt: "2026-07-07T12:00:00.000Z",
+    }],
+  });
 const genericUnavailable = (status: number) =>
   new HxHttpError(status, `commit failed: ${status} Service Unavailable`);
 
@@ -23,6 +37,7 @@ describe("classifyUpstreamError", () => {
       assert.ok(out instanceof SessionUpstreamUnavailable);
       assert.equal(out.reason, "vault_offline");
       assert.equal(out.status, 503);
+      assert.equal(out.blocker?.destinations[0]?.orgName, "Acme");
     }
   });
 
@@ -90,12 +105,33 @@ describe("collectSkipped", () => {
   it("includes a discovered file that is skipped, with its reason and retry time", () => {
     const files = [file("/a"), file("/b")];
     const st = state([
-      fileState("/a", { skipReason: "vault_offline", nextAttemptAtMs: 123 }),
+      fileState("/a", {
+        skipReason: "vault_offline",
+        nextAttemptAtMs: 123,
+        blocker: {
+          reason: "vault_offline",
+          destinations: [],
+          firstSeenAtMs: 100,
+          lastSeenAtMs: 110,
+        },
+      }),
       fileState("/b", {}),
     ]);
     const out = collectSkipped(files, st);
     assert.deepEqual(out, [
-      { path: "/a", sessionId: "sess-/a", reason: "vault_offline", nextAttemptAtMs: 123 },
+      {
+        path: "/a",
+        family: "claude-cli",
+        sessionId: "sess-/a",
+        reason: "vault_offline",
+        nextAttemptAtMs: 123,
+        blocker: {
+          reason: "vault_offline",
+          destinations: [],
+          firstSeenAtMs: 100,
+          lastSeenAtMs: 110,
+        },
+      },
     ]);
   });
 
@@ -106,6 +142,26 @@ describe("collectSkipped", () => {
 
   it("excludes files with no skipReason", () => {
     assert.deepEqual(collectSkipped([file("/a")], state([fileState("/a", {})])), []);
+  });
+});
+
+describe("snapshotFrom", () => {
+  it("never counts a blocked session as done even when legacy offsets equal its size", () => {
+    const file: DiscoveredFile = { path: "/a", size: 10, mtimeMs: 1, source: "claude" };
+    const st: HxState = {
+      files: {
+        "/a": {
+          path: "/a",
+          family: "claude-cli",
+          sessionId: "s1",
+          offsets: { letai: 10 },
+          lastMtimeMs: 1,
+          lastUploadAtMs: 1,
+          skipReason: "vault_offline",
+        },
+      },
+    };
+    assert.deepEqual(snapshotFrom([file], st), { total: 1, done: 0, totalBytes: 10 });
   });
 });
 

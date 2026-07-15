@@ -31,6 +31,7 @@ import {
   type FileSkipReason,
   type FileState,
   type HxState,
+  type SyncBlockerDetails,
   type StateScope,
   clearFileFailure,
   clearHeal,
@@ -66,6 +67,7 @@ import {
   uploadTasks,
   uploadTeamMirror,
   uploadWorkflowRun,
+  vaultBlockerFromDestinations,
   verifySessions,
 } from "./uploader.js";
 import { summariseChunk } from "./parse.js";
@@ -140,6 +142,7 @@ export class SessionUpstreamUnavailable extends Error {
     /** HTTP status when the store answered; null for an outright network failure. */
     readonly status: number | null,
     cause: unknown,
+    readonly blocker?: SyncBlockerDetails,
   ) {
     super(`session store unavailable (${reason})`, { cause });
     this.name = "SessionUpstreamUnavailable";
@@ -164,7 +167,9 @@ export function classifyUpstreamError(
   fortress: boolean,
 ): SessionUpstreamUnavailable | null {
   if (err instanceof HxHttpError) {
-    if (err.vaultOffline) return new SessionUpstreamUnavailable("vault_offline", err.status, err);
+    if (err.vaultOffline) {
+      return new SessionUpstreamUnavailable("vault_offline", err.status, err, err.blocker);
+    }
     if (fortress && err.serverUnavailable) {
       return new SessionUpstreamUnavailable("store_unreachable", err.status, err);
     }
@@ -380,7 +385,11 @@ async function ingestOne(
   // Skip only when the file hasn't grown past the LEAST-current destination —
   // a store still behind the others must keep getting bytes.
   const baseOffset = minOffset(fState);
-  if (st.size <= baseOffset) {
+  // A held session must re-resolve its destination even when every previously
+  // known offset is caught up: the missing/held store may not have had an
+  // offset key on an older gateway response, and remediation may have moved
+  // the repo to a different destination.
+  if (st.size <= baseOffset && !fState.skipReason) {
     if (fState.lastMtimeMs !== st.mtimeMs) {
       await touchMtime(file.path, st.mtimeMs, scope);
     }
@@ -406,6 +415,7 @@ async function ingestOne(
 
   let anyProgress = false;
   let lastUnavailable: HxHttpError | null = null;
+  let heldBlocker: SyncBlockerDetails | undefined;
   let artifactText: string | null = null;
   // A destination that answered "unavailable" this pass is skipped for the
   // rest of the pass — its offset stays put and the next pass retries it.
@@ -434,6 +444,8 @@ async function ingestOne(
       byteCount: st.size - minOffset(fState),
       repoSlug: head.repoSlug,
     });
+
+    heldBlocker = vaultBlockerFromDestinations(append.destinations);
 
     // The destinations array is the gateway's current truth for this session's
     // fan-out set (ready AND held). Drop offsets for destinations that left the
@@ -605,6 +617,17 @@ async function ingestOne(
     await syncArtifacts(cfg, fState, artifactText, log).catch((err) => {
       log(`  [artifacts] ${fState.sessionId.slice(0, 8)}…: ${(err as Error).message}`);
     });
+  }
+  // A mixed fan-out may have made progress to healthy stores while another
+  // destination stayed held. Persist that hold after the healthy commits so
+  // status remains below 100% and names the exact blocked destination.
+  if (heldBlocker) {
+    const err = new HxHttpError(
+      503,
+      "append-url reported a held vault_offline destination",
+      heldBlocker,
+    );
+    throw new SessionUpstreamUnavailable("vault_offline", 503, err, heldBlocker);
   }
   return true;
 }
@@ -1103,14 +1126,16 @@ function electUploaders(
  * Pure in-memory — `state` is the cached object the upload path mutates, so a
  * recompute mid-pass reflects offsets bumped by commits earlier in the pass.
  */
-function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnapshot {
+export function snapshotFrom(files: DiscoveredFile[], state: HxState): SyncSnapshot {
   let done = 0;
   let totalBytes = 0;
   for (const f of files) {
     const fs = state.files[f.path];
     // "Done" = the least-current destination has caught up to the file size.
     const offset = fs ? minOffset(fs) : 0;
-    if (offset >= f.size) done += 1;
+    // A persisted hold is unfinished even when legacy offsets happen to equal
+    // the source size: a destination is still explicitly waiting for bytes.
+    if (offset >= f.size && !fs?.skipReason) done += 1;
     totalBytes += f.size; // total size of ALL sessions, synced or not
   }
   return { total: files.length, done, totalBytes };
@@ -1151,10 +1176,18 @@ export interface SyncBehindEntry {
  *  own once the store returns; surfaced so `hx status` explains the lag. */
 export interface SyncSkippedEntry {
   path: string;
+  family: string;
   sessionId: string;
   reason: FileSkipReason;
   /** When the next upload attempt is due (ms since epoch), if scheduled. */
   nextAttemptAtMs?: number;
+  blocker?: FileState["blocker"];
+}
+
+export interface SyncReport {
+  snapshot: SyncSnapshot;
+  behind: SyncBehindEntry[];
+  skipped: SyncSkippedEntry[];
 }
 
 /** The still-on-disk sessions currently waiting on a temporarily-unavailable
@@ -1167,7 +1200,14 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
   for (const [p, fs] of Object.entries(state.files)) {
     if (!fs.skipReason) continue;
     if (!discovered.has(p)) continue;
-    out.push({ path: p, sessionId: fs.sessionId, reason: fs.skipReason, nextAttemptAtMs: fs.nextAttemptAtMs });
+    out.push({
+      path: p,
+      family: fs.family,
+      sessionId: fs.sessionId,
+      reason: fs.skipReason,
+      nextAttemptAtMs: fs.nextAttemptAtMs,
+      blocker: fs.blocker,
+    });
   }
   return out;
 }
@@ -1177,11 +1217,7 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
  *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
  *  server holds partial transcripts or a store is down. */
-export async function computeSyncReport(): Promise<{
-  snapshot: SyncSnapshot;
-  behind: SyncBehindEntry[];
-  skipped: SyncSkippedEntry[];
-}> {
+export async function computeSyncReport(): Promise<SyncReport> {
   const [claude, codex] = await Promise.all([
     discoverClaudeFiles(),
     discoverCodexFiles(),
@@ -1259,7 +1295,13 @@ export async function tickOnce(
         // fine. Skip just this file — short retries first, then a longer backoff
         // (recordFileFailure doubles per failure) — and record the reason so
         // `hx status` can show it. Everything else keeps uploading.
-        const delay = await recordFileFailure(f.path, SESSION_SKIP_RETRY_BASE_MS, scope, err.reason);
+        const delay = await recordFileFailure(
+          f.path,
+          SESSION_SKIP_RETRY_BASE_MS,
+          scope,
+          err.reason,
+          err.blocker,
+        );
         log(`  [hx] ${describeSkip(err.reason)}; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
         continue;
       }
@@ -1318,7 +1360,13 @@ export async function tickOnce(
             // The child's session vault is offline (child lanes route through the
             // cloud gateway, never fortress-direct) — skip just this child with
             // the same short-retries-then-backoff pacing as its parent.
-            await recordFileFailure(c.path, SESSION_SKIP_RETRY_BASE_MS, scope, "vault_offline");
+            await recordFileFailure(
+              c.path,
+              SESSION_SKIP_RETRY_BASE_MS,
+              scope,
+              "vault_offline",
+              err.blocker,
+            );
             continue;
           }
           // A wholesale lane pause (404/401/403) or gateway-wide outage is not

@@ -1,6 +1,14 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { destKey, offsetFor, migrateFileState, type FileState } from "./state.js";
+import {
+  clearBlockedFailuresFromState,
+  destKey,
+  offsetFor,
+  migrateFileState,
+  reconcileDestinationOffsets,
+  type FileState,
+  type HxState,
+} from "./state.js";
 
 describe("destKey", () => {
   it("maps null to letai and an org id to itself", () => {
@@ -24,6 +32,43 @@ describe("offsetFor", () => {
   it("returns the stored per-destination offset", () => {
     assert.equal(offsetFor(fs({ letai: 42, orgA: 7 }), null), 42);
     assert.equal(offsetFor(fs({ letai: 42, orgA: 7 }), "orgA"), 7);
+  });
+});
+
+describe("reconcileDestinationOffsets", () => {
+  it("adds new destinations at zero and prunes detached destinations", () => {
+    const offsets = { letai: 100, oldOrg: 20 };
+    assert.equal(reconcileDestinationOffsets(offsets, ["letai", "newOrg"]), true);
+    assert.deepEqual(offsets, { letai: 100, newOrg: 0 });
+    assert.equal(reconcileDestinationOffsets(offsets, ["letai", "newOrg"]), false);
+  });
+});
+
+describe("clearBlockedFailuresFromState", () => {
+  it("clears transient holds without changing offsets", () => {
+    const entry: FileState = {
+      path: "/a",
+      family: "claude-cli",
+      sessionId: "s1",
+      offsets: { orgA: 12 },
+      lastMtimeMs: 1,
+      lastUploadAtMs: 2,
+      consecutiveFailures: 3,
+      nextAttemptAtMs: 99,
+      skipReason: "vault_offline",
+      blocker: {
+        reason: "vault_offline",
+        destinations: [],
+        firstSeenAtMs: 1,
+        lastSeenAtMs: 2,
+      },
+    };
+    const state: HxState = { files: { [entry.path]: entry } };
+    assert.deepEqual(clearBlockedFailuresFromState(state), { files: 1, sessions: 1 });
+    assert.deepEqual(entry.offsets, { orgA: 12 });
+    assert.equal(entry.skipReason, undefined);
+    assert.equal(entry.nextAttemptAtMs, undefined);
+    assert.equal(entry.blocker, undefined);
   });
 });
 
@@ -75,5 +120,24 @@ describe("migrateFileState", () => {
       skipReason: "vault_offline",
     });
     assert.equal(out.skipReason, "vault_offline");
+  });
+
+  it("carries structured blocker metadata through the migration", () => {
+    const blocker = {
+      reason: "vault_offline" as const,
+      destinations: [],
+      firstSeenAtMs: 100,
+      lastSeenAtMs: 200,
+    };
+    const out = migrateFileState({
+      path: "/p",
+      family: "claude-cli",
+      sessionId: "s",
+      offsets: { letai: 5 },
+      lastMtimeMs: 1,
+      lastUploadAtMs: 2,
+      blocker,
+    });
+    assert.deepEqual(out.blocker, blocker);
   });
 });

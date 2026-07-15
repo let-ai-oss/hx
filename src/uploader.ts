@@ -6,6 +6,7 @@
 import type { HxConfig } from "./config.js";
 import type { Family } from "./sources.js";
 import type { HxCcdGroupMirrorBlob } from "./mirror-types.js";
+import type { SyncBlockerDetails, SyncBlockerDestination } from "./state.js";
 import { assertSecureFetchUrl } from "./net.js";
 
 /** One fan-out target for a chunk. `ready` carries a signed staging URL; `held`
@@ -19,7 +20,7 @@ export type AppendDestination =
       expiresAt: string;
       status: "ready";
     }
-  | { vaultOrgId: string; status: "held"; reason: "vault_offline"; orgName: string | null };
+  | (SyncBlockerDestination & { status: "held" });
 
 export interface AppendUrlResponse {
   chunkId: string;
@@ -66,6 +67,8 @@ export class HxHttpError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    /** Sanitized routing/liveness metadata for a per-session hold. */
+    public readonly blocker?: SyncBlockerDetails,
   ) {
     super(message);
     this.name = "HxHttpError";
@@ -84,13 +87,57 @@ export class HxHttpError extends Error {
    *  long per-file backoff instead of pausing the whole pass — other sessions
    *  (and other stores) keep uploading. */
   get vaultOffline(): boolean {
-    return this.status === 503 && this.message.includes("vault_offline");
+    return (
+      this.status === 503 &&
+      (this.blocker?.reason === "vault_offline" || this.message.includes("vault_offline"))
+    );
   }
+}
+
+/** Reduce an untrusted gateway destination list to the fixed, non-sensitive
+ * blocker allowlist used by state/status/doctor. */
+export function vaultBlockerFromDestinations(destinations: unknown): SyncBlockerDetails | undefined {
+  if (!Array.isArray(destinations)) return undefined;
+  const sanitized = destinations.flatMap((raw): SyncBlockerDestination[] => {
+    if (!raw || typeof raw !== "object") return [];
+    const d = raw as Record<string, unknown>;
+    if (typeof d.vaultOrgId !== "string" || d.reason !== "vault_offline") return [];
+    const nullableString = (value: unknown): string | null =>
+      typeof value === "string" ? value : null;
+    return [{
+      vaultOrgId: d.vaultOrgId,
+      reason: "vault_offline",
+      orgName: nullableString(d.orgName),
+      orgSlug: nullableString(d.orgSlug),
+      projectId: nullableString(d.projectId),
+      projectName: nullableString(d.projectName),
+      projectSlug: nullableString(d.projectSlug),
+      repoSlug: nullableString(d.repoSlug),
+      lastSeenAt: nullableString(d.lastSeenAt),
+    }];
+  });
+  return sanitized.length > 0
+    ? { reason: "vault_offline", destinations: sanitized }
+    : undefined;
 }
 
 async function throwHttp(res: Response, label: string): Promise<never> {
   const txt = await res.text().catch(() => "");
-  throw new HxHttpError(res.status, `${label} failed: ${res.status} ${txt.slice(0, 200)}`);
+  let blocker: SyncBlockerDetails | undefined;
+  try {
+    const body = JSON.parse(txt) as { error?: unknown; destinations?: unknown };
+    if (body.error === "vault_offline") {
+      blocker = vaultBlockerFromDestinations(body.destinations);
+    }
+  } catch {
+    // Old gateways and storage services may return text/HTML. Keep the bounded
+    // legacy message and simply omit structured diagnostics.
+  }
+  throw new HxHttpError(
+    res.status,
+    `${label} failed: ${res.status} ${txt.slice(0, 200)}`,
+    blocker,
+  );
 }
 
 function authHeaders(cfg: HxConfig): Record<string, string> {

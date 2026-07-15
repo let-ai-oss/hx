@@ -1,6 +1,11 @@
 import { describe, it, afterEach } from "bun:test";
 import assert from "node:assert/strict";
-import { requestAppendUrl, putChunk } from "./uploader.js";
+import {
+  HxHttpError,
+  requestAppendUrl,
+  putChunk,
+  vaultBlockerFromDestinations,
+} from "./uploader.js";
 import type { HxConfig } from "./config.js";
 
 const realFetch = globalThis.fetch;
@@ -76,7 +81,18 @@ describe("requestAppendUrl with a multi-destination response", () => {
           vaultOrgId: null,
           destinations: [
             { vaultOrgId: null, chunkId: "c1", uploadUrl: "https://b/p", objectName: "o", expiresAt: "z", status: "ready" },
-            { vaultOrgId: "orgA", status: "held", reason: "vault_offline", orgName: "Acme" },
+            {
+              vaultOrgId: "orgA",
+              status: "held",
+              reason: "vault_offline",
+              orgName: "Acme",
+              orgSlug: "acme",
+              projectId: "projA",
+              projectName: "Rocket",
+              projectSlug: "rocket",
+              repoSlug: "acme/app",
+              lastSeenAt: "2026-07-07T12:00:00.000Z",
+            },
           ],
         }),
         { status: 200, headers: { "content-type": "application/json" } },
@@ -102,5 +118,66 @@ describe("requestAppendUrl with a multi-destination response", () => {
       { family: "claude-cli", sessionId: "s1", byteCount: 1 },
     );
     assert.equal(res.destinations, undefined);
+  });
+
+  it("preserves sanitized blocker metadata from an all-held 503", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: "vault_offline",
+          destinations: [{
+            vaultOrgId: "orgA",
+            status: "held",
+            reason: "vault_offline",
+            orgName: "Acme",
+            orgSlug: "acme",
+            projectId: "projA",
+            projectName: "Rocket",
+            projectSlug: "rocket",
+            repoSlug: "acme/app",
+            lastSeenAt: "2026-07-07T12:00:00.000Z",
+            uploadUrl: "https://must-not-survive.example/signed",
+            accessToken: "must-not-survive",
+          }],
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    try {
+      await requestAppendUrl(
+        { gatewayBaseUrl: "https://g", accessToken: "t" },
+        { family: "claude-cli", sessionId: "s1", byteCount: 1, repoSlug: "acme/app" },
+      );
+      assert.fail("expected requestAppendUrl to throw");
+    } catch (err) {
+      assert.ok(err instanceof HxHttpError);
+      assert.equal(err.blocker?.destinations[0]?.projectName, "Rocket");
+      assert.equal("uploadUrl" in (err.blocker?.destinations[0] ?? {}), false);
+      assert.equal("accessToken" in (err.blocker?.destinations[0] ?? {}), false);
+    }
+  });
+});
+
+describe("vaultBlockerFromDestinations", () => {
+  it("allowlists operational fields from a mixed fan-out response", () => {
+    const out = vaultBlockerFromDestinations([{
+      vaultOrgId: "orgA",
+      status: "held",
+      reason: "vault_offline",
+      orgName: "Acme",
+      repoSlug: "acme/app",
+      uploadUrl: "https://must-not-survive.example/signed",
+      accessToken: "must-not-survive",
+    }]);
+    assert.deepEqual(out?.destinations[0], {
+      vaultOrgId: "orgA",
+      reason: "vault_offline",
+      orgName: "Acme",
+      orgSlug: null,
+      projectId: null,
+      projectName: null,
+      projectSlug: null,
+      repoSlug: "acme/app",
+      lastSeenAt: null,
+    });
   });
 });
