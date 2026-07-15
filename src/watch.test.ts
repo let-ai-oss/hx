@@ -2,8 +2,10 @@ import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
   SessionUpstreamUnavailable,
+  buildChildParentIndex,
   classifyUpstreamError,
   collectSkipped,
+  reconcileChildParent,
 } from "./watch.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
@@ -104,5 +106,76 @@ describe("collectSkipped", () => {
 
   it("excludes files with no skipReason", () => {
     assert.deepEqual(collectSkipped([file("/a")], state([fileState("/a", {})])), []);
+  });
+});
+
+describe("child parent identity", () => {
+  const fileState = (path: string, over: Partial<FileState> = {}): FileState => ({
+    path,
+    family: "claude-desktop",
+    sessionId: "canonical-session",
+    offsets: { letai: 42 },
+    lastMtimeMs: 1,
+    lastUploadAtMs: 2,
+    ...over,
+  });
+
+  it("maps Claude's artifact-directory id to the parsed parent session id", () => {
+    const parent = fileState("/projects/artifact-session.jsonl");
+    const staleChild = fileState("/projects/artifact-session/subagents/agent-a123.jsonl", {
+      family: "claude-cli",
+      sessionId: "artifact-session",
+    });
+    const index = buildChildParentIndex({
+      files: { [parent.path]: parent, [staleChild.path]: staleChild },
+    });
+
+    assert.deepEqual(index.get("artifact-session"), {
+      family: "claude-desktop",
+      sessionId: "canonical-session",
+    });
+  });
+
+  it("drops conflicting parent mappings instead of guessing", () => {
+    const first = fileState("/one/artifact-session.jsonl");
+    const second = fileState("/two/artifact-session.jsonl", { sessionId: "other-session" });
+
+    assert.equal(
+      buildChildParentIndex({ files: { [first.path]: first, [second.path]: second } }).has(
+        "artifact-session",
+      ),
+      false,
+    );
+  });
+
+  it("repairs stale child state, resets wrong-prefix offsets, and clears backoff", () => {
+    const child = fileState("/projects/artifact-session/subagents/agent-a123.jsonl", {
+      family: "claude-cli",
+      sessionId: "artifact-session",
+      consecutiveFailures: 4,
+      nextAttemptAtMs: 999,
+    });
+    const repaired = reconcileChildParent(child, {
+      family: "claude-desktop",
+      sessionId: "canonical-session",
+    });
+
+    assert.equal(repaired.family, "claude-desktop");
+    assert.equal(repaired.sessionId, "canonical-session");
+    assert.deepEqual(repaired.offsets, {});
+    assert.equal(repaired.consecutiveFailures, undefined);
+    assert.equal(repaired.nextAttemptAtMs, undefined);
+  });
+
+  it("keeps committed offsets when only the family classification changes", () => {
+    const child = fileState("/projects/session/subagents/agent-a123.jsonl", {
+      family: "claude-cli",
+    });
+    const repaired = reconcileChildParent(child, {
+      family: "claude-desktop",
+      sessionId: "canonical-session",
+    });
+
+    assert.deepEqual(repaired.offsets, { letai: 42 });
   });
 });

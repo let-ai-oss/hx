@@ -615,10 +615,74 @@ async function ingestOne(
  * dedicated agent endpoints; per-file state reuses the same FileState map
  * (keyed by path), with sessionId = the PARENT session id.
  */
+export interface ChildParentIdentity {
+  family: string;
+  sessionId: string;
+}
+
+/**
+ * Map Claude's on-disk artifact-directory id to the parent identity hx sends to
+ * the gateway. Those ids are usually equal, but Claude Desktop can name the
+ * flat file + artifact directory with one UUID while embedding a different
+ * canonical sessionId inside the JSONL. Parent FileState already carries the
+ * parsed canonical id, so basename -> FileState is the authoritative bridge.
+ *
+ * Conflicting basename mappings are omitted rather than guessed. Child state
+ * entries are excluded so a stale child cannot become its own parent oracle.
+ */
+export function buildChildParentIndex(state: HxState): Map<string, ChildParentIdentity> {
+  const index = new Map<string, ChildParentIdentity>();
+  const ambiguous = new Set<string>();
+  for (const file of Object.values(state.files)) {
+    if (!file.path.endsWith(".jsonl")) continue;
+    if (file.path.split(path.sep).includes("subagents")) continue;
+    const artifactSessionId = path.basename(file.path, ".jsonl");
+    if (artifactSessionId.startsWith("rollout-")) continue;
+    if (ambiguous.has(artifactSessionId)) continue;
+    const identity = { family: file.family, sessionId: file.sessionId };
+    const existing = index.get(artifactSessionId);
+    if (
+      existing &&
+      (existing.family !== identity.family || existing.sessionId !== identity.sessionId)
+    ) {
+      index.delete(artifactSessionId);
+      ambiguous.add(artifactSessionId);
+      continue;
+    }
+    index.set(artifactSessionId, identity);
+  }
+  return index;
+}
+
+/** Repair a persisted child identity after learning its canonical parent. A
+ * session-id change means any old offsets refer to the wrong storage prefix, so
+ * replay from zero. Either identity change clears failure backoff immediately —
+ * a client update should not wait up to 30 minutes before applying the repair. */
+export function reconcileChildParent(
+  child: FileState,
+  parent: ChildParentIdentity | undefined,
+): FileState {
+  if (!parent) return child;
+  const sessionChanged = child.sessionId !== parent.sessionId;
+  if (!sessionChanged && child.family === parent.family) return child;
+  return {
+    ...child,
+    family: parent.family,
+    sessionId: parent.sessionId,
+    offsets: sessionChanged ? {} : child.offsets,
+    lastUploadAtMs: sessionChanged ? 0 : child.lastUploadAtMs,
+    consecutiveFailures: undefined,
+    nextAttemptAtMs: undefined,
+    skipReason: undefined,
+    healCount: sessionChanged ? undefined : child.healCount,
+    healPausedUntilMs: sessionChanged ? undefined : child.healPausedUntilMs,
+  };
+}
+
 async function ingestChildOne(
   cfg: HxConfig,
   child: DiscoveredChildFile,
-  familyBySession: Map<string, string>,
+  parentByArtifactSession: Map<string, ChildParentIdentity>,
   opts: WatchOptions,
   log: (msg: string) => void,
 ): Promise<boolean> {
@@ -629,19 +693,26 @@ async function ingestChildOne(
     return false;
   }
   const scope = scopeOf(cfg);
+  const parent = parentByArtifactSession.get(child.parentSessionId);
   let fState = await getFileState(child.path, scope);
   if (!fState) {
     fState = {
       path: child.path,
       // The child belongs to the parent's session row, so it MUST upload under
-      // the parent's family or the gateway would mint a sibling row id.
-      family: familyBySession.get(child.parentSessionId) ?? "claude-cli",
-      sessionId: child.parentSessionId,
+      // the parent's canonical family + id or the gateway would mint a sibling.
+      family: parent?.family ?? "claude-cli",
+      sessionId: parent?.sessionId ?? child.parentSessionId,
       offsets: {},
       lastMtimeMs: st.mtimeMs,
       lastUploadAtMs: 0,
     };
     await upsertFileState(fState, scope);
+  } else {
+    const reconciled = reconcileChildParent(fState, parent);
+    if (reconciled !== fState) {
+      fState = reconciled;
+      await upsertFileState(fState, scope);
+    }
   }
   // A child lane is single-destination (its store is the parent session's,
   // resolved server-side and stable), so its one offset is the min over keys.
@@ -713,27 +784,29 @@ async function ingestChildOne(
 async function syncWorkflowRun(
   cfg: HxConfig,
   run: DiscoveredWorkflowRun,
-  familyBySession: Map<string, string>,
+  parentByArtifactSession: Map<string, ChildParentIdentity>,
   log: (msg: string) => void,
 ): Promise<void> {
   const scope = scopeOf(cfg);
-  const family = (familyBySession.get(run.parentSessionId) ?? "claude-cli") as never;
+  const parent = parentByArtifactSession.get(run.parentSessionId);
+  const family = (parent?.family ?? "claude-cli") as never;
+  const sessionId = parent?.sessionId ?? run.parentSessionId;
   const journal = await readTextFile(run.journalPath);
   const script = await readTextFile(run.scriptPath);
   if (!journal && !script) return;
-  const key = `${String(family)}:${run.parentSessionId}:wf:${run.runId}`;
+  const key = `${String(family)}:${sessionId}:wf:${run.runId}`;
   const hash = hashContent(`${script ?? ""}\n--journal--\n${journal ?? ""}`);
   if ((await getArtifactHash(key, scope)) === hash) return;
   await uploadWorkflowRun(cfg, {
     family,
-    sessionId: run.parentSessionId,
+    sessionId,
     runId: run.runId,
     scriptName: run.scriptName,
     script,
     journal,
   });
   await setArtifactHash(key, hash, scope);
-  log(`  [workflow] ${run.parentSessionId.slice(0, 8)}…/${run.runId}`);
+  log(`  [workflow] ${sessionId.slice(0, 8)}…/${run.runId}`);
 }
 
 // Mirror the device's active agent teams (~/.claude/teams/*). The dirs exist
@@ -1213,17 +1286,24 @@ export async function tickOnce(
   // Children are excluded from the sync snapshot on purpose: the Devices bar
   // counts sessions, and a child stream is part of its session, not a new one.
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
-    const familyBySession = new Map<string, string>();
-    for (const f of Object.values(state.files)) {
-      familyBySession.set(f.sessionId, f.family);
-    }
+    const parentByArtifactSession = buildChildParentIndex(state);
     try {
       const { children, runs } = await discoverClaudeChildren();
       for (const c of children) {
-        const pendingChild = state.files[c.path];
+        let pendingChild = state.files[c.path];
+        if (pendingChild) {
+          const reconciled = reconcileChildParent(
+            pendingChild,
+            parentByArtifactSession.get(c.parentSessionId),
+          );
+          if (reconciled !== pendingChild) {
+            pendingChild = reconciled;
+            await upsertFileState(reconciled, scope);
+          }
+        }
         if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) continue;
         try {
-          const did = await ingestChildOne(cfg, c, familyBySession, opts, log);
+          const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
           if (did) uploaded += 1;
           if (
             pendingChild?.consecutiveFailures !== undefined ||
@@ -1251,7 +1331,7 @@ export async function tickOnce(
       }
       for (const r of runs) {
         try {
-          await syncWorkflowRun(cfg, r, familyBySession, log);
+          await syncWorkflowRun(cfg, r, parentByArtifactSession, log);
         } catch (err) {
           if (latchChildLanePause(err, scope, log)) break;
           log(`  [error] workflow ${r.runId}: ${(err as Error).message}`);
