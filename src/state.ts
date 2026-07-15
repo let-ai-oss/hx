@@ -27,6 +27,33 @@ export type StateScope = "main" | "local";
  *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
 export type FileSkipReason = "vault_offline" | "store_unreachable";
 
+/** Non-sensitive routing context returned by the gateway for a held upload. */
+export interface SyncBlockerDestination {
+  vaultOrgId: string;
+  reason: "vault_offline";
+  /** Optional for compatibility with gateways that predate rich blockers. */
+  orgName?: string | null;
+  orgSlug?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectSlug?: string | null;
+  repoSlug?: string | null;
+  /** Gateway-observed Fortress heartbeat, not transcript activity. */
+  lastSeenAt?: string | null;
+}
+
+/** Structured explanation attached to an unavailable-session error. */
+export interface SyncBlockerDetails {
+  reason: FileSkipReason;
+  destinations: SyncBlockerDestination[];
+}
+
+/** The blocker persisted beside an upload offset for offline diagnostics. */
+export interface PersistedSyncBlocker extends SyncBlockerDetails {
+  firstSeenAtMs: number;
+  lastSeenAtMs: number;
+}
+
 export interface FileState {
   /** Absolute jsonl path on disk. */
   path: string;
@@ -65,6 +92,9 @@ export interface FileState {
    *  temporarily unavailable (a transient outage, not a fault of this file).
    *  Drives the `hx status` "waiting" row; cleared by any clean pass. */
   skipReason?: FileSkipReason;
+  /** Compact operational context only: no transcript content, paths, tokens,
+   *  signed URLs, or credentials are ever stored here. */
+  blocker?: PersistedSyncBlocker;
 }
 
 /** On-disk shape before per-destination fan-out carried a single `offset`. The
@@ -82,6 +112,7 @@ export interface LegacyFileState {
   consecutiveFailures?: number;
   nextAttemptAtMs?: number;
   skipReason?: FileSkipReason;
+  blocker?: PersistedSyncBlocker;
   healCount?: number;
   healPausedUntilMs?: number;
 }
@@ -120,6 +151,7 @@ export function migrateFileState(s: LegacyFileState): FileState {
     consecutiveFailures: s.consecutiveFailures,
     nextAttemptAtMs: s.nextAttemptAtMs,
     skipReason: s.skipReason,
+    blocker: s.blocker,
     healCount: s.healCount,
     healPausedUntilMs: s.healPausedUntilMs,
   };
@@ -140,6 +172,12 @@ const STATE_FILE: Record<StateScope, string> = {
 
 const inMemory = new Map<StateScope, HxState>();
 const writeChains = new Map<StateScope, Promise<void>>();
+
+/** Forget a cached snapshot so a maintenance command can re-read state after
+ *  stopping the daemon that owned the file. */
+export function resetStateCache(scope: StateScope = "main"): void {
+  inMemory.delete(scope);
+}
 
 function statePath(scope: StateScope): string {
   return path.join(STATE_DIR, STATE_FILE[scope]);
@@ -237,14 +275,33 @@ export async function reconcileDestinations(
   const state = await loadState(scope);
   const existing = state.files[filePath];
   if (!existing) return;
+  const changed = reconcileDestinationOffsets(existing.offsets, activeKeys);
+  if (changed) await schedulePersist(state, scope);
+}
+
+/** Apply a gateway's current destination set to an offset map. Exported as a
+ * pure mutation helper so the add-at-zero/prune contract is directly tested. */
+export function reconcileDestinationOffsets(
+  offsets: Record<string, number>,
+  activeKeys: string[],
+): boolean {
   const keep = new Set(activeKeys);
   let changed = false;
-  for (const k of Object.keys(existing.offsets)) {
-    if (keep.has(k)) continue;
-    delete existing.offsets[k];
+  // A newly-attached destination starts at zero. Recording that zero is what
+  // keeps the sync percentage honest while the destination is held/offline;
+  // otherwise minOffset() would only see already-written stores and could
+  // incorrectly report 100%.
+  for (const k of keep) {
+    if (k in offsets) continue;
+    offsets[k] = 0;
     changed = true;
   }
-  if (changed) await schedulePersist(state, scope);
+  for (const k of Object.keys(offsets)) {
+    if (keep.has(k)) continue;
+    delete offsets[k];
+    changed = true;
+  }
+  return changed;
 }
 
 /** Refresh a file's observed mtime without advancing any destination's offset
@@ -276,6 +333,7 @@ export async function recordFileFailure(
   baseMs: number,
   scope: StateScope = "main",
   skipReason?: FileSkipReason,
+  blocker?: SyncBlockerDetails,
 ): Promise<number> {
   const state = await loadState(scope);
   const existing = state.files[filePath];
@@ -286,6 +344,17 @@ export async function recordFileFailure(
   existing.nextAttemptAtMs = Date.now() + delay;
   if (skipReason) existing.skipReason = skipReason;
   else delete existing.skipReason;
+  if (blocker) {
+    const now = Date.now();
+    const sameReason = existing.blocker?.reason === blocker.reason;
+    existing.blocker = {
+      ...blocker,
+      firstSeenAtMs: sameReason ? existing.blocker!.firstSeenAtMs : now,
+      lastSeenAtMs: now,
+    };
+  } else {
+    delete existing.blocker;
+  }
   await schedulePersist(state, scope);
   return delay;
 }
@@ -339,14 +408,45 @@ export async function clearFileFailure(
     !existing ||
     (existing.consecutiveFailures === undefined &&
       existing.nextAttemptAtMs === undefined &&
-      existing.skipReason === undefined)
+      existing.skipReason === undefined &&
+      existing.blocker === undefined)
   ) {
     return;
   }
   delete existing.consecutiveFailures;
   delete existing.nextAttemptAtMs;
   delete existing.skipReason;
+  delete existing.blocker;
   await schedulePersist(state, scope);
+}
+
+/** Clear only transient destination holds so the next daemon pass retries them
+ *  immediately. The caller stops the daemon first, preserving state.json's
+ *  single-writer invariant. */
+export async function clearBlockedFailures(
+  scope: StateScope = "main",
+): Promise<{ files: number; sessions: number }> {
+  const state = await loadState(scope);
+  const cleared = clearBlockedFailuresFromState(state);
+  if (cleared.files > 0) await schedulePersist(state, scope);
+  return cleared;
+}
+
+export function clearBlockedFailuresFromState(
+  state: HxState,
+): { files: number; sessions: number } {
+  const sessions = new Set<string>();
+  let files = 0;
+  for (const entry of Object.values(state.files)) {
+    if (!entry.skipReason && !entry.blocker) continue;
+    files += 1;
+    sessions.add(`${entry.family}:${entry.sessionId}`);
+    delete entry.consecutiveFailures;
+    delete entry.nextAttemptAtMs;
+    delete entry.skipReason;
+    delete entry.blocker;
+  }
+  return { files, sessions: sessions.size };
 }
 
 export async function getArtifactHash(
