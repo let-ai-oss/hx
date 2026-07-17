@@ -108,13 +108,18 @@ echo "Installed hx to $BIN"
 # $SHELL is only the *login* shell from the password DB; it doesn't change when
 # the user starts a different shell. The shell that invoked this script is our
 # parent, so read its name off $PPID and fall back to $SHELL when ps can't say.
+#
+# Only match shells a human sits in: an sh/dash parent is nearly always a
+# wrapper (`sh install-from-source.sh`, a Makefile), and trusting it would send
+# a zsh user's PATH line to ~/.profile, which zsh never reads. $SHELL answers
+# those, and still lands a genuine sh user on ~/.profile via the default below.
 hx_shell=$(basename "${SHELL:-/bin/sh}")
 if command -v ps >/dev/null 2>&1; then
   _pcomm=$(ps -o comm= -p "$PPID" 2>/dev/null || true)
   _pcomm=${_pcomm#-}        # login shells show as '-zsh' / '-bash'
   _pcomm=${_pcomm##*/}      # strip any dir: '/bin/zsh' -> 'zsh'
   case "$_pcomm" in
-    zsh|bash|fish|sh|dash|ksh|ksh93|mksh|ash) hx_shell=$_pcomm ;;
+    zsh|bash|fish) hx_shell=$_pcomm ;;
   esac
 fi
 
@@ -145,17 +150,29 @@ case "$hx_shell" in
     SOURCE_KW="."
     ;;
 esac
-touch "$RC"
+touch "$RC" 2>/dev/null || true
 
+# An unwritable rc must not fail the install — the binary is built and `hx
+# connect` below still works. Read-only rc files (home-manager/chezmoi symlink
+# them into an immutable store) and unwritable $HOME (containers) are both real,
+# and under `set -e` an unguarded `>>` aborts here, between build and connect.
+#
+# Report success only when the line landed: `set -e` does NOT fire on a failed
+# redirect into a { } group in bash-as-sh, so an unconditional "Added …" claims
+# a PATH that was never set — the exact gap this block closes.
+#
 # Idempotency: full-line fixed-string match, so a rebuild never stacks a second
 # copy. A loose substring grep would treat any past mention of .let/bin as
 # "done" — including one in a different rc file.
-if ! grep -qxF "$PATH_LINE" "$RC" 2>/dev/null; then
-  {
-    echo ""
-    echo "# Added by hx installer ($(date '+%Y-%m-%d'))"
-    echo "$PATH_LINE"
-  } >> "$RC"
+path_written=0
+if grep -qxF "$PATH_LINE" "$RC" 2>/dev/null; then
+  path_written=1
+elif {
+  echo ""
+  echo "# Added by hx installer ($(date '+%Y-%m-%d'))"
+  echo "$PATH_LINE"
+} >> "$RC" 2>/dev/null; then
+  path_written=1
   echo "Added ~/.let/bin to PATH in $RC"
 fi
 
@@ -284,11 +301,19 @@ else
   "$BIN" connect || connect_status=$?
 fi
 
+# Nothing to say when `hx` already resolves. Otherwise the closing card depends
+# on whether the rc line landed: sourcing an rc we failed to write bridges
+# nothing, so that case asks for the line by hand instead — the one instruction
+# that still works, and the last thing on screen either way.
 if [ "$hx_on_path" = 0 ]; then
   echo ""
-  draw_cta "Run this to use hx in this terminal:" "$SOURCE_KW $RC"
-  echo ""
-  printf '  %s(new terminals find hx automatically)%s\n' "$DIM" "$RST"
+  if [ "$path_written" = 1 ]; then
+    draw_cta "Run this to use hx in this terminal:" "$SOURCE_KW $RC"
+    echo ""
+    printf '  %s(new terminals find hx automatically)%s\n' "$DIM" "$RST"
+  else
+    draw_cta "Couldn't write $RC. Add this line to it:" "$PATH_LINE"
+  fi
 fi
 
 exit "$connect_status"
