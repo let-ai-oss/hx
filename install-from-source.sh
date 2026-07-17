@@ -157,9 +157,13 @@ touch "$RC" 2>/dev/null || true
 # them into an immutable store) and unwritable $HOME (containers) are both real,
 # and under `set -e` an unguarded `>>` aborts here, between build and connect.
 #
-# Report success only when the line landed: `set -e` does NOT fire on a failed
-# redirect into a { } group in bash-as-sh, so an unconditional "Added …" claims
-# a PATH that was never set — the exact gap this block closes.
+# Report success only when the line landed: an unconditional "Added …" would
+# claim a PATH that was never set — the exact gap this block closes. As the
+# `elif` condition the append is also exempt from `set -e`, whatever /bin/sh is.
+#
+# `2>/dev/null` ahead of the `>>`, not after: redirections are applied in order,
+# so with the append first the shell's own "Permission denied" reaches the real
+# stderr before /dev/null is in place.
 #
 # Idempotency: full-line fixed-string match, so a rebuild never stacks a second
 # copy. A loose substring grep would treat any past mention of .let/bin as
@@ -171,7 +175,7 @@ elif {
   echo ""
   echo "# Added by hx installer ($(date '+%Y-%m-%d'))"
   echo "$PATH_LINE"
-} >> "$RC" 2>/dev/null; then
+} 2>/dev/null >> "$RC"; then
   path_written=1
   echo "Added ~/.let/bin to PATH in $RC"
 fi
