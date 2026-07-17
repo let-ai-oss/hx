@@ -80,10 +80,16 @@ current prod). Pass your workbench's hx gateway explicitly instead (e.g.
 `./install-from-source.sh https://<your-workbench>/_api/hx-gateway`) to connect to a
 different environment. The script requires [Bun](https://bun.sh) — if it's missing it
 offers to install it for you — then: `bun install` → `bun run build` → installs
-`./dist/hx` to `~/.let/bin/hx` (ad-hoc code-signing it on macOS), seeds the gateway into
-`~/.let/hx/config.json`, and hands off to the same interactive `hx connect` device flow
-(browser approval + background mirror). `bun run install:connect` runs the same
-entrypoint.
+`./dist/hx` to `~/.let/bin/hx` (ad-hoc code-signing it on macOS), adds `~/.let/bin` to
+your shell's `PATH`, seeds the gateway into `~/.let/hx/config.json`, and hands off to the
+same interactive `hx connect` device flow (browser approval + background mirror).
+`bun run install:connect` runs the same entrypoint.
+
+The `PATH` edit lands in your shell's startup file (`~/.zshrc`, `~/.bashrc`,
+`~/.bash_profile` on macOS, `~/.config/fish/config.fish`, or `~/.profile`), so **new**
+terminals find `hx` on their own. The shell you ran the installer from won't — a process
+can't change its parent's environment — so it prints the one-time `source` command to
+bridge it. Run that, or open a new terminal.
 
 ## Commands
 
