@@ -55,7 +55,7 @@ export function DeviceDetail() {
       setVerSub({ bar: p, text: `Downloading 76.3.0 (14.1 MB) — ${p}%`, ok: false });
       await sleep(55);
     }
-    for (const [label, ms] of [["Verifying checksum…", 450], ["Installing…", 450], ["Restarting daemon…", 600], ["Reconnecting HX UI…", 700]] as [string, number][]) {
+    for (const [label, ms] of [["Verifying checksum…", 450], ["Installing…", 450], ["Restarting daemon…", 600], ["Reconnecting HX Client…", 700]] as [string, number][]) {
       setVerSub({ bar: 100, text: label, ok: false });
       await sleep(ms);
     }

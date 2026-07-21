@@ -16,7 +16,7 @@ import { InspectorModal } from "./modals/InspectorModal";
 function Chrome() {
   const { deviceName } = useApp();
   useEffect(() => {
-    document.title = `HX UI — ${deviceName}`;
+    document.title = `HX Client — ${deviceName}`;
   }, [deviceName]);
   return (
     <>

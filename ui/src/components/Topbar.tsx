@@ -15,7 +15,7 @@ export function Topbar() {
   return (
     <div className="topbar">
       <div className="mark"><i></i><i></i><i></i><i></i></div>
-      <div className="wordmark">HX <span>UI</span></div>
+      <div className="wordmark">HX Client</div>
 
       <div className="chip" id="connChip" style={{ marginLeft: 8 }}>
         <span className="dot" id="connDot" style={{ background: deviceConnected ? "var(--ok)" : "var(--border-strong)" }}></span> <span id="connLabel">{deviceConnected ? "Connected" : "Disconnected"}</span>
