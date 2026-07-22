@@ -4,20 +4,20 @@
 // must never affect uploads, so every function here swallows its errors.
 // Nothing in this file uploads anywhere; the journal stays on the machine.
 
-import { appendFile, open, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, open, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { HX_DIR } from "./hx-home.js";
 
 export const ACTIVITY_PATH = join(HX_DIR, "activity.jsonl");
 
+// Deliberately minimal fields: enough for the chart (per-hour bytes) and the
+// distinct-session stats. No transcript-derived text (titles, paths) — the UI
+// resolves display names from its own head reads.
 export interface ActivityEntry {
   /** Epoch ms of the commit. */
   at: number;
   sessionId: string;
   family: string;
-  title: string | null;
-  /** ~-collapsed folder (session cwd). */
-  folder: string | null;
   bytes: number;
   /** Destination store key: "letai" or a vault org id. */
   dest: string;
@@ -52,8 +52,6 @@ export function parseActivityLines(text: string, sinceMs: number): ActivityEntry
           at: e.at,
           sessionId: e.sessionId,
           family: typeof e.family === "string" ? e.family : "unknown",
-          title: typeof e.title === "string" ? e.title : null,
-          folder: typeof e.folder === "string" ? e.folder : null,
           bytes: e.bytes,
           dest: e.dest,
         });
@@ -67,12 +65,12 @@ export function parseActivityLines(text: string, sinceMs: number): ActivityEntry
 
 export async function readActivity(sinceMs: number, path: string = ACTIVITY_PATH): Promise<ActivityEntry[]> {
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- see appendActivity.
-    const st = await stat(path);
-    const start = Math.max(0, st.size - READ_CAP_BYTES);
+    // Open first, size via fstat on the handle — no stat-then-open race.
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- see appendActivity.
     const fh = await open(path, "r");
     try {
+      const st = await fh.stat();
+      const start = Math.max(0, st.size - READ_CAP_BYTES);
       const buf = Buffer.alloc(st.size - start);
       await fh.read(buf, 0, buf.length, start);
       const text = buf.toString("utf-8");
@@ -92,14 +90,14 @@ const TRIM_KEEP_BYTES = 1 * 1024 * 1024;
  *  (aligned to a line boundary). Called once at daemon start. */
 export async function trimActivity(path: string = ACTIVITY_PATH): Promise<void> {
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- see appendActivity.
-    const st = await stat(path);
-    if (st.size <= TRIM_AT_BYTES) return;
-    const start = st.size - TRIM_KEEP_BYTES;
+    // Open first, size via fstat on the handle — no stat-then-open race.
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- see appendActivity.
     const fh = await open(path, "r");
     let text: string;
     try {
+      const st = await fh.stat();
+      if (st.size <= TRIM_AT_BYTES) return;
+      const start = st.size - TRIM_KEEP_BYTES;
       const buf = Buffer.alloc(TRIM_KEEP_BYTES);
       await fh.read(buf, 0, buf.length, start);
       text = buf.toString("utf-8");

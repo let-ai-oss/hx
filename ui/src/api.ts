@@ -110,8 +110,6 @@ export interface ActivityEntry {
   at: number;
   sessionId: string;
   family: string;
-  title: string | null;
-  folder: string | null;
   bytes: number;
   dest: string;
 }

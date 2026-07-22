@@ -2,7 +2,7 @@
 // rendered as the same Me/Agent/Tool lines the transcript uploads as. Reads
 // a bounded tail (64 KB) of the jsonl — never the whole file.
 
-import { open, stat } from "node:fs/promises";
+import { open } from "node:fs/promises";
 
 export type PreviewRole = "Me" | "Agent" | "Tool";
 export interface PreviewLine {
@@ -120,13 +120,13 @@ export async function readHeadLines(filePath: string): Promise<string[]> {
 
 export async function previewSessionFile(filePath: string): Promise<PreviewLine[]> {
   try {
+    // Open first, size via fstat on the handle — no stat-then-open race.
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- the
     // route handler admits only paths present in the discovery scan.
-    const st = await stat(filePath);
-    const start = Math.max(0, st.size - TAIL_BYTES);
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- see above.
     const fh = await open(filePath, "r");
     try {
+      const st = await fh.stat();
+      const start = Math.max(0, st.size - TAIL_BYTES);
       const buf = Buffer.alloc(st.size - start);
       await fh.read(buf, 0, buf.length, start);
       const lines = buf.toString("utf-8").split("\n");

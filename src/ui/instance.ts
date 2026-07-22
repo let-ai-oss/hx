@@ -39,10 +39,16 @@ export async function readServerInfo(dir: string = UI_DIR): Promise<ServerInfo |
   try {
     const raw = await readFile(infoPath(dir), "utf-8");
     const parsed = JSON.parse(raw) as Partial<ServerInfo>;
+    // Strict shape gate: the port feeds a loopback probe URL, so it must be a
+    // real port number, not arbitrary file content.
     if (
       typeof parsed.port !== "number" ||
+      !Number.isInteger(parsed.port) ||
+      parsed.port < 1 ||
+      parsed.port > 65535 ||
       typeof parsed.pid !== "number" ||
-      typeof parsed.launchToken !== "string"
+      typeof parsed.launchToken !== "string" ||
+      !/^[A-Za-z0-9_-]+$/.test(parsed.launchToken)
     ) {
       return null;
     }

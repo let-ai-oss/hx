@@ -625,8 +625,6 @@ async function ingestOne(
           at: Date.now(),
           sessionId: fState.sessionId,
           family: fState.family,
-          title: title ?? null,
-          folder: fState.cwd ?? null,
           bytes: trimmed.length,
           dest: destKey(step.vaultOrgId),
         });

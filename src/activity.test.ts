@@ -11,8 +11,6 @@ const entry = (at: number, over: Partial<ActivityEntry> = {}): ActivityEntry => 
   at,
   sessionId: "s1",
   family: "claude-cli",
-  title: null,
-  folder: "~/w",
   bytes: 100,
   dest: "letai",
   ...over,

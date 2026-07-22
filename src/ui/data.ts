@@ -8,7 +8,7 @@
 // snapshot resets the in-process state cache before reading (loadState caches
 // forever per process by design) and re-reads config per request.
 
-import { open, stat } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { readConfig, type HxConfig } from "../config.js";
@@ -390,10 +390,11 @@ const LOG_TAIL_MAX = 256 * 1024;
 
 export async function tailDaemonLog(maxLines: number): Promise<{ body: string; level: LogLevel }[]> {
   try {
-    const st = await stat(STDOUT_LOG);
-    const start = Math.max(0, st.size - LOG_TAIL_MAX);
+    // Open first, size via fstat on the handle — no stat-then-open race.
     const fh = await open(STDOUT_LOG, "r");
     try {
+      const st = await fh.stat();
+      const start = Math.max(0, st.size - LOG_TAIL_MAX);
       const buf = Buffer.alloc(st.size - start);
       await fh.read(buf, 0, buf.length, start);
       const lines = buf.toString("utf-8").split("\n");
