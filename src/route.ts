@@ -1,5 +1,8 @@
 // Per-repo upload route discovery. Before uploading a session's
-// chunk, hx asks the cloud where that repo's sessions should land:
+// chunk, hx asks the cloud where that repo's sessions should land.
+// Newer gateways also echo `attributedOrgIds` — the org ids the repo
+// auto-attributes to for this user (empty = attaches to no workspace, i.e.
+// personal); the settings-driven personal gate persists it per file. Routes:
 //   • { mode: "cloud" }            → upload through the cloud gateway (default)
 //   • { mode: "fortress-direct" }  → upload straight to the org's Fortress with
 //                                    a short-lived capability token.
@@ -9,8 +12,14 @@
 import { isSecureFetchUrl, assertSecureFetchUrl } from "./net.js";
 
 export type Route =
-  | { mode: "cloud" }
-  | { mode: "fortress-direct"; gatewayUrl: string; token: string; expiresAt: string };
+  | { mode: "cloud"; attributedOrgIds?: string[] }
+  | {
+      mode: "fortress-direct";
+      gatewayUrl: string;
+      token: string;
+      expiresAt: string;
+      attributedOrgIds?: string[];
+    };
 
 export interface ResolveRouteOpts {
   repo: string;

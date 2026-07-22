@@ -1,6 +1,7 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
+  applyEnrichment,
   classifyLogLine,
   destLabelFor,
   familyLabel,
@@ -116,6 +117,52 @@ describe("classifyLogLine", () => {
     assert.equal(classifyLogLine("[hx] uploads to nordbank not progressing; backing off 20s"), "warn");
     assert.equal(classifyLogLine("[hx] tick uploaded=3 failed=0"), "info");
     assert.equal(classifyLogLine("[groups] synced 2 CCD group(s)"), "info");
+  });
+});
+
+describe("applyEnrichment", () => {
+  const enrichment = {
+    folders: [
+      {
+        path: "/home/u/w/app",
+        folderQuery: "/home/u/w/app",
+        repoSlug: "acme/app",
+        workspaces: [{ orgId: "org1", orgName: "Acme", projectId: "p1", projectName: "App" }],
+        sharing: {
+          orgId: "org1",
+          orgName: "Acme",
+          sharing: true,
+          teams: [{ id: "t1", name: "Payments", accentColor: "#123" }],
+          people: [{ userId: "u2", name: "Marta" }],
+          peopleCount: 3,
+        },
+      },
+    ],
+    vaults: {
+      org1: { orgId: "org1", orgName: "Acme", storageKind: "gcs", bucketRegion: "eu", status: "connected" },
+    },
+  };
+
+  it("maps workspace, sharing, and vault labels onto local rows", () => {
+    const folders = groupFolders([
+      fact("/a.jsonl", { cwd: "/home/u/w/app", repoSlug: "acme/app" }, { offsets: { org1: 5 } }),
+    ]);
+    const dests = groupDestinations([
+      fact("/a.jsonl", { cwd: "/home/u/w/app" }, { offsets: { org1: 5 } }),
+    ]);
+    applyEnrichment(folders, dests, enrichment);
+    assert.deepEqual(folders[0]?.workspace, { orgName: "Acme", projectName: "App" });
+    assert.equal(folders[0]?.sharing?.teams[0]?.name, "Payments");
+    assert.deepEqual(folders[0]?.sharing?.people, ["Marta"]);
+    assert.equal(dests[0]?.label, "Acme");
+    assert.equal(dests[0]?.storage?.status, "connected");
+  });
+
+  it("leaves rows untouched when the gateway has no enrichment", () => {
+    const folders = groupFolders([fact("/a.jsonl", { cwd: "/w" }, { offsets: { letai: 1 } })]);
+    applyEnrichment(folders, [], null);
+    assert.equal(folders[0]?.workspace, null);
+    assert.equal(folders[0]?.sharing, null);
   });
 });
 

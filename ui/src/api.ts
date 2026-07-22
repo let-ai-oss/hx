@@ -33,6 +33,14 @@ export interface FolderInfo {
   dests: string[];
   lastUploadAtMs: number;
   unlinkedRepo: boolean;
+  workspace: { orgName: string; projectName: string } | null;
+  sharing: {
+    orgName: string;
+    sharing: boolean;
+    teams: { name: string; accentColor: string | null }[];
+    people: string[];
+    peopleCount: number;
+  } | null;
 }
 
 export interface DestinationInfo {
@@ -44,6 +52,7 @@ export interface DestinationInfo {
   bytes: number;
   lastUploadAtMs: number;
   blocked: { sessions: number; reason: string; orgName: string | null } | null;
+  storage: { kind: string | null; region: string | null; status: string } | null;
 }
 
 export interface RecentUpload {

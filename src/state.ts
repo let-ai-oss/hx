@@ -73,6 +73,11 @@ export interface FileState {
   /** Canonical owner/name repo slug from the session head; null = the folder
    *  has no (GitHub) repo; undefined = not yet recorded (legacy entry). */
   repoSlug?: string | null;
+  /** Whether the repo auto-attributes to any org workspace, per the gateway's
+   *  route discovery. undefined = unknown (no repo, never resolved, or an
+   *  older gateway that doesn't echo it) — treated as work by the personal
+   *  gate, never silently skipped. */
+  attributed?: boolean;
   /** Last mtime we observed (ms). Skip the file if mtime hasn't moved. */
   lastMtimeMs: number;
   /** Last upload attempt timestamp (ms). For logging/inspection. */

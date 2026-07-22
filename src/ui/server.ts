@@ -83,29 +83,35 @@ export interface UiServerCtx {
   port: number;
 }
 
-const SECURITY_HEADERS: Record<string, string> = {
-  "content-security-policy":
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; " +
+// script-src carries exact hashes of index.html's inline scripts (the theme
+// bootstrap) instead of 'unsafe-inline'; style-src keeps 'unsafe-inline' for
+// React style attributes — standard, and styles can't exfiltrate.
+export function cspFor(inlineScriptHashes: string[]): string {
+  const scriptSrc = ["'self'", ...inlineScriptHashes].join(" ");
+  return (
+    `default-src 'self'; script-src ${scriptSrc}; ` +
     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
     "connect-src 'self'; font-src 'self'; base-uri 'none'; " +
-    "frame-ancestors 'none'; form-action 'none'",
-  "x-content-type-options": "nosniff",
-  "referrer-policy": "no-referrer",
-};
+    "frame-ancestors 'none'; form-action 'none'"
+  );
+}
 
-function finish(res: Response, cache: string): Response {
-  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
+function finish(res: Response, cache: string, csp: string): Response {
+  res.headers.set("content-security-policy", csp);
+  res.headers.set("x-content-type-options", "nosniff");
+  res.headers.set("referrer-policy", "no-referrer");
   res.headers.set("cache-control", cache);
   return res;
 }
 
-function json(body: unknown, status = 200, cache = "no-store"): Response {
+function json(body: unknown, status = 200, cache = "no-store", csp = cspFor([])): Response {
   return finish(
     new Response(JSON.stringify(body), {
       status,
       headers: { "content-type": "application/json" },
     }),
     cache,
+    csp,
   );
 }
 
@@ -134,8 +140,9 @@ export async function handleUiRequest(req: Request, ctx: UiServerCtx): Promise<R
   }
   const assetPath = path === "/" ? "/index.html" : path;
   const filePath = ctx.assets.files[assetPath];
+  const csp = cspFor(ctx.assets.inlineScriptHashes);
   if (!filePath) {
-    return finish(new Response("Not found", { status: 404 }), "no-store");
+    return finish(new Response("Not found", { status: 404 }), "no-store", csp);
   }
   const cache =
     assetPath === "/index.html"
@@ -148,6 +155,7 @@ export async function handleUiRequest(req: Request, ctx: UiServerCtx): Promise<R
       headers: { "content-type": contentTypeFor(assetPath) },
     }),
     cache,
+    csp,
   );
 }
 
@@ -179,7 +187,7 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
   }
 
   if (path === "/api/ping") {
-    return finish(new Response(null, { status: 204 }), "no-store");
+    return finish(new Response(null, { status: 204 }), "no-store", cspFor([]));
   }
 
   if (req.method === "POST") {
@@ -298,6 +306,7 @@ function sseResponse(hub: UiEventHub): Response {
       headers: { "content-type": "text/event-stream", connection: "keep-alive" },
     }),
     "no-store",
+    cspFor([]),
   );
 }
 

@@ -4,7 +4,7 @@ import { plural, TOOL_NOTE, TOOL_ORDER } from "../data";
 import { fmtBytes, fmtClock, fmtRelative, type FolderInfo, type SessionInfo } from "../api";
 import { GPill } from "../components/GPill";
 import { CellA, CellB, CellC } from "../components/FolderCells";
-import { BranchIc, CloudIc, FortressIc, SearchIc } from "../icons";
+import { BranchIc, CloudIc, CompanyIc, FortressIc, ProjectIc, SearchIc } from "../icons";
 
 const GLBL: Record<GroupBy, string> = { tool: "Tool", dir: "Directory", dest: "Destination" };
 
@@ -51,7 +51,14 @@ function FolderWhy({ f }: { f: FolderInfo }) {
   const chain = f.repo ? (
     <>
       <span className="step"><BranchIc /> {f.repo}</span><span className="arr">→</span>
-      {f.unlinkedRepo && <><span className="step dashed">no workspace claims this repo</span><span className="arr">→</span></>}
+      {f.workspace ? (
+        <>
+          <span className="step"><ProjectIc /> {f.workspace.projectName}</span><span className="arr">→</span>
+          <span className="step"><CompanyIc /> {f.workspace.orgName}</span><span className="arr">→</span>
+        </>
+      ) : f.unlinkedRepo ? (
+        <><span className="step dashed">no workspace claims this repo</span><span className="arr">→</span></>
+      ) : null}
       <span className="step hl">{orgDest ? <FortressIc /> : <CloudIc />} {labels.join(" · ")}</span>
     </>
   ) : (
@@ -62,7 +69,9 @@ function FolderWhy({ f }: { f: FolderInfo }) {
   );
 
   const note = f.repo ? (
-    f.unlinkedRepo ? (
+    f.workspace ? (
+      <div className="why-note">This folder’s git repo is attached to the <b>{f.workspace.projectName}</b> project in <b>{f.workspace.orgName}</b>. Sessions here appear in your My Sessions{orgDest ? "; where the organization runs its own Session Vault, session content rests on its servers" : ""}.</div>
+    ) : f.unlinkedRepo ? (
       <div className="why-note">This folder has a git repo, but no workspace in your organizations claims it — so its sessions upload as <b>personal</b>: your private space, visible only to you. <b>If this is company code</b>, an admin can attach <span className="mono">{f.repo}</span> to a project and future sessions route to that organization.</div>
     ) : orgDest ? (
       <div className="why-note">This folder’s git repo routes to {labels.filter((l) => l !== "let.ai").map((l, i) => <b key={l}>{i > 0 ? " and " : ""}{l}</b>)}. Where an organization runs its own Session Vault, session content rests on its servers.</div>
@@ -73,10 +82,29 @@ function FolderWhy({ f }: { f: FolderInfo }) {
     <div className="why-note">No git repository — sessions from this folder upload as personal and attach to no workspace. Only you can see them.</div>
   );
 
+  const visibility = f.sharing ? (
+    f.sharing.sharing && f.sharing.peopleCount > 0 ? (
+      <>
+        <div className="why-note"><b>Who can see it:</b> {f.sharing.teams.length > 0 ? <>the <b>{f.sharing.teams.map((t) => t.name).join(", ")}</b> team{f.sharing.teams.length === 1 ? "" : "s"} ha{f.sharing.teams.length === 1 ? "s" : "ve"} access, and you share sessions with {f.sharing.orgName} — these members can open them:</> : <>you share sessions with <b>{f.sharing.orgName}</b>:</>}</div>
+        <div className="people">
+          {f.sharing.people.map((name) => (
+            <span key={name} className="pchip"><span className="pa">{name.slice(0, 2).toUpperCase()}</span> {name}</span>
+          ))}
+          {f.sharing.peopleCount > f.sharing.people.length && (
+            <span className="pmore">· {f.sharing.peopleCount - f.sharing.people.length} more</span>
+          )}
+        </div>
+      </>
+    ) : (
+      <div className="why-note"><b>Who can see it:</b> only you{f.sharing.sharing ? "" : ` — sharing is off for ${f.sharing.orgName}`}.</div>
+    )
+  ) : null;
+
   return (
     <>
       <div className="chain">{chain}</div>
       {note}
+      {visibility}
       <div className="why-note" style={{ marginTop: 10 }}>
         <b>Sessions in this folder</b> <span className="psub">· last activity {fmtRelative(f.lastUploadAtMs)}</span>
       </div>

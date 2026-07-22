@@ -110,12 +110,16 @@ export interface FileSyncIdentity {
   cwd?: string;
   /** null = known to have no repo; undefined = unknown. */
   repoSlug?: string | null;
+  /** Gateway-confirmed workspace attribution; false = repo attaches to no
+   *  workspace (personal); undefined = unknown (older gateway / unresolved). */
+  attributed?: boolean;
 }
 
 /**
  * Should this file stay on the machine under the current settings?
- * Unknown cwd/repo (legacy entries not yet re-seeded) never match — the safe
- * default is to keep uploading work.
+ * Personal = no repo, or a repo the gateway confirmed attaches to no
+ * workspace. Unknown identity (legacy entries, older gateways) never
+ * matches — the safe default is to keep uploading work.
  */
 export function shouldSkipFile(s: HxSettings, id: FileSyncIdentity): boolean {
   if (id.cwd !== undefined) {
@@ -126,6 +130,6 @@ export function shouldSkipFile(s: HxSettings, id: FileSyncIdentity): boolean {
       if (ruleMatches(rule, id.cwd)) return true;
     }
   }
-  if (!s.personalSync && id.repoSlug === null) return true;
+  if (!s.personalSync && (id.repoSlug === null || id.attributed === false)) return true;
   return false;
 }

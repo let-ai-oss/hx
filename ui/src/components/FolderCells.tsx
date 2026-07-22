@@ -1,7 +1,7 @@
 import { useApp } from "../store";
 import type { FolderInfo } from "../api";
 import { plural } from "../data";
-import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc, SlashIc } from "../icons";
+import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc, SlashIc, TeamIc } from "../icons";
 
 // Strict two-line cells — every cell shares the same line grid so icons,
 // destinations, and counts all read as vertical columns.
@@ -57,6 +57,15 @@ export function CellB({ f, isExcluded = false, destAction }: { f: FolderInfo; is
             <span className="ico">{second.personal ? <CloudIc /> : <FortressIc />}</span>
             <span className="tx destlink" onClick={destAction ? (e) => { e.stopPropagation(); destAction(second.key); } : undefined}>{second.label}</span>
             {rows.length > 2 && <span className="tx">· +{rows.length - 2} more</span>}
+          </>
+        ) : f.sharing ? (
+          <>
+            <span className="ico">{f.sharing.sharing && f.sharing.teams.length > 0 ? <TeamIc /> : <PersonIc />}</span>
+            <span className="tx">{f.sharing.sharing
+              ? f.sharing.peopleCount > 0
+                ? `Me + ${f.sharing.teams.map((t) => t.name).join(", ")} (${f.sharing.peopleCount})`
+                : `Shared with ${f.sharing.orgName}`
+              : "Only me"}</span>
           </>
         ) : (
           <><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">{first.personal ? "your private space" : "organization vault"}</span></>

@@ -20,6 +20,7 @@ beforeAll(() => {
   const assets: UiAssets = {
     mode: "disk",
     files: { "/index.html": indexPath, "/assets/app.js": appPath },
+    inlineScriptHashes: ["'sha256-testhash'"],
   };
   auth = createUiAuth();
   const providers = {
@@ -80,8 +81,12 @@ describe("handleUiRequest — request gates", () => {
   it("sets security headers on every response", async () => {
     const res = await handleUiRequest(req("/"), ctx);
     assert.equal(res.headers.get("x-content-type-options"), "nosniff");
-    assert.match(res.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    assert.match(csp, /frame-ancestors 'none'/);
     assert.equal(res.headers.get("referrer-policy"), "no-referrer");
+    // script-src carries exact inline hashes, never 'unsafe-inline'
+    assert.match(csp, /script-src 'self' 'sha256-testhash'/);
+    assert.doesNotMatch(csp, /script-src[^;]*'unsafe-inline'/);
   });
 });
 

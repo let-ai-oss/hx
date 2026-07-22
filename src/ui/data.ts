@@ -57,6 +57,15 @@ export interface FolderVM {
   lastUploadAtMs: number;
   /** Repo detected but every observed upload went only to the personal store. */
   unlinkedRepo: boolean;
+  /** Gateway enrichment (device-folders/mine) — absent on older gateways. */
+  workspace: { orgName: string; projectName: string } | null;
+  sharing: {
+    orgName: string;
+    sharing: boolean;
+    teams: { name: string; accentColor: string | null }[];
+    people: string[];
+    peopleCount: number;
+  } | null;
 }
 
 export interface SessionVM {
@@ -79,6 +88,8 @@ export interface DestinationVM {
   bytes: number;
   lastUploadAtMs: number;
   blocked: { sessions: number; reason: string; orgName: string | null } | null;
+  /** Vault display info from the gateway — absent on older gateways. */
+  storage: { kind: string | null; region: string | null; status: string } | null;
 }
 
 export interface RecentUploadVM {
@@ -180,6 +191,8 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
         dests: [],
         lastUploadAtMs: 0,
         unlinkedRepo: false,
+        workspace: null,
+        sharing: null,
       };
       byId.set(id, row);
     }
@@ -224,6 +237,7 @@ export function groupDestinations(
           bytes: 0,
           lastUploadAtMs: 0,
           blocked: null,
+          storage: null,
           folderIds: new Set<string>(),
         };
         byKey.set(key, row);
@@ -282,6 +296,8 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
   }
 
   const folders = groupFolders(facts);
+  const destinations = groupDestinations(facts, await readOrgNames());
+  applyEnrichment(folders, destinations, await cachedEnrichment());
   const lastUploadAtMs = facts.reduce((m, f) => Math.max(m, f.state?.lastUploadAtMs ?? 0), 0);
 
   const gatewayHost = ((): string | null => {
@@ -312,7 +328,7 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
       lastUploadAtMs,
     },
     folders,
-    destinations: groupDestinations(facts, await readOrgNames()),
+    destinations,
     recent: facts
       .filter((f) => (f.state?.lastUploadAtMs ?? 0) > 0)
       .sort((a, b) => (b.state?.lastUploadAtMs ?? 0) - (a.state?.lastUploadAtMs ?? 0))
@@ -391,6 +407,106 @@ export async function tailDaemonLog(maxLines: number): Promise<{ body: string; l
     }
   } catch {
     return [];
+  }
+}
+
+// ── device-folders/mine enrichment (workspace, sharing, vault labels) ──
+// Newer gateways serve the same folder inventory the workbench's My Devices
+// page uses, scoped to this device's own sessions. Cached briefly; an older
+// gateway (404) caches null so every snapshot doesn't re-ask.
+
+interface GatewayFolder {
+  path: string;
+  folderQuery: string;
+  repoSlug: string | null;
+  workspaces: { orgId: string; orgName: string; projectId: string; projectName: string }[];
+  sharing: {
+    orgId: string;
+    orgName: string;
+    sharing: boolean;
+    teams: { id: string; name: string; accentColor: string | null }[];
+    people: { userId: string; name: string }[];
+    peopleCount: number;
+  } | null;
+}
+
+interface GatewayVault {
+  orgId: string;
+  orgName: string;
+  storageKind: string | null;
+  bucketRegion: string | null;
+  status: string;
+}
+
+interface Enrichment {
+  folders: GatewayFolder[];
+  vaults: Record<string, GatewayVault>;
+}
+
+let enrichmentCache: { at: number; value: Enrichment | null } | null = null;
+const ENRICHMENT_TTL_MS = 60_000;
+
+async function cachedEnrichment(fetcher: typeof fetch = fetch): Promise<Enrichment | null> {
+  if (enrichmentCache && Date.now() - enrichmentCache.at < ENRICHMENT_TTL_MS) {
+    return enrichmentCache.value;
+  }
+  const cfg = await readConfig();
+  if (!cfg?.accessToken || !cfg.gatewayBaseUrl) return null;
+  try {
+    const url = `${cfg.gatewayBaseUrl}/device-folders/mine`;
+    assertSecureFetchUrl(url, "gateway");
+    const res = await fetcher(url, {
+      headers: { authorization: `Bearer ${cfg.accessToken}` },
+      signal: AbortSignal.timeout(6_000),
+    });
+    const value = res.ok ? ((await res.json()) as Enrichment) : null;
+    enrichmentCache = { at: Date.now(), value };
+    return value;
+  } catch {
+    enrichmentCache = { at: Date.now(), value: null };
+    return null;
+  }
+}
+
+/** Pure: fold gateway folder rows onto locally-derived folders — exact path
+ *  match first, then worktree-group prefix match. Unit-tested. */
+export function applyEnrichment(
+  folders: FolderVM[],
+  destinations: DestinationVM[],
+  enrichment: Enrichment | null,
+): void {
+  if (!enrichment) return;
+  const collapsed = enrichment.folders.map((g) => ({
+    g,
+    path: collapseHome(g.path),
+    prefix: g.folderQuery.endsWith("/") ? collapseHome(g.folderQuery) : null,
+  }));
+  for (const f of folders) {
+    const hit =
+      collapsed.find((c) => c.path === f.path) ??
+      collapsed.find((c) => c.prefix !== null && `${f.path}/`.startsWith(c.prefix));
+    if (!hit) continue;
+    const primary = hit.g.workspaces[0];
+    f.workspace = primary ? { orgName: primary.orgName, projectName: primary.projectName } : null;
+    f.sharing = hit.g.sharing
+      ? {
+          orgName: hit.g.sharing.orgName,
+          sharing: hit.g.sharing.sharing,
+          teams: hit.g.sharing.teams.map((t) => ({ name: t.name, accentColor: t.accentColor })),
+          people: hit.g.sharing.people.map((p) => p.name),
+          peopleCount: hit.g.sharing.peopleCount,
+        }
+      : null;
+  }
+  for (const d of destinations) {
+    const vault = enrichment.vaults[d.key];
+    if (!vault) continue;
+    d.label = vault.orgName;
+    d.storage = {
+      kind: vault.storageKind,
+      region: vault.bucketRegion,
+      status: vault.status,
+    };
   }
 }
 

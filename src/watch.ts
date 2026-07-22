@@ -221,27 +221,32 @@ const ROUTE_CACHE = new Map<StateScope, Map<string, Route>>();
  *  route — one pointed at the Fortress gateway with its capability token as the
  *  bearer. Discovery failures fall back to cloud inside resolveRoute (off the hot
  *  path); see route.ts. */
-async function uploadConfigFor(
-  cfg: HxConfig,
-  repoSlug: string | null | undefined,
-): Promise<{ cfg: HxConfig; fortress: boolean }> {
-  if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
-  const scope = scopeOf(cfg);
+function routeCacheFor(scope: StateScope): Map<string, Route> {
   let cache = ROUTE_CACHE.get(scope);
   if (!cache) {
     cache = new Map<string, Route>();
     ROUTE_CACHE.set(scope, cache);
   }
+  return cache;
+}
+
+async function uploadConfigFor(
+  cfg: HxConfig,
+  repoSlug: string | null | undefined,
+): Promise<{ cfg: HxConfig; fortress: boolean; attributedOrgIds?: string[] }> {
+  if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
   const route = await resolveRoute({
     repo: repoSlug,
     gatewayBaseUrl: cfg.gatewayBaseUrl,
     accessToken: cfg.accessToken,
-    cache,
+    cache: routeCacheFor(scopeOf(cfg)),
   });
-  if (route.mode !== "fortress-direct") return { cfg, fortress: false };
+  const attributedOrgIds = route.attributedOrgIds;
+  if (route.mode !== "fortress-direct") return { cfg, fortress: false, attributedOrgIds };
   return {
     cfg: { ...cfg, gatewayBaseUrl: route.gatewayUrl, accessToken: route.token },
     fortress: true,
+    attributedOrgIds,
   };
 }
 
@@ -439,6 +444,15 @@ async function ingestOne(
   // Fortress next pass; it is never re-sent to the cloud.
   const route = await uploadConfigFor(cfg, head.repoSlug);
   const uploadCfg = route.cfg;
+  // Persist gateway-confirmed workspace attribution — the personal gate's
+  // exact signal (see settings.ts). Only when the gateway echoes it.
+  if (Array.isArray(route.attributedOrgIds)) {
+    const attributed = route.attributedOrgIds.length > 0;
+    if (fState.attributed !== attributed) {
+      fState.attributed = attributed;
+      await upsertFileState(fState, scope);
+    }
+  }
 
   // CCD session metadata (title + group id) is byte-independent — resolve once.
   const ccdByCli = await getCcdRecentsByCliId(Date.now()).catch(() => null);
@@ -1331,8 +1345,28 @@ export async function tickOnce(
     if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
     // A file seen for the first time has no state entry for filterWatched to
     // match — seed it now and re-check before any byte leaves the machine.
-    if (!pending) {
-      const seeded = await ensureFileState(f, scope);
+    // With the personal gate armed, a repo file with UNKNOWN attribution asks
+    // the gateway first (one bounded, cached route lookup) so the very first
+    // chunk already respects the gate exactly.
+    if (!pending || (!settings.personalSync && state.files[f.path]?.attributed === undefined)) {
+      const seeded = pending ?? (await ensureFileState(f, scope));
+      if (
+        !settings.personalSync &&
+        seeded.repoSlug &&
+        seeded.attributed === undefined &&
+        cfg.accessToken
+      ) {
+        const r = await resolveRoute({
+          repo: seeded.repoSlug,
+          gatewayBaseUrl: cfg.gatewayBaseUrl,
+          accessToken: cfg.accessToken,
+          cache: routeCacheFor(scope),
+        });
+        if (Array.isArray(r.attributedOrgIds)) {
+          seeded.attributed = r.attributedOrgIds.length > 0;
+          await upsertFileState(seeded, scope);
+        }
+      }
       if (shouldSkipFile(settings, seeded)) continue;
     }
     try {

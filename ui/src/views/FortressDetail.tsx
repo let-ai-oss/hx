@@ -56,6 +56,9 @@ export function FortressDetail() {
             {dest && (
               <>
                 <div className="frw"><span className="k">Sessions</span><span><span className="v">{plural(dest.sessions, "session")}</span><div className="vs">{fmtBytes(dest.bytes)} uploaded, across {plural(dest.folders, "folder")}</div></span></div>
+                {dest.storage && (
+                  <div className="frw"><span className="k">Storage</span><span><span className="v">{dest.storage.kind === "s3" ? "AWS S3" : dest.storage.kind === "gcs" ? "Google Cloud Storage" : dest.storage.kind ?? "Session Vault"}</span><div className="vs">{[dest.storage.region, dest.storage.status].filter(Boolean).join(" · ")}</div></span></div>
+                )}
                 <div className="frw"><span className="k">Uploaded bytes</span><span><span className="v">{fmtBytes(dest.bytes)}</span><div className="vs">confirmed committed to this destination</div></span></div>
                 <div className="frw"><span className="k">Last sent</span><span><span className="v">{fmtRelative(dest.lastUploadAtMs)}</span></span></div>
               </>
