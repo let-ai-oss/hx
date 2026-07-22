@@ -15,7 +15,7 @@ export function FortressDetail() {
       <h1 id="ftTitle">{dest ? dest.label : "Destination"}</h1>
       <p className="lede" id="ftLede">{dest
         ? (dest.personal
-          ? "Your private space. Sessions that attach to no organization workspace rest here, and only you can ever see them."
+          ? "let.ai-hosted storage. Your personal sessions rest here (visible only to you), alongside sessions of organizations that use let.ai-managed storage — visibility always follows each session’s workspace."
           : "An organization vault. Sessions in this organization’s repositories rest under its own storage configuration.")
         : ""}</p>
       <div className="panel">

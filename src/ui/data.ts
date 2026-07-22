@@ -55,7 +55,12 @@ export interface FolderVM {
   /** Destination store keys observed in state offsets ("letai" | org id). */
   dests: string[];
   lastUploadAtMs: number;
-  /** Repo detected but every observed upload went only to the personal store. */
+  /** Workspace attribution: true/false only when CONFIRMED (gateway route echo
+   *  persisted by the daemon, or the device-folders enrichment); null =
+   *  unknown. Storage keys can NOT stand in for this — a cloud-hosted org's
+   *  sessions rest in the let.ai store while fully attributed. */
+  attributed: boolean | null;
+  /** Repo present AND attribution CONFIRMED absent — never inferred. */
   unlinkedRepo: boolean;
   /** Gateway enrichment (device-folders/mine) — absent on older gateways. */
   workspace: { orgName: string; projectName: string } | null;
@@ -190,6 +195,7 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
         branch: null,
         dests: [],
         lastUploadAtMs: 0,
+        attributed: null,
         unlinkedRepo: false,
         workspace: null,
         sharing: null,
@@ -204,12 +210,18 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
       for (const key of Object.keys(state.offsets)) {
         if ((state.offsets[key] ?? 0) > 0 && !row.dests.includes(key)) row.dests.push(key);
       }
+      // Confirmed knowledge only: any file confirmed attributed lifts the
+      // folder; confirmed-false only sticks while nothing contradicts it.
+      if (state.attributed === true) row.attributed = true;
+      else if (state.attributed === false && row.attributed === null) row.attributed = false;
     }
   }
   for (const row of byId.values()) {
     row.dests.sort();
-    row.unlinkedRepo =
-      row.repo !== null && row.dests.length > 0 && row.dests.every((d) => d === "letai");
+    // Vault-store offsets are attribution proof in themselves (only attributed
+    // sessions fan out to an org vault).
+    if (row.dests.some((d) => d !== "letai")) row.attributed = true;
+    row.unlinkedRepo = row.repo !== null && row.attributed === false;
   }
   return [...byId.values()].sort((a, b) => b.sessions - a.sessions);
 }
@@ -489,6 +501,9 @@ export function applyEnrichment(
     if (!hit) continue;
     const primary = hit.g.workspaces[0];
     f.workspace = primary ? { orgName: primary.orgName, projectName: primary.projectName } : null;
+    // The gateway's workspace list is the authoritative attribution answer.
+    f.attributed = hit.g.workspaces.length > 0;
+    f.unlinkedRepo = f.repo !== null && f.attributed === false;
     f.sharing = hit.g.sharing
       ? {
           orgName: hit.g.sharing.orgName,

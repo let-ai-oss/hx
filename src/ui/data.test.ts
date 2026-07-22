@@ -60,11 +60,27 @@ describe("groupFolders", () => {
     assert.equal(app.id, folderIdFor("claude-cli", "/w/app"));
   });
 
-  it("flags a repo folder whose uploads only ever reached the personal store", () => {
+  it("never infers unlinked from storage — letai-only offsets stay unknown", () => {
+    // A cloud-hosted org's attributed sessions rest in the let.ai store too,
+    // so letai-only offsets prove nothing about attribution.
     const rows = groupFolders([
       fact("/a.jsonl", { cwd: "/w/solo", repoSlug: "acme/solo" }, { offsets: { letai: 10 } }),
     ]);
-    assert.equal(rows[0]?.unlinkedRepo, true);
+    assert.equal(rows[0]?.attributed, null);
+    assert.equal(rows[0]?.unlinkedRepo, false);
+  });
+
+  it("flags unlinked only on confirmed non-attribution; vault offsets confirm attribution", () => {
+    const rows = groupFolders([
+      fact("/a.jsonl", { cwd: "/w/unlinked", repoSlug: "acme/unlinked" }, { offsets: { letai: 10 }, attributed: false }),
+      fact("/b.jsonl", { cwd: "/w/vaulted", repoSlug: "acme/vaulted" }, { offsets: { org1: 10 } }),
+      fact("/c.jsonl", { cwd: "/w/confirmed", repoSlug: "acme/confirmed" }, { offsets: { letai: 10 }, attributed: true }),
+    ]);
+    const by = (p: string) => rows.find((r) => r.path === p);
+    assert.equal(by("/w/unlinked")?.unlinkedRepo, true);
+    assert.equal(by("/w/vaulted")?.attributed, true);
+    assert.equal(by("/w/vaulted")?.unlinkedRepo, false);
+    assert.equal(by("/w/confirmed")?.unlinkedRepo, false);
   });
 
   it("ignores zero-byte destination offsets", () => {
@@ -163,6 +179,19 @@ describe("applyEnrichment", () => {
     applyEnrichment(folders, [], null);
     assert.equal(folders[0]?.workspace, null);
     assert.equal(folders[0]?.sharing, null);
+    assert.equal(folders[0]?.attributed, null);
+  });
+
+  it("confirms unlinked when the gateway answers with zero workspaces", () => {
+    const folders = groupFolders([
+      fact("/a.jsonl", { cwd: "/home/u/w/app", repoSlug: "acme/app" }, { offsets: { letai: 1 } }),
+    ]);
+    applyEnrichment(folders, [], {
+      folders: [{ path: "/home/u/w/app", folderQuery: "/home/u/w/app", repoSlug: "acme/app", workspaces: [], sharing: null }],
+      vaults: {},
+    });
+    assert.equal(folders[0]?.attributed, false);
+    assert.equal(folders[0]?.unlinkedRepo, true);
   });
 });
 

@@ -32,6 +32,7 @@ export interface FolderInfo {
   branch: string | null;
   dests: string[];
   lastUploadAtMs: number;
+  attributed: boolean | null;
   unlinkedRepo: boolean;
   workspace: { orgName: string; projectName: string } | null;
   sharing: {

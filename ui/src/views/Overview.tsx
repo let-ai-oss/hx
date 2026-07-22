@@ -72,9 +72,9 @@ export function Overview() {
               ))}
             </div></span>}
             {orgDests.length > 0 && personalDests.length > 0 && " · "}
-            {personalDests.length > 0 && <span className="dashy">{personalDests.length} personal<div className="pop">
-              <b>My private space</b>
-              <div style={{ marginTop: 6 }}>Sessions that attach to no workspace live in your private let.ai space. Only you can ever see them.</div>
+            {personalDests.length > 0 && <span className="dashy">{personalDests.length} let.ai-hosted<div className="pop">
+              <b>let.ai-hosted storage</b>
+              <div style={{ marginTop: 6 }}>Holds your personal sessions (visible only to you) and sessions of organizations that use let.ai-managed storage. Who can see each session follows its workspace, not where it rests.</div>
             </div></span>}
           </div>
         </div>
@@ -114,7 +114,7 @@ export function Overview() {
           {destinations.map((d) => (
             <div key={d.key} className="row fortrow" data-fortress={d.key} onClick={() => openDest(d.key)}>
               <span className={`dot${d.blocked ? " warn" : ""}`}></span>
-              <div className="who"><b>{d.label}</b><div className="sub">{d.personal ? "my private space — only I can ever see it" : "organization vault"}</div></div>
+              <div className="who"><b>{d.label}</b><div className="sub">{d.personal ? "let.ai-hosted storage" : "organization vault"}</div></div>
               <div><span className={`pill ${d.blocked ? "warn" : "ok"}`}>{d.blocked ? "Held — retrying" : "Connected"}</span></div>
               <div className="fortmeta"><div>{plural(d.sessions, "session")} · {fmtBytes(d.bytes)}</div><div>last sent {fmtRelative(d.lastUploadAtMs)}</div></div>
               <div className="chev"></div>

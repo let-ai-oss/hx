@@ -76,7 +76,9 @@ function FolderWhy({ f }: { f: FolderInfo }) {
     ) : orgDest ? (
       <div className="why-note">This folder’s git repo routes to {labels.filter((l) => l !== "let.ai").map((l, i) => <b key={l}>{i > 0 ? " and " : ""}{l}</b>)}. Where an organization runs its own Session Vault, session content rests on its servers.</div>
     ) : (
-      <div className="why-note">Uploads from this folder have {personalOnly ? "so far gone to your private space" : "not started yet"}. Routing is decided by your workbench at upload time.</div>
+      <div className="why-note">{personalOnly
+        ? <>Uploads from this folder rest in let.ai-hosted storage. Which workspace they attach to — and who can see them — is decided by your workbench; open your cloud UI’s My Devices page for the authoritative picture.</>
+        : <>Uploads from this folder haven’t started yet. Routing is decided by your workbench at upload time.</>}</div>
     )
   ) : (
     <div className="why-note">No git repository — sessions from this folder upload as personal and attach to no workspace. Only you can see them.</div>

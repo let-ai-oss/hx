@@ -68,7 +68,7 @@ export function CellB({ f, isExcluded = false, destAction }: { f: FolderInfo; is
               : "Only me"}</span>
           </>
         ) : (
-          <><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">{first.personal ? "your private space" : "organization vault"}</span></>
+          <><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">{first.personal ? "let.ai-hosted storage" : "organization vault"}</span></>
         )}
       </div>
     </div>

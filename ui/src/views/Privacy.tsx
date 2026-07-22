@@ -112,7 +112,7 @@ export function Privacy() {
                 <div className="rulerow" key={d.key}>
                   <span className="ico">{d.personal ? <CloudIc /> : <FortressIc />}</span>
                   <span className="p">{d.label}</span>
-                  <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>{plural(d.sessions, "session")} · {fmtBytes(d.bytes)}{d.personal ? " · only you" : ""}</span>
+                  <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>{plural(d.sessions, "session")} · {fmtBytes(d.bytes)}</span>
                 </div>
               ))}
             </div>
