@@ -50,6 +50,7 @@ import {
   upsertFileState,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
+import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
 import {
@@ -312,6 +313,14 @@ function trimAtLastNewline(buf: Buffer, startOffset: number): { trimmed: Buffer;
 async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise<FileState> {
   const existing = await getFileState(file.path, scope);
   if (existing) {
+    // Legacy entries predate the cwd/repoSlug columns the settings filters
+    // match on — re-seed them once from the head so exclusions apply.
+    if (existing.cwd === undefined) {
+      const head = await readHead(file.path, file.source);
+      existing.cwd = head.cwd ? collapseHome(head.cwd) : path.dirname(file.path);
+      existing.repoSlug = head.repoSlug;
+      await upsertFileState(existing, scope);
+    }
     if (existing.lastMtimeMs !== file.mtimeMs || existing.lastKnownSize !== file.size) {
       existing.lastMtimeMs = file.mtimeMs;
       existing.lastKnownSize = file.size;
@@ -324,6 +333,8 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
     path: file.path,
     family: head.family,
     sessionId: head.sessionId ?? path.basename(file.path, ".jsonl"),
+    cwd: head.cwd ? collapseHome(head.cwd) : path.dirname(file.path),
+    repoSlug: head.repoSlug,
     offsets: {},
     lastKnownSize: file.size,
     lastMtimeMs: file.mtimeMs,
@@ -331,6 +342,24 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
   };
   await upsertFileState(seeded, scope);
   return seeded;
+}
+
+/**
+ * Drop files the device's settings keep local (excluded folders, path rules,
+ * personal gate). Matching happens on the persisted state identity; a file
+ * with no state entry yet passes — its first ingest seeds the entry and the
+ * pre-upload check in tickOnce keeps its bytes on the machine.
+ */
+export function filterWatched(
+  files: DiscoveredFile[],
+  state: HxState,
+  settings: HxSettings,
+): DiscoveredFile[] {
+  return files.filter((f) => {
+    const fs = state.files[f.path];
+    if (!fs) return true;
+    return !shouldSkipFile(settings, fs);
+  });
 }
 
 const FALLBACK_TITLE_MAX = 80;
@@ -1156,7 +1185,8 @@ export async function computeSyncSnapshot(only?: string): Promise<SyncSnapshot> 
   let files = [...claude, ...codex];
   if (only) files = files.filter((f) => f.path === only);
   const state = await loadState();
-  return snapshotFrom(electUploaders(files, state), state);
+  const settings = await readSettings();
+  return snapshotFrom(filterWatched(electUploaders(files, state), state, settings), state);
 }
 
 /** A state entry that is no longer discoverable on disk yet never finished
@@ -1249,7 +1279,11 @@ export async function computeSyncReport(): Promise<SyncReport> {
       sourceGone: !existsSync(p),
     });
   }
-  const elected = electUploaders(all, state);
+  // Settings filtering applies to the ELECTED set only: `discovered` and
+  // `liveSessions` above stay unfiltered so an excluded-but-present file can
+  // never masquerade as a vanished-source gap.
+  const settings = await readSettings();
+  const elected = filterWatched(electUploaders(all, state), state, settings);
   return { snapshot: snapshotFrom(elected, state), behind, skipped: collectSkipped(elected, state) };
 }
 
@@ -1270,7 +1304,8 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
-  files = electUploaders(files, state, log);
+  const settings = await readSettings();
+  files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
   let uploaded = 0;
@@ -1281,6 +1316,12 @@ export async function tickOnce(
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
     if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
+    // A file seen for the first time has no state entry for filterWatched to
+    // match — seed it now and re-check before any byte leaves the machine.
+    if (!pending) {
+      const seeded = await ensureFileState(f, scope);
+      if (shouldSkipFile(settings, seeded)) continue;
+    }
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
@@ -1444,9 +1485,28 @@ export async function startWatch(
   // audit by its next interval.
   let passBusy = false;
 
+  // User-driven pause (settings.json, written by the UI server or a future
+  // CLI). Checked every tick so a pause/resume takes effect within one poll.
+  // Heartbeats keep running while paused — the device reads "online, paused",
+  // not vanished. Log only the transitions, not every skipped tick.
+  let wasPaused = false;
+
   const run = async () => {
     if (Date.now() < pauseUploadsUntilMs) return;
     if (passBusy) return;
+    const settings = await readSettings();
+    if (isPaused(settings)) {
+      if (!wasPaused) {
+        wasPaused = true;
+        const until = settings.pause?.untilMs;
+        log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
+      }
+      return;
+    }
+    if (wasPaused) {
+      wasPaused = false;
+      log(`[hx] sync resumed`);
+    }
     passBusy = true;
     try {
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);

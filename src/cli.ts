@@ -27,6 +27,7 @@ import {
   formatSyncDoctorText,
 } from "./diagnostics.js";
 import { clearBlockedFailures, resetStateCache } from "./state.js";
+import { isPaused, readSettings } from "./settings.js";
 import { openBrowser } from "./browser.js";
 import { loadUiAssets } from "./ui/assets.js";
 import { createUiAuth } from "./ui/auth.js";
@@ -215,9 +216,11 @@ async function autoStartDaemon(
       return;
     }
     // Already loaded — restart it if the token was just reminted (it's holding
-    // the revoked one) or there's still a backlog to push.
+    // the revoked one) or there's still a backlog to push. A user-paused device
+    // is deliberately behind — restarting wouldn't (and shouldn't) change that.
+    const settings = await readSettings();
     const snap = await computeSyncSnapshot().catch(() => null);
-    const behind = snap ? snap.done < snap.total : false;
+    const behind = !isPaused(settings) && (snap ? snap.done < snap.total : false);
     const remaining = snap ? Math.max(0, snap.total - snap.done) : 0;
     if (opts.tokenRefreshed || behind) {
       const dotfileConsent = await resolveDotfileConsent(ops);
@@ -518,6 +521,17 @@ async function cmdStatus(): Promise<void> {
             : "stopped — run `hx start` to resume",
       ]);
     }
+  }
+
+  // User-driven pause (settings.json — set from the HX Client UI). Shown
+  // before the probe so a paused device explains its own backlog.
+  const settings = await readSettings();
+  if (isPaused(settings)) {
+    const until = settings.pause?.untilMs;
+    rows.push([
+      "Paused",
+      until ? `yes — resumes ${new Date(until).toLocaleString()}` : "yes — until resumed",
+    ]);
   }
 
   // Local sync state remains useful even when the network probe is down: a

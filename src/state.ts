@@ -66,6 +66,13 @@ export interface FileState {
    *  attached to several orgs fans out to several stores, each advancing
    *  independently. */
   offsets: Record<string, number>;
+  /** ~-collapsed working directory of the session, from its head. Undefined on
+   *  legacy entries until the watch loop re-seeds them; the settings filters
+   *  (folder exclusions, personal gate) treat unknown as "keep uploading". */
+  cwd?: string;
+  /** Canonical owner/name repo slug from the session head; null = the folder
+   *  has no (GitHub) repo; undefined = not yet recorded (legacy entry). */
+  repoSlug?: string | null;
   /** Last mtime we observed (ms). Skip the file if mtime hasn't moved. */
   lastMtimeMs: number;
   /** Last upload attempt timestamp (ms). For logging/inspection. */
