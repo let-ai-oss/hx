@@ -8,8 +8,8 @@
 // Surfaced on the CLI as `hx connect` (with `hx login` as a hidden alias
 // for binaries / installers that pre-date the rename).
 
-import { spawn } from "node:child_process";
 import os from "node:os";
+import { openBrowser } from "./browser.js";
 import { writeConfig, ensureDeviceId, type HxConfig } from "./config.js";
 import { assertSecureFetchUrl } from "./net.js";
 
@@ -35,31 +35,6 @@ interface PollApproved {
   deviceName?: string | null;
 }
 type PollResponse = PollPending | PollApproved;
-
-function openBrowser(url: string): void {
-  // Best-effort, fail silently — the URL is printed to the terminal regardless.
-  //
-  // `url` is verificationUriComplete straight off the gateway response, so it
-  // is untrusted: never hand it to a shell (a value like "https://x/$(...)"
-  // would execute), and only ever open http(s). Validate the scheme, then
-  // spawn with an argv array so the URL is a single non-shell argument.
-  try {
-    const scheme = new URL(url).protocol;
-    if (scheme !== "http:" && scheme !== "https:") return;
-  } catch {
-    return;
-  }
-  const platform = os.platform();
-  const [cmd, args]: [string, string[]] =
-    platform === "darwin"
-      ? ["open", [url]]
-      : platform === "win32"
-        ? ["explorer", [url]]
-        : ["xdg-open", [url]];
-  const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-  child.on("error", () => {});
-  child.unref();
-}
 
 // ── pairing-code card ───────────────────────────────────────────────────
 // The browser approve page says "Check this matches your terminal", so the

@@ -13,7 +13,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "bun test",
-    "build": "mkdir -p ./dist && bun build ./src/cli.ts --compile --outfile ./dist/hx",
+    "build:ui": "cd ui && bun install && bun run build",
+    "gen:ui": "bun scripts/gen-ui-assets.ts",
+    "build": "bun run build:ui && bun run gen:ui && mkdir -p ./dist && bun build ./src/cli.ts --compile --outfile ./dist/hx",
     "install:connect": "sh install-from-source.sh"
   },
   "devDependencies": {

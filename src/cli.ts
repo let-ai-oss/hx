@@ -27,6 +27,16 @@ import {
   formatSyncDoctorText,
 } from "./diagnostics.js";
 import { clearBlockedFailures, resetStateCache } from "./state.js";
+import { openBrowser } from "./browser.js";
+import { loadUiAssets } from "./ui/assets.js";
+import { createUiAuth } from "./ui/auth.js";
+import {
+  probeExistingInstance,
+  readServerInfo,
+  removeServerInfo,
+  writeServerInfo,
+} from "./ui/instance.js";
+import { tryServeUi } from "./ui/server.js";
 
 function log(msg: string): void {
   process.stdout.write(`${msg}\n`);
@@ -874,6 +884,79 @@ async function cmdUninstall(): Promise<void> {
   log(`"Added by hx installer" line and remove it.`);
 }
 
+const UI_DEFAULT_PORT = 8000;
+const UI_PORT_SCAN_SPAN = 20;
+
+async function cmdUi(): Promise<void> {
+  const portFlag = flag("port");
+  let requested: number | null = null;
+  if (portFlag !== undefined) {
+    requested = Number(portFlag);
+    if (!Number.isInteger(requested) || requested < 1 || requested > 65535) {
+      log(`invalid --port: ${portFlag}`);
+      process.exitCode = 64;
+      return;
+    }
+  }
+
+  const assets = await loadUiAssets();
+  if (!assets) {
+    log("The web UI isn't bundled in this build and ui/dist doesn't exist.");
+    log("From a source checkout, build it once: bun run build:ui");
+    process.exit(1);
+  }
+
+  const auth = createUiAuth();
+  const strict = requested !== null;
+  const basePort = requested ?? UI_DEFAULT_PORT;
+
+  let port = basePort;
+  let server = tryServeUi(basePort, auth, assets);
+  if (!server && !strict) {
+    // The default port is taken — maybe by an earlier `hx ui`. Reuse a live
+    // instance of ours instead of racing it; otherwise scan forward.
+    const existing = await readServerInfo();
+    if (existing) {
+      const alive = await probeExistingInstance(existing);
+      if (alive) {
+        log(`[hx] HX Client UI already running at ${alive.url}`);
+        if (!hasFlag("no-open")) openBrowser(alive.url);
+        return;
+      }
+      await removeServerInfo();
+    }
+    for (let p = basePort + 1; p <= basePort + UI_PORT_SCAN_SPAN && !server; p++) {
+      server = tryServeUi(p, auth, assets);
+      if (server) port = p;
+    }
+    if (server) {
+      log(`[hx] port ${basePort} is in use by another app — serving on http://localhost:${port}`);
+    }
+  }
+  if (!server) {
+    const range = strict ? `${basePort}` : `${basePort}-${basePort + UI_PORT_SCAN_SPAN}`;
+    log(`port ${range} is in use — stop the other process or pass --port <n> (try: lsof -i :${basePort})`);
+    process.exit(1);
+  }
+
+  await writeServerInfo({ port, pid: process.pid, launchToken: auth.launchToken });
+
+  const launchUrl = `http://localhost:${port}/#k=${auth.launchToken}`;
+  log(`[hx] HX Client UI → ${launchUrl}`);
+  if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
+  log(`[hx] Ctrl+C to stop`);
+  if (!hasFlag("no-open")) openBrowser(launchUrl);
+
+  const shutdown = (): void => {
+    void removeServerInfo().finally(() => {
+      server.stop(true);
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2];
   switch (cmd) {
@@ -920,6 +1003,9 @@ async function main(): Promise<void> {
     case "logs":
       await cmdLogs();
       break;
+    case "ui":
+      await cmdUi();
+      break;
     case "update":
       await cmdUpdate();
       break;
@@ -940,6 +1026,7 @@ async function main(): Promise<void> {
       log("  status     Show connection status and link quality");
       log("  doctor sync  Explain blocked sessions (pass --json for automation)");
       log("  logs       Tail the daemon's stdout / stderr");
+      log("  ui         Open the local HX Client UI (http://localhost:8000; --port, --no-open)");
       log("");
       log("Maintenance:");
       log("  backfill   Upload tasks + plans for sessions already on disk");

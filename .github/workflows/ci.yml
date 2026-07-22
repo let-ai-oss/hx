@@ -22,6 +22,17 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # ui/ is its own package: install pinned deps, build (which typechecks it
+      # via `tsc -b`), then generate the embed manifest so the root typecheck
+      # below also covers src/ui-assets.gen.ts exactly as a release build sees it.
+      - name: Build web UI
+        run: |
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+          cd ..
+          bun run gen:ui
+
       - name: Typecheck
         run: bun run typecheck
 

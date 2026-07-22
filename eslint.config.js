@@ -4,7 +4,10 @@ import security from "eslint-plugin-security";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**"],
+    // ui/ is a separate Vite/React app with its own toolchain: typechecked by
+    // `tsc -b` during its build, not covered by this config's node/security
+    // ruleset (no React plugins here). CodeQL still scans it.
+    ignores: ["dist/**", "node_modules/**", "ui/**", "src/ui-assets.gen.ts"],
   },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

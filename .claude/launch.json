@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "hx-ui",
-      "runtimeExecutable": "pnpm",
-      "runtimeArgs": ["--dir", "ui", "dev"],
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["--cwd", "ui", "dev"],
       "port": 5199
     }
   ]

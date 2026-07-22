@@ -23,6 +23,15 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # Keep in sync with release.yml "Build web UI".
+      - name: Build web UI
+        run: |
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+          cd ..
+          bun run gen:ui
+
       - name: Read hx version
         id: version
         shell: bash
