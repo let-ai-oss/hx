@@ -115,6 +115,37 @@ export interface ProbeInfo {
   quality?: string;
 }
 
+export interface ExcludedFolder {
+  family: string;
+  cwd: string;
+}
+
+export interface Settings {
+  pause: { untilMs: number | null } | null;
+  personalSync: boolean;
+  excludedFolders: ExcludedFolder[];
+  excludeRules: string[];
+}
+
+export interface DaemonActionResult {
+  managerName: string;
+  loaded: boolean;
+  pid: number | null;
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest: string | null;
+  updateAvailable: boolean;
+}
+
+export type ServerEvent =
+  | { type: "hello" }
+  | { type: "changed" }
+  | { type: "update-progress"; phase: string; pct?: number }
+  | { type: "update-done"; alreadyLatest: boolean; version: string; daemonRestarted: boolean }
+  | { type: "update-error"; message: string };
+
 const TOKEN_KEY = "hx-ui-session-token";
 
 class ApiError extends Error {
@@ -158,6 +189,78 @@ async function get<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function post<T>(path: string, body?: unknown): Promise<T> {
+  const token = await sessionToken();
+  if (!token) throw new ApiError(401, "no session token — reopen from `hx ui`");
+  const res = await fetch(path, {
+    method: "POST",
+    headers: {
+      "x-hx-ui-token": token,
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new ApiError(res.status, `${path} → ${res.status}`);
+  return (await res.json()) as T;
+}
+
+/**
+ * Server-sent events over an authenticated fetch stream (EventSource can't
+ * set headers). Returns an aborter; auto-reconnects with a small backoff so a
+ * restarted `hx ui` picks the page back up.
+ */
+export function subscribeEvents(onEvent: (evt: ServerEvent) => void): () => void {
+  let stopped = false;
+  let ctrl: AbortController | null = null;
+
+  const connect = async (): Promise<void> => {
+    while (!stopped) {
+      try {
+        const token = await sessionToken();
+        if (!token) return;
+        ctrl = new AbortController();
+        const res = await fetch("/api/events", {
+          headers: { "x-hx-ui-token": token },
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !res.body) throw new ApiError(res.status, "events unavailable");
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let idx: number;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            const frame = buf.slice(0, idx);
+            buf = buf.slice(idx + 2);
+            const data = frame
+              .split("\n")
+              .filter((l) => l.startsWith("data: "))
+              .map((l) => l.slice(6))
+              .join("");
+            if (!data) continue;
+            try {
+              onEvent(JSON.parse(data) as ServerEvent);
+            } catch {
+              // malformed frame — skip
+            }
+          }
+        }
+      } catch {
+        // fall through to reconnect
+      }
+      if (!stopped) await new Promise((r) => setTimeout(r, 3_000));
+    }
+  };
+  void connect();
+  return () => {
+    stopped = true;
+    ctrl?.abort();
+  };
+}
+
 export const api = {
   snapshot: () => get<Snapshot>("/api/snapshot"),
   sessions: (folderId: string) =>
@@ -170,6 +273,14 @@ export const api = {
   probe: () => get<ProbeInfo>("/api/probe"),
   whoami: () => get<{ email: string | null }>("/api/whoami"),
   activity: (hours: number) => get<{ entries: ActivityEntry[] }>(`/api/activity?hours=${hours}`),
+  settings: () => get<Settings>("/api/settings"),
+  patchSettings: (patch: Partial<Settings>) => post<Settings>("/api/settings", patch),
+  daemon: (action: "start" | "stop" | "restart") =>
+    post<DaemonActionResult>("/api/daemon", { action }),
+  retryBlocked: () => post<{ sessions: number; restarted: boolean }>("/api/retry-blocked"),
+  updateCheck: () => get<UpdateCheck>("/api/update-check"),
+  startUpdate: () => post<{ started: boolean }>("/api/update"),
+  disconnect: () => post<{ disconnected: boolean }>("/api/disconnect"),
 };
 
 // ── formatting helpers shared by the views ──────────────────────────────

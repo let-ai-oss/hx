@@ -25,11 +25,28 @@ function SessionRow({ s }: { s: SessionInfo }) {
 }
 
 function FolderWhy({ f }: { f: FolderInfo }) {
-  const { destinations, sessionsFor, destLabels } = useApp();
+  const { destinations, sessionsFor, destLabels, isExcluded, isPersonalGated, excludeFolder, includeFolder, setPersonal, goto } = useApp();
   const sessions = sessionsFor(f.id);
   const labels = destLabels(f);
   const orgDest = f.dests.some((d) => d !== "letai");
   const personalOnly = f.dests.length > 0 && f.dests.every((d) => d === "letai");
+
+  if (isExcluded(f)) {
+    return (
+      <>
+        <div className="why-note"><b>Excluded.</b> Nothing new from this folder leaves this machine — it isn’t uploaded to any destination while excluded. Anything uploaded before stays where it is.</div>
+        <div className="why-act"><button className="btn ghost sm" onClick={() => { includeFolder(f); goto("activity"); }}>Include again</button></div>
+      </>
+    );
+  }
+  if (isPersonalGated(f)) {
+    return (
+      <>
+        <div className="why-note"><b>Personal sync is off</b>, so this repo-less folder stays on this machine. Turn personal sync back on to resume uploading it to your private space.</div>
+        <div className="why-act"><button className="btn ghost sm" onClick={() => setPersonal(true)}>Turn personal sync on</button></div>
+      </>
+    );
+  }
 
   const chain = f.repo ? (
     <>
@@ -74,18 +91,21 @@ function FolderWhy({ f }: { f: FolderInfo }) {
         </div>
       )}
       {destinations.length === 0 && null}
+      <div className="why-act"><button className="btn ghost sm" onClick={() => excludeFolder(f)}>Exclude this folder</button></div>
     </>
   );
 }
 
 export function FolderRow({ f }: { f: FolderInfo }) {
-  const { openRows, toggleRow, openDest, loadSessions } = useApp();
+  const { openRows, toggleRow, openDest, loadSessions, isExcluded, isPersonalGated } = useApp();
   const open = openRows.has(f.id);
+  const excluded = isExcluded(f);
+  const dim = excluded || isPersonalGated(f);
   return (
-    <div className={`frow${open ? " open" : ""}`} data-id={f.id}>
+    <div className={`frow${dim ? " dim" : ""}${open ? " open" : ""}`} data-id={f.id}>
       <div className="line" onClick={() => { if (!open) loadSessions(f.id); toggleRow(f.id); }}>
         <CellA f={f} />
-        <CellB f={f} destAction={openDest} />
+        <CellB f={f} isExcluded={excluded} destAction={openDest} />
         <CellC f={f} />
         <div className="chev"></div>
       </div>
@@ -132,21 +152,30 @@ export function groupsFor(list: FolderInfo[], groupBy: GroupBy, destLabel: (key:
 }
 
 export function Folders() {
-  const { view, groupBy, setGroupBy, query, setQuery, activeFolders, destinations, openDest } = useApp();
+  const { view, groupBy, setGroupBy, query, setQuery, allFolders, destinations, openDest, settings, setPersonal } = useApp();
   const [menuOpen, setMenuOpen] = useState(false);
 
   const destLabel = (key: string) => destinations.find((d) => d.key === key)?.label ?? key;
   const q = query.trim().toLowerCase();
-  const list = activeFolders.filter((f) => !q ||
+  const list = allFolders.filter((f) => !q ||
     [f.path, f.repo, f.tool, ...f.dests.map(destLabel)]
       .filter(Boolean).join(" ").toLowerCase().includes(q));
   const groups = groupsFor(list, groupBy, destLabel);
+  const personalOff = settings?.personalSync === false;
 
   return (
     <section className={`view${view === "folders" ? " active" : ""}`} id="view-folders">
       <div className="kicker">This device</div>
       <h1>Folders &amp; Destinations</h1>
       <p className="lede">Every folder where an agentic tool keeps sessions, and the exact place each one is stored. Open a row to see <i>why</i> it goes where it goes.</p>
+
+      {personalOff && (
+        <div className="banner info" id="personalOffBanner" style={{ display: "flex" }}>
+          <span className="badge">i</span>
+          <span><b>Personal session sync is off.</b> Dimmed repo-less folders stay on this machine only. Work folders continue to sync.</span>
+          <button className="btn" id="reenableBtn" onClick={() => setPersonal(true)}>Turn back on</button>
+        </div>
+      )}
 
       <div className="toolbar">
         <GPill id="groupPill" label="Group by" value={GLBL[groupBy]} valueId="groupVal" menuId="groupMenu" open={menuOpen} setOpen={setMenuOpen}>

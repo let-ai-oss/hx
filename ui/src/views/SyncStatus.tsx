@@ -64,7 +64,9 @@ function Chart({ entries }: { entries: ActivityEntry[] }) {
 }
 
 export function SyncStatus() {
-  const { view, goto, snap, destinations, activity } = useApp();
+  const { view, goto, snap, destinations, activity, settings, resumeAll } = useApp();
+  const paused = settings?.pause != null;
+  const pausedUntil = settings?.pause?.untilMs ?? null;
 
   const sync = snap?.sync;
   const doctor = snap?.doctor;
@@ -83,6 +85,14 @@ export function SyncStatus() {
       <div className="kicker">This device</div>
       <h1>Sync Status</h1>
       <p className="lede">What <code className="hx">hx</code> is syncing right now, what’s queued, and what this device has been sending.</p>
+
+      {paused && (
+        <div className="banner warn" id="pauseBanner" style={{ display: "flex" }}>
+          <span className="badge">II</span>
+          <span className="btxt"><b>Syncing is paused.</b> {pausedUntil ? `It resumes at ${fmtClock(pausedUntil)}.` : "It stays paused until you resume it."} Sessions keep queueing safely on this machine.</span>
+          <button className="btn" id="pauseBannerResume" onClick={resumeAll}>Resume now</button>
+        </div>
+      )}
 
       <div className="stats">
         <div className="stat"><span className="lbl">On disk</span><div className="big">{sync?.total ?? "…"}</div><div className="sub">{sync ? `sessions · ${fmtBytes(sync.totalBytes)}` : ""}</div></div>

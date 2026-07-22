@@ -13,8 +13,31 @@ function probeLine(p: ProbeInfo | null, probing: boolean): { v: string; vs: stri
 }
 
 export function DeviceDetail() {
-  const { view, goto, snap, email, doctorOpen, setDoctorOpen, activeFolders, probe, probing, runProbe } = useApp();
+  const {
+    view, goto, snap, email, doctorOpen, setDoctorOpen, activeFolders, probe, probing, runProbe,
+    daemonAct, retryBlockedAct, update, checkUpdate, runUpdateAct,
+  } = useApp();
   const [copied, setCopied] = useState(false);
+  const [engFlash, setEngFlash] = useState<string | null>(null);
+  const [engBusy, setEngBusy] = useState(false);
+  const [retryFlash, setRetryFlash] = useState<string | null>(null);
+
+  const engAction = (action: "start" | "stop" | "restart") => {
+    setEngBusy(true);
+    void daemonAct(action)
+      .then((msg) => {
+        setEngFlash(msg);
+        setTimeout(() => setEngFlash(null), 4500);
+      })
+      .finally(() => setEngBusy(false));
+  };
+
+  const doRetry = () => {
+    void retryBlockedAct().then((msg) => {
+      setRetryFlash(msg);
+      setTimeout(() => setRetryFlash(null), 4500);
+    });
+  };
 
   const device = snap?.device;
   const daemon = device?.daemon;
@@ -48,7 +71,26 @@ export function DeviceDetail() {
           <div className="frw"><span className="k">Platform</span><span><span className="v">{device ? `${device.platform} ${device.arch}` : "…"}</span><div className="vs">service manager: {daemon?.managerName ?? "…"}</div></span></div>
           <div className="frw">
             <span className="k"><code className="hx">hx</code> version</span>
-            <span><span className="v mono" id="verVal">{device?.hxVersion ?? "…"}</span><div className="vs" id="verSub">update any time with <span className="mono">hx update</span></div></span>
+            <span>
+              <span className="v mono" id="verVal">{device?.hxVersion ?? "…"}</span>
+              <div className={`vs${update.done || update.check ? " okv" : ""}`} id="verSub">
+                {update.running ? (update.progress ?? "updating…")
+                  : update.error ? update.error
+                  : update.done ? update.done
+                  : update.checking ? "checking…"
+                  : update.check
+                    ? update.check.updateAvailable
+                      ? `${update.check.latest} is available — nothing was installed yet.`
+                      : "You’re on the latest version."
+                    : "self-updates via the gateway"}
+              </div>
+            </span>
+            <span style={{ display: "flex", gap: 8 }}>
+              <button className="btn ghost sm" id="updateBtn" disabled={update.checking || update.running} onClick={checkUpdate}>Check for updates</button>
+              {update.check?.updateAvailable && !update.done && (
+                <button className="btn sm" id="updateNowBtn" disabled={update.running} onClick={runUpdateAct}>Update to {update.check.latest}</button>
+              )}
+            </span>
           </div>
         </div>
       </div>
@@ -82,16 +124,21 @@ export function DeviceDetail() {
             <span className="k">State</span>
             <span>
               <span className="v" id="engState">{daemon ? (running ? "Running — watching" : "Stopped") : "…"}</span>
-              <div className="vs" id="engStateSub">{daemon
+              <div className={`vs${engFlash ? " okv" : ""}`} id="engStateSub">{engFlash ?? (daemon
                 ? running
                   ? `daemon running · pid ${daemon.pid} · via ${daemon.managerName}`
-                  : `daemon not running — sessions still queue safely; start it with \`hx start\``
-                : ""}</div>
+                  : "daemon not running — sessions still queue safely; start it from here any time"
+                : "")}</div>
+            </span>
+            <span style={{ display: "flex", gap: 8 }}>
+              <button className="btn ghost sm" id="restartBtn" disabled={engBusy || !running} onClick={() => engAction("restart")}>Restart</button>
+              <button className="btn ghost sm" id="stopBtn" disabled={engBusy} onClick={() => engAction(running ? "stop" : "start")}>{running ? "Stop" : "Start"}</button>
             </span>
           </div>
           <div className="frw">
             <span className="k">Last pass</span>
             <span><span className="v" id="lpV">{fmtRelative(snap?.sync.lastUploadAtMs ?? 0)}</span><div className="vs">most recent successful upload from this device</div></span>
+            <button className="btn ghost sm" id="tickBtn" disabled={engBusy || !running} onClick={() => engAction("restart")}>Sync now</button>
           </div>
           <div className="frw"><span className="k">Queue</span><span><span className="v">{waiting > 0 ? plural(waiting, "session") : "Empty"}</span><div className="vs">{waiting > 0 ? "waiting to upload on the next pass" : "fully caught up"}</div></span></div>
           <div className="frw"><span className="k">Backoff</span><span><span className="v">{nextRetry ? `next retry ${fmtClock(nextRetry)}` : "None"}</span></span></div>
@@ -154,7 +201,14 @@ export function DeviceDetail() {
             </div>
           )}
           {doctor && doctor.blockers.length > 0 && (
-            <div className="why-note" style={{ marginTop: 12 }}><b>Fix:</b> bring the Session Vault back online, or ask an admin to move the repository to a live destination. Nothing is lost — held sessions send automatically on reconnect. From a terminal: <span className="mono">hx retry --blocked</span>.</div>
+            <>
+              <div className="why-note" style={{ marginTop: 12 }}><b>Fix:</b> bring the Session Vault back online, or ask an admin to move the repository to a live destination. Nothing is lost — held sessions send automatically on reconnect.</div>
+              <div className="why-act">
+                <button className="btn ghost sm" id="retryBtn" onClick={doRetry}>Retry blocked now</button>
+                <button className="btn ghost sm" onClick={() => goto("folders")}>Open Folders &amp; Destinations</button>
+              </div>
+              <div className={`resultline${retryFlash ? " on" : ""}`} id="retryResult">{retryFlash}</div>
+            </>
           )}
         </div>
         <details className="cliref">

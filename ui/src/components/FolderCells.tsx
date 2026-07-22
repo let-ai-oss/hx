@@ -1,7 +1,7 @@
 import { useApp } from "../store";
 import type { FolderInfo } from "../api";
 import { plural } from "../data";
-import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc } from "../icons";
+import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc, SlashIc } from "../icons";
 
 // Strict two-line cells — every cell shares the same line grid so icons,
 // destinations, and counts all read as vertical columns.
@@ -20,8 +20,16 @@ export function CellA({ f }: { f: FolderInfo }) {
   );
 }
 
-export function CellB({ f, destAction }: { f: FolderInfo; destAction?: (destKey: string) => void }) {
+export function CellB({ f, isExcluded = false, destAction }: { f: FolderInfo; isExcluded?: boolean; destAction?: (destKey: string) => void }) {
   const { destinations } = useApp();
+  if (isExcluded) {
+    return (
+      <div className="cell cellB">
+        <div className="cl l1 exc"><span className="ico"><SlashIc /></span><span className="tx">Excluded</span></div>
+        <div className="cl l2"><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">Not uploaded while excluded</span></div>
+      </div>
+    );
+  }
   if (f.dests.length === 0) {
     return (
       <div className="cell cellB">

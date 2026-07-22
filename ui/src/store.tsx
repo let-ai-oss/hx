@@ -2,13 +2,16 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { flushSync } from "react-dom";
 import {
   api,
+  subscribeEvents,
   type ActivityEntry,
   type DestinationInfo,
   type FolderInfo,
   type LogLine,
   type ProbeInfo,
   type SessionInfo,
+  type Settings,
   type Snapshot,
+  type UpdateCheck,
 } from "./api";
 
 export type View = "overview" | "folders" | "activity" | "privacy" | "device" | "logs" | "fortress";
@@ -81,7 +84,36 @@ interface AppState {
   previewFor: (path: string) => { role: string; text: string }[] | undefined;
   loadPreview: (path: string) => void;
 
+  // Settings + actions (all real: settings.json + daemon/gateway calls)
+  settings: Settings | null;
+  isExcluded: (f: FolderInfo) => boolean;
+  isPersonalGated: (f: FolderInfo) => boolean;
+  setPersonal: (on: boolean) => void;
+  pickPause: (opt: string) => void;
+  resumeAll: () => void;
+  excludeFolder: (f: FolderInfo) => void;
+  includeFolder: (f: FolderInfo) => void;
+  addRule: (v: string) => void;
+  removeRule: (v: string) => void;
+  daemonAct: (action: "start" | "stop" | "restart") => Promise<string>;
+  retryBlockedAct: () => Promise<string>;
+  disconnectAct: () => Promise<void>;
+  update: {
+    checking: boolean;
+    check: UpdateCheck | null;
+    running: boolean;
+    progress: string | null;
+    done: string | null;
+    error: string | null;
+  };
+  checkUpdate: () => void;
+  runUpdateAct: () => void;
+  confirm: { open: boolean; title: string; message: string; action: string } | null;
+  askConfirm: (title: string, message: string, action: string, onYes: () => void) => void;
+  answerConfirm: (yes: boolean) => void;
+
   // Derived
+  allFolders: FolderInfo[];
   activeFolders: FolderInfo[];
   destinations: DestinationInfo[];
   foldersOfDest: (destKey: string) => FolderInfo[];
@@ -131,9 +163,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const sessionsInFlight = useRef<Set<string>>(new Set());
   const previewsInFlight = useRef<Set<string>>(new Set());
 
-  // ── polling ───────────────────────────────────────────────────────────
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [update, setUpdate] = useState<AppState["update"]>({
+    checking: false, check: null, running: false, progress: null, done: null, error: null,
+  });
+  const [confirm, setConfirm] = useState<AppState["confirm"]>(null);
+  const confirmYes = useRef<(() => void) | null>(null);
+
+  // ── polling + server-sent nudges ──────────────────────────────────────
+  const refetchSnap = useRef<() => void>(() => {});
   useEffect(() => {
     let alive = true;
+    let debounce: ReturnType<typeof setTimeout> | null = null;
     const pull = async () => {
       try {
         const s = await api.snapshot();
@@ -147,16 +188,48 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (alive) setLoading(false);
       }
     };
+    refetchSnap.current = () => {
+      if (debounce) return;
+      debounce = setTimeout(() => {
+        debounce = null;
+        void pull();
+      }, 300);
+    };
     void pull();
     const t = setInterval(pull, SNAPSHOT_POLL_MS);
+    const unsubscribe = subscribeEvents((evt) => {
+      if (!alive) return;
+      if (evt.type === "changed") refetchSnap.current();
+      else if (evt.type === "update-progress") {
+        setUpdate((u) => ({
+          ...u,
+          running: true,
+          progress: `${evt.phase}${evt.pct !== undefined ? ` — ${Math.round(evt.pct)}%` : "…"}`,
+        }));
+      } else if (evt.type === "update-done") {
+        setUpdate((u) => ({
+          ...u,
+          running: false,
+          progress: null,
+          done: evt.alreadyLatest
+            ? `Already on the latest version (${evt.version}).`
+            : `Updated to ${evt.version}${evt.daemonRestarted ? " — daemon restarted" : ""}. Restart \`hx ui\` for the new client.`,
+        }));
+      } else if (evt.type === "update-error") {
+        setUpdate((u) => ({ ...u, running: false, progress: null, error: evt.message }));
+      }
+    });
     return () => {
       alive = false;
       clearInterval(t);
+      if (debounce) clearTimeout(debounce);
+      unsubscribe();
     };
   }, []);
 
   useEffect(() => {
     void api.whoami().then((w) => setEmail(w.email)).catch(() => {});
+    void api.settings().then(setSettings).catch(() => {});
   }, []);
 
   // Activity journal backs the Sync Status chart; refreshed with the view.
@@ -257,7 +330,116 @@ export function AppProvider({ children }: { children: ReactNode }) {
       .finally(() => previewsInFlight.current.delete(path));
   };
 
-  const activeFolders = snap?.folders ?? [];
+  // ── settings actions (each patches settings.json; the daemon notices
+  // within one 1.5 s tick, and a follow-up refetch shows the effect) ─────
+  const patch = (p: Partial<Settings>) => {
+    void api
+      .patchSettings(p)
+      .then((s) => {
+        setSettings(s);
+        setTimeout(() => refetchSnap.current(), 2_000);
+      })
+      .catch(() => {});
+  };
+
+  const setPersonal = (on: boolean) => patch({ personalSync: on });
+  const pickPause = (opt: string) => {
+    if (opt === "forever") return patch({ pause: { untilMs: null } });
+    if (opt === "tomorrow") {
+      const d = new Date();
+      d.setDate(d.getDate() + 1);
+      d.setHours(8, 0, 0, 0);
+      return patch({ pause: { untilMs: d.getTime() } });
+    }
+    patch({ pause: { untilMs: Date.now() + Number(opt) * 60_000 } });
+  };
+  const resumeAll = () => patch({ pause: null });
+
+  const isExcluded = (f: FolderInfo) =>
+    Boolean(settings?.excludedFolders.some((e) => e.family === f.family && e.cwd === f.path)) ||
+    Boolean(settings?.excludeRules.some((r) => {
+      const rr = r.replace(/\/+$/, "");
+      return rr.length > 0 && (f.path === rr || f.path.startsWith(`${rr}/`));
+    }));
+  const isPersonalGated = (f: FolderInfo) => settings?.personalSync === false && f.repo === null;
+
+  const excludeFolder = (f: FolderInfo) => {
+    const cur = settings?.excludedFolders ?? [];
+    if (cur.some((e) => e.family === f.family && e.cwd === f.path)) return;
+    patch({ excludedFolders: [...cur, { family: f.family, cwd: f.path }] });
+  };
+  const includeFolder = (f: FolderInfo) => {
+    const cur = settings?.excludedFolders ?? [];
+    patch({ excludedFolders: cur.filter((e) => !(e.family === f.family && e.cwd === f.path)) });
+  };
+  const addRule = (v: string) => {
+    const cur = settings?.excludeRules ?? [];
+    if (cur.includes(v)) return;
+    patch({ excludeRules: [...cur, v] });
+  };
+  const removeRule = (v: string) => {
+    patch({ excludeRules: (settings?.excludeRules ?? []).filter((r) => r !== v) });
+  };
+
+  const daemonAct = async (action: "start" | "stop" | "restart"): Promise<string> => {
+    try {
+      const r = await api.daemon(action);
+      setTimeout(() => refetchSnap.current(), 500);
+      return r.pid
+        ? `daemon ${action === "stop" ? "stopped" : "running"} · pid ${r.pid} · via ${r.managerName}`
+        : `daemon ${action === "stop" ? "stopped" : "not running"} (${r.managerName})`;
+    } catch {
+      return `couldn't ${action} the daemon — try \`hx ${action}\` in a terminal`;
+    }
+  };
+
+  const retryBlockedAct = async (): Promise<string> => {
+    try {
+      const r = await api.retryBlocked();
+      setTimeout(() => refetchSnap.current(), 500);
+      return r.restarted
+        ? `Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"} — daemon restarted for an immediate retry.`
+        : `Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"}.`;
+    } catch {
+      return "Retry failed — try `hx retry --blocked` in a terminal.";
+    }
+  };
+
+  const disconnectAct = async (): Promise<void> => {
+    try {
+      await api.disconnect();
+    } finally {
+      refetchSnap.current();
+    }
+  };
+
+  const checkUpdate = () => {
+    setUpdate((u) => ({ ...u, checking: true, error: null, done: null }));
+    void api
+      .updateCheck()
+      .then((c) => setUpdate((u) => ({ ...u, checking: false, check: c })))
+      .catch(() => setUpdate((u) => ({ ...u, checking: false, error: "update check failed" })));
+  };
+  const runUpdateAct = () => {
+    setUpdate((u) => ({ ...u, running: true, progress: "starting…", error: null, done: null }));
+    void api.startUpdate().catch(() =>
+      setUpdate((u) => ({ ...u, running: false, progress: null, error: "couldn't start the update" })),
+    );
+  };
+
+  const askConfirm = (title: string, message: string, action: string, onYes: () => void) => {
+    confirmYes.current = onYes;
+    setConfirm({ open: true, title, message, action });
+  };
+  const answerConfirm = (yes: boolean) => {
+    setConfirm(null);
+    const fn = confirmYes.current;
+    confirmYes.current = null;
+    if (yes && fn) fn();
+  };
+
+  const allFolders = snap?.folders ?? [];
+  const activeFolders = allFolders.filter((f) => !isExcluded(f) && !isPersonalGated(f));
   const destinations = snap?.destinations ?? [];
   const foldersOfDest = (destKey: string) => activeFolders.filter((f) => f.dests.includes(destKey));
   const destLabels = (f: FolderInfo) =>
@@ -342,7 +524,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
     loadSessions,
     previewFor: (p) => previews.get(p),
     loadPreview,
-    activeFolders, destinations, foldersOfDest, destLabels, unlinkedFolders,
+    settings, isExcluded, isPersonalGated,
+    setPersonal, pickPause, resumeAll,
+    excludeFolder, includeFolder, addRule, removeRule,
+    daemonAct, retryBlockedAct, disconnectAct,
+    update, checkUpdate, runUpdateAct,
+    confirm, askConfirm, answerConfirm,
+    allFolders, activeFolders, destinations, foldersOfDest, destLabels, unlinkedFolders,
     reviewUnlinked, jumpFortressList, jumpDoctor,
   };
 

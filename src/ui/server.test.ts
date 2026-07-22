@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createUiAuth, type UiAuth } from "./auth.js";
-import { handleUiRequest, type UiServerCtx } from "./server.js";
+import { createEventHub, handleUiRequest, type UiServerCtx } from "./server.js";
 import type { UiAssets } from "./assets.js";
 
 const PORT = 8000;
@@ -33,7 +33,16 @@ beforeAll(() => {
     whoami: () => Promise.resolve({ email: "dev@local.test" }),
     activity: () => Promise.resolve([{ at: 1, bytes: 10, dest: "letai" }]),
   };
-  ctx = { auth, assets, providers, port: PORT };
+  const actions = {
+    readSettings: () => Promise.resolve({ personalSync: true }),
+    writeSettings: (patch: Record<string, unknown>) => Promise.resolve({ personalSync: true, ...patch }),
+    daemon: (action: string) => Promise.resolve({ managerName: "test", loaded: action !== "stop", pid: 1 }),
+    retryBlocked: () => Promise.resolve({ sessions: 2, files: 2, restarted: true }),
+    updateCheck: () => Promise.resolve({ current: "1.0.0", latest: "1.0.0", updateAvailable: false }),
+    startUpdate: () => Promise.resolve(true),
+    disconnect: () => Promise.resolve({ disconnected: true }),
+  };
+  ctx = { auth, assets, providers, actions, events: createEventHub(), port: PORT };
 });
 
 const req = (
@@ -172,6 +181,47 @@ describe("handleUiRequest — auth flow", () => {
 
     const logs = await handleUiRequest(req("/api/logs", { token: auth.sessionToken }), ctx);
     assert.equal(logs.status, 200);
+  });
+
+  it("serves and validates the action endpoints", async () => {
+    const t = auth.sessionToken;
+    // settings round-trip + unknown-key rejection
+    const settings = await handleUiRequest(req("/api/settings", { token: t }), ctx);
+    assert.equal(settings.status, 200);
+    const patched = await handleUiRequest(
+      req("/api/settings", { method: "POST", token: t, body: { personalSync: false } }),
+      ctx,
+    );
+    assert.equal(patched.status, 200);
+    const badKey = await handleUiRequest(
+      req("/api/settings", { method: "POST", token: t, body: { accessToken: "sneaky" } }),
+      ctx,
+    );
+    assert.equal(badKey.status, 400);
+    // daemon action validation
+    const badAction = await handleUiRequest(
+      req("/api/daemon", { method: "POST", token: t, body: { action: "explode" } }),
+      ctx,
+    );
+    assert.equal(badAction.status, 400);
+    const stop = await handleUiRequest(
+      req("/api/daemon", { method: "POST", token: t, body: { action: "stop" } }),
+      ctx,
+    );
+    assert.equal(stop.status, 200);
+    // retry / update-check / update / disconnect
+    assert.equal((await handleUiRequest(req("/api/retry-blocked", { method: "POST", token: t }), ctx)).status, 200);
+    assert.equal((await handleUiRequest(req("/api/update-check", { token: t }), ctx)).status, 200);
+    assert.equal((await handleUiRequest(req("/api/update", { method: "POST", token: t }), ctx)).status, 200);
+    assert.equal((await handleUiRequest(req("/api/disconnect", { method: "POST", token: t }), ctx)).status, 200);
+    // all actions are session-gated
+    assert.equal((await handleUiRequest(req("/api/disconnect", { method: "POST" }), ctx)).status, 401);
+    // and Origin-gated like every non-GET
+    const crossSite = await handleUiRequest(
+      req("/api/disconnect", { method: "POST", token: t, origin: "https://evil.example" }),
+      ctx,
+    );
+    assert.equal(crossSite.status, 403);
   });
 
   it("404s unknown authed api routes without leaking to anonymous callers", async () => {

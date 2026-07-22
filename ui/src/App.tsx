@@ -12,6 +12,7 @@ import { FortressDetail } from "./views/FortressDetail";
 import { Logs } from "./views/Logs";
 import { KbdModal } from "./modals/KbdModal";
 import { InspectorModal } from "./modals/InspectorModal";
+import { ConfirmModal } from "./modals/ConfirmModal";
 
 function Chrome() {
   const { snap, error, loading } = useApp();
@@ -48,6 +49,7 @@ function Chrome() {
       <FooterBand />
       <KbdModal />
       <InspectorModal />
+      <ConfirmModal />
     </>
   );
 }
