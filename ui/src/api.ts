@@ -97,6 +97,16 @@ export interface LogLine {
   level: "info" | "up" | "warn";
 }
 
+export interface ActivityEntry {
+  at: number;
+  sessionId: string;
+  family: string;
+  title: string | null;
+  folder: string | null;
+  bytes: number;
+  dest: string;
+}
+
 export interface ProbeInfo {
   up: boolean;
   reason?: string;
@@ -159,6 +169,7 @@ export const api = {
   logs: (lines: number) => get<{ lines: LogLine[] }>(`/api/logs?lines=${lines}`),
   probe: () => get<ProbeInfo>("/api/probe"),
   whoami: () => get<{ email: string | null }>("/api/whoami"),
+  activity: (hours: number) => get<{ entries: ActivityEntry[] }>(`/api/activity?hours=${hours}`),
 };
 
 // ── formatting helpers shared by the views ──────────────────────────────

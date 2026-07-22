@@ -30,6 +30,7 @@ export interface UiProviders {
   logs(maxLines: number): Promise<{ body: string; level: LogLevel }[]>;
   probe(): Promise<unknown>;
   whoami(): Promise<{ email: string | null }>;
+  activity(hours: number): Promise<unknown[]>;
 }
 
 export interface UiServerCtx {
@@ -165,6 +166,10 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
       return json(await ctx.providers.probe());
     case "/api/whoami":
       return json(await ctx.providers.whoami());
+    case "/api/activity": {
+      const hours = Number(query.get("hours")) || 24;
+      return json({ entries: await ctx.providers.activity(hours) });
+    }
     default:
       return apiError(404, "not found");
   }

@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { flushSync } from "react-dom";
 import {
   api,
+  type ActivityEntry,
   type DestinationInfo,
   type FolderInfo,
   type LogLine,
@@ -74,6 +75,7 @@ interface AppState {
   probing: boolean;
   runProbe: () => void;
   logs: LogLine[];
+  activity: ActivityEntry[] | null;
   sessionsFor: (folderId: string) => SessionInfo[] | undefined;
   loadSessions: (folderId: string) => void;
   previewFor: (path: string) => { role: string; text: string }[] | undefined;
@@ -123,6 +125,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [probe, setProbe] = useState<ProbeInfo | null>(null);
   const [probing, setProbing] = useState(false);
   const [logs, setLogs] = useState<LogLine[]>([]);
+  const [activity, setActivity] = useState<ActivityEntry[] | null>(null);
   const [sessions, setSessions] = useState<Map<string, SessionInfo[]>>(new Map());
   const [previews, setPreviews] = useState<Map<string, { role: string; text: string }[]>>(new Map());
   const sessionsInFlight = useRef<Set<string>>(new Set());
@@ -155,6 +158,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void api.whoami().then((w) => setEmail(w.email)).catch(() => {});
   }, []);
+
+  // Activity journal backs the Sync Status chart; refreshed with the view.
+  useEffect(() => {
+    if (view !== "activity") return;
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await api.activity(24);
+        if (alive) setActivity(r.entries);
+      } catch {
+        if (alive) setActivity([]);
+      }
+    };
+    void pull();
+    const t = setInterval(pull, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [view]);
 
   const logsActive = view === "logs" || logFull;
   useEffect(() => {
@@ -314,6 +337,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     snap, loading, error, email,
     probe, probing, runProbe,
     logs,
+    activity,
     sessionsFor: (id) => sessions.get(id),
     loadSessions,
     previewFor: (p) => previews.get(p),

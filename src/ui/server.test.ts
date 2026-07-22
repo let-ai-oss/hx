@@ -31,6 +31,7 @@ beforeAll(() => {
     logs: () => Promise.resolve([{ body: "[hx] tick", level: "info" as const }]),
     probe: () => Promise.resolve({ up: true }),
     whoami: () => Promise.resolve({ email: "dev@local.test" }),
+    activity: () => Promise.resolve([{ at: 1, bytes: 10, dest: "letai" }]),
   };
   ctx = { auth, assets, providers, port: PORT };
 });

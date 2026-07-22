@@ -15,6 +15,8 @@ import { readConfig, type HxConfig } from "../config.js";
 import { getDaemonOps, STDOUT_LOG } from "../daemon.js";
 import { buildSyncDoctorReport, type SyncDoctorReport } from "../diagnostics.js";
 import { assertSecureFetchUrl } from "../net.js";
+import { readActivity, type ActivityEntry } from "../activity.js";
+import { readOrgNames } from "../org-names.js";
 import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
 import { loadState, minOffset, resetStateCache, type FileState } from "../state.js";
@@ -33,9 +35,12 @@ export function familyLabel(family: string): string {
   return FAMILY_LABELS[family] ?? family;
 }
 
-/** "letai" (shared let.ai store) or a vault org id — display fallback. */
-export function destLabelFor(destKey: string): string {
+/** "letai" (shared let.ai store) or a vault org id — friendly name when the
+ *  daemon has ever learned one, short id otherwise. */
+export function destLabelFor(destKey: string, names: Record<string, string> = {}): string {
   if (destKey === "letai") return "let.ai";
+  const known = names[destKey];
+  if (known) return known;
   return destKey.length > 14 ? `${destKey.slice(0, 12)}…` : destKey;
 }
 
@@ -197,7 +202,10 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
 }
 
 /** Pure fold of per-file facts into destination rows — unit-tested. */
-export function groupDestinations(facts: FileFacts[]): DestinationVM[] {
+export function groupDestinations(
+  facts: FileFacts[],
+  names: Record<string, string> = {},
+): DestinationVM[] {
   const byKey = new Map<string, DestinationVM & { folderIds: Set<string> }>();
   for (const { file, head, state } of facts) {
     if (!state) continue;
@@ -209,7 +217,7 @@ export function groupDestinations(facts: FileFacts[]): DestinationVM[] {
       if (!row) {
         row = {
           key,
-          label: destLabelFor(key),
+          label: destLabelFor(key, names),
           personal: key === "letai",
           sessions: 0,
           folders: 0,
@@ -304,7 +312,7 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
       lastUploadAtMs,
     },
     folders,
-    destinations: groupDestinations(facts),
+    destinations: groupDestinations(facts, await readOrgNames()),
     recent: facts
       .filter((f) => (f.state?.lastUploadAtMs ?? 0) > 0)
       .sort((a, b) => (b.state?.lastUploadAtMs ?? 0) - (a.state?.lastUploadAtMs ?? 0))
@@ -414,4 +422,11 @@ export async function cachedWhoami(fetcher: typeof fetch = fetch): Promise<{ ema
 
 export async function readConfigForProbe(): Promise<HxConfig | null> {
   return readConfig();
+}
+
+const ACTIVITY_MAX_HOURS = 7 * 24;
+
+export async function activitySince(hours: number): Promise<ActivityEntry[]> {
+  const h = Math.min(ACTIVITY_MAX_HOURS, Math.max(1, hours));
+  return readActivity(Date.now() - h * 3_600_000);
 }

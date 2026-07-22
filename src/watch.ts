@@ -50,6 +50,8 @@ import {
   upsertFileState,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
+import { appendActivity, trimActivity } from "./activity.js";
+import { rememberOrgNames } from "./org-names.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
@@ -603,6 +605,17 @@ async function ingestOne(
         log(
           `  ${path.relative(process.env.HOME ?? "", file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
         );
+        // Local journal for the UI's traffic chart — best-effort, never awaited
+        // into the upload path's error handling.
+        void appendActivity({
+          at: Date.now(),
+          sessionId: fState.sessionId,
+          family: fState.family,
+          title: title ?? null,
+          folder: fState.cwd ?? null,
+          bytes: trimmed.length,
+          dest: destKey(step.vaultOrgId),
+        });
       } catch (err) {
         // One destination's vault being unavailable must not stall the others — log
         // and move on; its offset stays put so the next pass retries just it.
@@ -1336,6 +1349,7 @@ export async function tickOnce(
         // fine. Skip just this file — short retries first, then a longer backoff
         // (recordFileFailure doubles per failure) — and record the reason so
         // `hx status` can show it. Everything else keeps uploading.
+        if (err.blocker) void rememberOrgNames(err.blocker.destinations);
         const delay = await recordFileFailure(
           f.path,
           SESSION_SKIP_RETRY_BASE_MS,
@@ -1445,6 +1459,7 @@ export async function startWatch(
     `[hx] watching ${CLAUDE_PROJECTS_DIR}, ${CODEX_SESSIONS_DIR}, ${CODEX_ARCHIVED_DIR}`,
   );
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
+  void trimActivity(); // cap the UI journal once per daemon lifetime
 
   // Last time anything reached the gateway (upload or beat). Uploads count as
   // contact, so a busy daemon never sends a redundant heartbeat.

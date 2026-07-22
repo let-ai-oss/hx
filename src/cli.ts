@@ -39,6 +39,7 @@ import {
 } from "./ui/instance.js";
 import { tryServeUi, type UiProviders } from "./ui/server.js";
 import {
+  activitySince,
   buildSessions,
   buildSnapshot,
   cachedWhoami,
@@ -360,6 +361,18 @@ function localLog(msg: string): void {
   log(`[local] ${msg}`);
 }
 
+// Daemon log lines carry a local-time stamp: stdout.log is append-only across
+// days, so an un-stamped "heartbeat error" is undatable after the fact. Only
+// the watch lanes stamp — tables/help/interactive output stay clean.
+function stamped(base: (msg: string) => void): (msg: string) => void {
+  return (msg) => {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const ts = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    base(`${ts} ${msg}`);
+  };
+}
+
 async function cmdWatch(): Promise<void> {
   const cfg = await ensureConfig();
   // --local: regular behavior untouched, PLUS a second fully independent lane
@@ -371,8 +384,8 @@ async function cmdWatch(): Promise<void> {
   const oneShot = process.argv.includes("--once") || process.argv.includes("-1");
   const only = flag("only");
   const [main, local] = await Promise.all([
-    startWatch(cfg, { oneShot, only }, log),
-    localCfg ? startWatch(localCfg, { oneShot, only }, localLog) : null,
+    startWatch(cfg, { oneShot, only }, stamped(log)),
+    localCfg ? startWatch(localCfg, { oneShot, only }, stamped(localLog)) : null,
   ]);
   if (!oneShot) {
     process.on("SIGINT", () => {
@@ -939,6 +952,7 @@ async function cmdUi(): Promise<void> {
     preview: async (filePath) =>
       (await isDiscoveredPath(filePath)) ? previewSessionFile(filePath) : null,
     logs: (maxLines) => tailDaemonLog(maxLines),
+    activity: (hours) => activitySince(hours),
     probe: async () => {
       const cfg = await readConfigForProbe();
       if (!cfg) return { up: false, reason: "not connected" };
