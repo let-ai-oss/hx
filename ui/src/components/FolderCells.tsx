@@ -1,11 +1,13 @@
-import { FORTRESSES, destLabel, plural, type Folder } from "../data";
-import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc, SlashIc, TeamIc } from "../icons";
+import { useApp } from "../store";
+import type { FolderInfo } from "../api";
+import { plural } from "../data";
+import { BranchIc, CloudIc, FolderIc, FortressIc, PersonIc } from "../icons";
 
 // Strict two-line cells — every cell shares the same line grid so icons,
 // destinations, and counts all read as vertical columns.
 
-export function CellA({ f, isExcluded }: { f: Folder; isExcluded: boolean }) {
-  const np = f.noProject && !isExcluded ? <> <span className="pill warn mini">no project</span></> : null;
+export function CellA({ f }: { f: FolderInfo }) {
+  const np = f.unlinkedRepo ? <> <span className="pill warn mini">no workspace</span></> : null;
   return (
     <div className="cell cellA">
       <div className="cl l1"><span className="ico"><FolderIc /></span><span className="tx path">{f.path}</span></div>
@@ -18,30 +20,44 @@ export function CellA({ f, isExcluded }: { f: Folder; isExcluded: boolean }) {
   );
 }
 
-export function CellB({ f, isExcluded, destAction }: { f: Folder; isExcluded: boolean; destAction?: (ftId: string) => void }) {
-  if (isExcluded) {
+export function CellB({ f, destAction }: { f: FolderInfo; destAction?: (destKey: string) => void }) {
+  const { destinations } = useApp();
+  if (f.dests.length === 0) {
     return (
       <div className="cell cellB">
-        <div className="cl l1 exc"><span className="ico"><SlashIc /></span><span className="tx">Excluded</span></div>
-        <div className="cl l2"><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">Never uploaded</span></div>
+        <div className="cl l1"><span className="ico"><CloudIc /></span><span className="tx" style={{ fontStyle: "italic" }}>not uploaded yet</span></div>
+        <div className="cl l2"><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">appears after the first sync pass</span></div>
       </div>
     );
   }
-  const kind = f.destKind === "fortress" ? "fortress" : "cloudy";
-  const ft = f.destKind === "fortress" ? FORTRESSES.find((x) => x.destMatch === f.dest) : undefined;
+  const rows = f.dests.map((key) => {
+    const dest = destinations.find((d) => d.key === key);
+    return { key, label: dest?.label ?? key, personal: dest?.personal ?? key === "letai", blocked: Boolean(dest?.blocked) };
+  });
+  const first = rows[0];
+  const second = rows[1];
   return (
     <div className="cell cellB">
-      <div className={`cl l1 ${kind}`}>
-        <span className="ico">{f.destKind === "fortress" ? <FortressIc /> : <CloudIc />}</span>
-        {ft
-          ? <span className="tx destlink" data-fortress={ft.id} onClick={destAction ? (e) => { e.stopPropagation(); destAction(ft.id); } : undefined}>{destLabel(f.dest)}</span>
-          : <span className="tx">{destLabel(f.dest)}</span>}
+      <div className={`cl l1 ${first.personal ? "cloudy" : "fortress"}`}>
+        <span className="ico">{first.personal ? <CloudIc /> : <FortressIc />}</span>
+        <span className="tx destlink" onClick={destAction ? (e) => { e.stopPropagation(); destAction(first.key); } : undefined}>{first.label}</span>
+        {first.blocked && <span className="pill warn mini">held</span>}
       </div>
-      <div className="cl l2"><span className="ico">{f.visKind === "team" ? <TeamIc /> : <PersonIc />}</span><span className="tx">{f.vis}</span></div>
+      <div className="cl l2">
+        {second ? (
+          <>
+            <span className="ico">{second.personal ? <CloudIc /> : <FortressIc />}</span>
+            <span className="tx destlink" onClick={destAction ? (e) => { e.stopPropagation(); destAction(second.key); } : undefined}>{second.label}</span>
+            {rows.length > 2 && <span className="tx">· +{rows.length - 2} more</span>}
+          </>
+        ) : (
+          <><span className="ico" style={{ visibility: "hidden" }}><PersonIc /></span><span className="tx">{first.personal ? "your private space" : "organization vault"}</span></>
+        )}
+      </div>
     </div>
   );
 }
 
-export function CellC({ f }: { f: Folder }) {
+export function CellC({ f }: { f: FolderInfo }) {
   return <div className="cell cellC">{plural(f.sessions, "session")}</div>;
 }

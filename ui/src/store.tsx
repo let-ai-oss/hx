@@ -1,10 +1,20 @@
-import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { flushSync } from "react-dom";
-import { FOLDERS, type Folder, type Fortress } from "./data";
+import {
+  api,
+  type DestinationInfo,
+  type FolderInfo,
+  type LogLine,
+  type ProbeInfo,
+  type SessionInfo,
+  type Snapshot,
+} from "./api";
 
 export type View = "overview" | "folders" | "activity" | "privacy" | "device" | "logs" | "fortress";
-export type GroupBy = "tool" | "dir" | "dest" | "person";
-export interface PauseState { msg: string; forever: boolean; }
+export type GroupBy = "tool" | "dir" | "dest";
+
+const SNAPSHOT_POLL_MS = 5_000;
+const LOGS_POLL_MS = 4_000;
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -29,18 +39,13 @@ export function copyText(text: string): boolean {
   }
 }
 
-const fmtT = (d: Date) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
 const VIEW_KEYS: Record<string, View> = { "1": "overview", "2": "folders", "3": "activity", "4": "privacy", "5": "device", "6": "logs" };
 
 interface AppState {
   view: View;
   goto: (v: View) => void;
-  currentFortress: string | null;
-  openFortress: (id: string) => void;
-
-  personalOn: boolean;
-  applyPersonal: (on: boolean) => void;
+  currentDest: string | null;
+  openDest: (key: string) => void;
 
   groupBy: GroupBy;
   setGroupBy: (g: GroupBy) => void;
@@ -49,40 +54,41 @@ interface AppState {
   openRows: Set<string>;
   toggleRow: (id: string) => void;
 
-  excluded: Set<string>;
-  excludeFolder: (id: string) => void;
-  includeFolder: (id: string) => void;
-  recentlyIncluded: string[];
-
-  manualExclusions: string[];
-  addRule: (v: string) => void;
-  removeRule: (v: string) => void;
-
-  pause: PauseState | null;
-  pickPause: (p: string) => void;
-  resumeAll: () => void;
-
-  deviceName: string;
-  setDeviceName: (n: string) => void;
-  deviceConnected: boolean;
-  setDeviceConnected: (b: boolean) => void;
-
   doctorOpen: boolean;
   setDoctorOpen: (b: boolean) => void;
-
   kbdOpen: boolean;
   setKbdOpen: (b: boolean) => void;
   inspOpen: boolean;
   setInspOpen: (b: boolean) => void;
+  inspInitialPath: string | null;
+  openInspector: (path?: string) => void;
   logFull: boolean;
   setLogFull: (b: boolean) => void;
 
-  reviewUnlinked: () => void;
+  // Live data
+  snap: Snapshot | null;
+  loading: boolean;
+  error: string | null;
+  email: string | null;
+  probe: ProbeInfo | null;
+  probing: boolean;
+  runProbe: () => void;
+  logs: LogLine[];
+  sessionsFor: (folderId: string) => SessionInfo[] | undefined;
+  loadSessions: (folderId: string) => void;
+  previewFor: (path: string) => { role: string; text: string }[] | undefined;
+  loadPreview: (path: string) => void;
+
+  // Derived
+  activeFolders: FolderInfo[];
+  destinations: DestinationInfo[];
+  foldersOfDest: (destKey: string) => FolderInfo[];
+  destLabels: (f: FolderInfo) => string[];
+  unlinkedFolders: FolderInfo[];
+
+  reviewUnlinked: (folderId: string) => void;
   jumpFortressList: () => void;
   jumpDoctor: () => void;
-
-  activeFolders: Folder[];
-  fortressFolders: (ft: Fortress) => Folder[];
 }
 
 const Ctx = createContext<AppState | null>(null);
@@ -95,35 +101,89 @@ export function useApp(): AppState {
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [view, setView] = useState<View>("overview");
-  const [currentFortress, setCurrentFortress] = useState<string | null>(null);
-  const [personalOn, setPersonalOn] = useState(true);
+  const [currentDest, setCurrentDest] = useState<string | null>(null);
   const [groupBy, setGroupByState] = useState<GroupBy>("tool");
   const [query, setQueryState] = useState("");
   const [openRows, setOpenRows] = useState<Set<string>>(new Set());
-  const [excluded, setExcluded] = useState<Set<string>>(new Set());
-  const [recentlyIncluded, setRecentlyIncluded] = useState<string[]>([]);
-  const [manualExclusions, setManualExclusions] = useState<string[]>(["~/personal-finance"]);
-  const [pause, setPause] = useState<PauseState | null>(null);
-  const [deviceName, setDeviceName] = useState("claude-container");
-  const [deviceConnected, setDeviceConnected] = useState(true);
   const [doctorOpen, setDoctorOpen] = useState(false);
   const [kbdOpen, setKbdOpen] = useState(false);
   const [inspOpen, setInspOpen] = useState(false);
+  const [inspInitialPath, setInspInitialPath] = useState<string | null>(null);
   const [logFull, setLogFull] = useState(false);
+
+  const openInspector = (path?: string) => {
+    setInspInitialPath(path ?? null);
+    setInspOpen(true);
+  };
+
+  const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [email, setEmail] = useState<string | null>(null);
+  const [probe, setProbe] = useState<ProbeInfo | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [logs, setLogs] = useState<LogLine[]>([]);
+  const [sessions, setSessions] = useState<Map<string, SessionInfo[]>>(new Map());
+  const [previews, setPreviews] = useState<Map<string, { role: string; text: string }[]>>(new Map());
+  const sessionsInFlight = useRef<Set<string>>(new Set());
+  const previewsInFlight = useRef<Set<string>>(new Set());
+
+  // ── polling ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    let alive = true;
+    const pull = async () => {
+      try {
+        const s = await api.snapshot();
+        if (!alive) return;
+        setSnap(s);
+        setError(null);
+      } catch (e) {
+        if (!alive) return;
+        setError((e as Error).message);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    };
+    void pull();
+    const t = setInterval(pull, SNAPSHOT_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+
+  useEffect(() => {
+    void api.whoami().then((w) => setEmail(w.email)).catch(() => {});
+  }, []);
+
+  const logsActive = view === "logs" || logFull;
+  useEffect(() => {
+    if (!logsActive) return;
+    let alive = true;
+    const pull = async () => {
+      try {
+        const r = await api.logs(500);
+        if (alive) setLogs(r.lines);
+      } catch {
+        // snapshot polling surfaces connectivity problems; keep last lines
+      }
+    };
+    void pull();
+    const t = setInterval(pull, LOGS_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [logsActive]);
 
   const goto = (v: View) => {
     setView(v);
     window.scrollTo(0, 0);
   };
 
-  const openFortress = (id: string) => {
-    setCurrentFortress(id);
+  const openDest = (key: string) => {
+    setCurrentDest(key);
     goto("fortress");
-  };
-
-  const applyPersonal = (on: boolean) => {
-    setPersonalOn(on);
-    setOpenRows(new Set());
   };
 
   const setGroupBy = (g: GroupBy) => {
@@ -145,60 +205,53 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
   };
 
-  const excludeFolder = (id: string) => {
-    setExcluded((prev) => new Set(prev).add(id));
-    setOpenRows(new Set());
+  const runProbe = () => {
+    setProbing(true);
+    void api
+      .probe()
+      .then(setProbe)
+      .catch(() => setProbe({ up: false, reason: "probe failed" }))
+      .finally(() => setProbing(false));
   };
 
-  // Excluding is instant; re-including kicks off a history back-fill, so
-  // take the user to Sync Status where that progress is visible.
-  const includeFolder = (id: string) => {
-    setExcluded((prev) => {
-      const next = new Set(prev);
-      next.delete(id);
-      return next;
-    });
-    setRecentlyIncluded((prev) => (prev.includes(id) ? prev : [...prev, id]));
-    setOpenRows(new Set());
-    goto("activity");
+  const loadSessions = (folderId: string) => {
+    if (sessions.has(folderId) || sessionsInFlight.current.has(folderId)) return;
+    sessionsInFlight.current.add(folderId);
+    void api
+      .sessions(folderId)
+      .then((list) => setSessions((prev) => new Map(prev).set(folderId, list)))
+      .catch(() => {})
+      .finally(() => sessionsInFlight.current.delete(folderId));
   };
 
-  const addRule = (v: string) => {
-    setManualExclusions((prev) => (prev.includes(v) ? prev : [...prev, v]));
-  };
-  const removeRule = (v: string) => {
-    setManualExclusions((prev) => prev.filter((p) => p !== v));
+  const loadPreview = (path: string) => {
+    if (previews.has(path) || previewsInFlight.current.has(path)) return;
+    previewsInFlight.current.add(path);
+    void api
+      .sessionPreview(path)
+      .then((r) => setPreviews((prev) => new Map(prev).set(path, r.lines)))
+      .catch(() => setPreviews((prev) => new Map(prev).set(path, [])))
+      .finally(() => previewsInFlight.current.delete(path));
   };
 
-  const pickPause = (p: string) => {
-    if (p === "forever") {
-      setPause({ msg: "Paused until I resume it", forever: true });
-      return;
-    }
-    let until: Date;
-    if (p === "tomorrow") {
-      const d = new Date();
-      d.setDate(d.getDate() + 1);
-      d.setHours(8, 0, 0, 0);
-      until = d;
-    } else {
-      until = new Date(Date.now() + Number(p) * 60000);
-    }
-    const mins = Math.max(1, Math.round((until.getTime() - Date.now()) / 60000));
-    const when = mins >= 16 * 60 ? `tomorrow at ${fmtT(until)}` : `at ${fmtT(until)}`;
-    setPause({ msg: `Paused — resumes ${when} · in ${mins >= 60 ? Math.round(mins / 60) + "h" : mins + " min"}`, forever: false });
-  };
-  const resumeAll = () => setPause(null);
+  const activeFolders = snap?.folders ?? [];
+  const destinations = snap?.destinations ?? [];
+  const foldersOfDest = (destKey: string) => activeFolders.filter((f) => f.dests.includes(destKey));
+  const destLabels = (f: FolderInfo) =>
+    f.dests.length > 0
+      ? f.dests.map((key) => destinations.find((d) => d.key === key)?.label ?? key)
+      : ["not uploaded yet"];
+  const unlinkedFolders = activeFolders.filter((f) => f.unlinkedRepo);
 
-  // Review → land on the exact row being reviewed, highlighted.
-  const reviewUnlinked = () => {
+  // Review → land on the exact folder row being reviewed, highlighted.
+  const reviewUnlinked = (folderId: string) => {
     flushSync(() => {
       setGroupByState("tool");
       setOpenRows(new Set());
       setView("folders");
     });
     window.scrollTo(0, 0);
-    const row = document.querySelector('#folderList .frow[data-id="rind"]');
+    const row = document.querySelector(`#folderList .frow[data-id="${CSS.escape(folderId)}"]`);
     if (row) {
       row.scrollIntoView({ behavior: "smooth", block: "center" });
       retrigger(row, "flashrow");
@@ -224,10 +277,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
       retrigger(mp, "flash");
     }
   };
-
-  const activeFolders = FOLDERS.filter((f) => !excluded.has(f.id));
-  const fortressFolders = (ft: Fortress) =>
-    FOLDERS.filter((f) => !excluded.has(f.id) && f.dest === ft.destMatch && (!f.personal || personalOn));
 
   // Keyboard: ? for the menu, 1–6 for sections, Esc for dialogs / fullscreen logs.
   useEffect(() => {
@@ -257,17 +306,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [logFull]);
 
   const value: AppState = {
-    view, goto, currentFortress, openFortress,
-    personalOn, applyPersonal,
+    view, goto, currentDest, openDest,
     groupBy, setGroupBy, query, setQuery, openRows, toggleRow,
-    excluded, excludeFolder, includeFolder, recentlyIncluded,
-    manualExclusions, addRule, removeRule,
-    pause, pickPause, resumeAll,
-    deviceName, setDeviceName, deviceConnected, setDeviceConnected,
     doctorOpen, setDoctorOpen,
-    kbdOpen, setKbdOpen, inspOpen, setInspOpen, logFull, setLogFull,
+    kbdOpen, setKbdOpen, inspOpen, setInspOpen, inspInitialPath, openInspector,
+    logFull, setLogFull,
+    snap, loading, error, email,
+    probe, probing, runProbe,
+    logs,
+    sessionsFor: (id) => sessions.get(id),
+    loadSessions,
+    previewFor: (p) => previews.get(p),
+    loadPreview,
+    activeFolders, destinations, foldersOfDest, destLabels, unlinkedFolders,
     reviewUnlinked, jumpFortressList, jumpDoctor,
-    activeFolders, fortressFolders,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

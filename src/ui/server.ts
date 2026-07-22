@@ -19,10 +19,23 @@ import type { Server } from "bun";
 import { isAllowedHost, isAllowedOrigin, type UiAuth } from "./auth.js";
 import { contentTypeFor, type UiAssets } from "./assets.js";
 import { instanceIdentity } from "./instance.js";
+import type { SessionVM, UiSnapshot, LogLevel } from "./data.js";
+import type { PreviewLine } from "./preview.js";
+
+/** Read-only data the API serves; injected so the handler tests with fakes. */
+export interface UiProviders {
+  snapshot(): Promise<UiSnapshot>;
+  sessions(folderId: string): Promise<SessionVM[]>;
+  preview(filePath: string): Promise<PreviewLine[] | null>;
+  logs(maxLines: number): Promise<{ body: string; level: LogLevel }[]>;
+  probe(): Promise<unknown>;
+  whoami(): Promise<{ email: string | null }>;
+}
 
 export interface UiServerCtx {
   auth: UiAuth;
   assets: UiAssets;
+  providers: UiProviders;
   /** The bound port — Host/Origin checks compare against it. */
   port: number;
 }
@@ -126,7 +139,35 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
     return finish(new Response(null, { status: 204 }), "no-store");
   }
 
-  return apiError(404, "not found");
+  if (req.method !== "GET") return apiError(405, "method not allowed");
+  const query = new URL(req.url).searchParams;
+
+  switch (path) {
+    case "/api/snapshot":
+      return json(await ctx.providers.snapshot());
+    case "/api/sessions": {
+      const folder = query.get("folder");
+      if (!folder) return apiError(400, "missing folder");
+      return json(await ctx.providers.sessions(folder));
+    }
+    case "/api/session-preview": {
+      const file = query.get("path");
+      if (!file) return apiError(400, "missing path");
+      const lines = await ctx.providers.preview(file);
+      if (lines === null) return apiError(404, "not found");
+      return json({ lines });
+    }
+    case "/api/logs": {
+      const n = Math.min(2_000, Math.max(50, Number(query.get("lines")) || 500));
+      return json({ lines: await ctx.providers.logs(n) });
+    }
+    case "/api/probe":
+      return json(await ctx.providers.probe());
+    case "/api/whoami":
+      return json(await ctx.providers.whoami());
+    default:
+      return apiError(404, "not found");
+  }
 }
 
 /**
@@ -138,8 +179,9 @@ export function tryServeUi(
   port: number,
   auth: UiAuth,
   assets: UiAssets,
+  providers: UiProviders,
 ): Server<undefined> | null {
-  const ctx: UiServerCtx = { auth, assets, port };
+  const ctx: UiServerCtx = { auth, assets, providers, port };
   try {
     return Bun.serve({
       hostname: "127.0.0.1",

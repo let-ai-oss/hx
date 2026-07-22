@@ -1,159 +1,152 @@
-import { useState, type ReactNode } from "react";
+import { useState } from "react";
 import { useApp, type GroupBy } from "../store";
-import { FOLDERS, FORTRESSES, TOOL_NOTE, TOOL_ORDER, destLabel, plural, type Folder } from "../data";
+import { plural, TOOL_NOTE, TOOL_ORDER } from "../data";
+import { fmtBytes, fmtClock, fmtRelative, type FolderInfo, type SessionInfo } from "../api";
 import { GPill } from "../components/GPill";
 import { CellA, CellB, CellC } from "../components/FolderCells";
-import { BranchIc, CloudIc, CompanyIc, FortressIc, ProjectIc, SearchIc } from "../icons";
+import { BranchIc, CloudIc, FortressIc, SearchIc } from "../icons";
 
-const GLBL: Record<GroupBy, string> = { tool: "Tool", dir: "Directory", dest: "Cloud Destination", person: "Person" };
+const GLBL: Record<GroupBy, string> = { tool: "Tool", dir: "Directory", dest: "Destination" };
 
-function FolderWhy({ f }: { f: Folder }) {
-  const { excluded, personalOn, includeFolder, excludeFolder, applyPersonal } = useApp();
-  if (excluded.has(f.id)) {
-    return (
-      <>
-        <div className="why-note"><b>Excluded.</b> Nothing from this folder leaves this machine — it isn’t uploaded to any company fortress or to my private space.</div>
-        <div className="why-act"><button className="btn ghost sm" onClick={() => includeFolder(f.id)}>Include again</button></div>
-      </>
-    );
-  }
-  if (f.personal && !personalOn) {
-    return (
-      <>
-        <div className="why-note"><b>Personal sync is off</b>, so this folder stays on this machine. Turn personal sync back on to resume uploading it to my private space.</div>
-        <div className="why-act"><button className="btn ghost sm" onClick={() => applyPersonal(true)}>Turn personal sync on</button></div>
-      </>
-    );
-  }
-  let chain: ReactNode;
-  let notes: ReactNode;
-  if (f.repo && f.project) {
-    chain = (
-      <>
-        <span className="step"><BranchIc /> {f.repo}</span><span className="arr">→</span>
-        <span className="step"><ProjectIc /> {f.project}</span><span className="arr">→</span>
-        <span className="step"><CompanyIc /> {f.company}</span><span className="arr">→</span>
-        <span className="step hl"><FortressIc /> {destLabel(f.dest)}</span>
-      </>
-    );
-    notes = (
-      <>
-        <div className="why-note">This folder’s git repo is attached to the <b>{f.project}</b> project in <b>{f.company}</b>, which stores all its session data on its own servers — <b>never on let.ai’s</b>. Sessions here appear in My Sessions.</div>
-        {f.shared ? (
-          <>
-            <div className="why-note"><b>Who can see it:</b> the <b>Payments</b> team has access to the {f.project} project, and I’ve opted into team sharing — these members can currently open my {f.project} sessions:</div>
-            <div className="people">
-              <span className="pchip"><span className="pa" style={{ background: "#5b5bd6" }}>JO</span> Me</span>
-              <span className="pchip"><span className="pa" style={{ background: "#17835b" }}>MN</span> Marta Nilsson</span>
-              <span className="pchip"><span className="pa" style={{ background: "#b25e09" }}>PS</span> Priya Shah</span>
-              <span className="pchip"><span className="pa" style={{ background: "#8a5bd6" }}>TB</span> Tomas Berg</span>
-              <span className="pmore">· 2 team members haven’t opted in and see nothing</span>
-            </div>
-          </>
-        ) : (
-          <div className="why-note"><b>Who can see it:</b> only me.</div>
-        )}
-      </>
-    );
-  } else if (f.repo && f.noProject) {
-    chain = (
-      <>
-        <span className="step"><BranchIc /> {f.repo}</span><span className="arr">→</span>
-        <span className="step dashed">no matching project in my companies</span><span className="arr">→</span>
-        <span className="step hl"><CloudIc /> treated as personal</span>
-      </>
-    );
-    notes = <div className="why-note">This folder has a git repo, but no project in orange-corp or nordbank has it attached — so it’s <b>personal</b>: my private let.ai space, visible only to me. <b>If this is company code</b>, an admin can attach <span className="mono">{f.repo}</span> to a project and future sessions move to that company’s fortress.</div>;
-  } else {
-    chain = (
-      <>
-        <span className="step dashed">no git repo</span><span className="arr">→</span>
-        <span className="step hl"><CloudIc /> {destLabel(f.dest)} — personal</span>
-      </>
-    );
-    notes = <div className="why-note">No repo, no company link — private to me.</div>;
-  }
+function SessionRow({ s }: { s: SessionInfo }) {
+  const { openInspector } = useApp();
+  const status = s.pendingBytes > 0
+    ? `${fmtBytes(s.pendingBytes)} waiting to send`
+    : s.lastUploadAtMs > 0
+      ? `sent ${fmtClock(s.lastUploadAtMs)}`
+      : "not uploaded yet";
   return (
-    <>
-      <div className="chain">{chain}</div>
-      {notes}
-      <div className="why-act"><button className="btn ghost sm" onClick={() => excludeFolder(f.id)}>Exclude this folder</button></div>
-    </>
-  );
-}
-
-export function FolderRow({ f }: { f: Folder }) {
-  const { excluded, personalOn, openRows, toggleRow, openFortress } = useApp();
-  const isExcluded = excluded.has(f.id);
-  const dim = isExcluded || (f.personal && !personalOn);
-  const open = openRows.has(f.id);
-  return (
-    <div className={`frow${dim ? " dim" : ""}${open ? " open" : ""}`} data-id={f.id}>
-      <div className="line" onClick={() => toggleRow(f.id)}>
-        <CellA f={f} isExcluded={isExcluded} />
-        <CellB f={f} isExcluded={isExcluded} destAction={openFortress} />
-        <CellC f={f} />
-        <div className="chev"></div>
-      </div>
-      <div className="fwhy"><FolderWhy f={f} /></div>
+    <div className="poprow" style={{ alignItems: "center", gap: 12 }}>
+      <span className="grow" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title}</span>
+      <span className={`st ${s.pendingBytes > 0 ? "warny" : "on"}`} style={{ flexShrink: 0 }}>{status}</span>
+      <button className="btn ghost sm" style={{ flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); openInspector(s.path); }}>Inspect</button>
     </div>
   );
 }
 
-interface Group { title: string; note: string; items: Folder[]; }
+function FolderWhy({ f }: { f: FolderInfo }) {
+  const { destinations, sessionsFor, destLabels } = useApp();
+  const sessions = sessionsFor(f.id);
+  const labels = destLabels(f);
+  const orgDest = f.dests.some((d) => d !== "letai");
+  const personalOnly = f.dests.length > 0 && f.dests.every((d) => d === "letai");
 
-function groupsFor(list: Folder[], groupBy: GroupBy, excluded: Set<string>): Group[] {
+  const chain = f.repo ? (
+    <>
+      <span className="step"><BranchIc /> {f.repo}</span><span className="arr">→</span>
+      {f.unlinkedRepo && <><span className="step dashed">no workspace claims this repo</span><span className="arr">→</span></>}
+      <span className="step hl">{orgDest ? <FortressIc /> : <CloudIc />} {labels.join(" · ")}</span>
+    </>
+  ) : (
+    <>
+      <span className="step dashed">no git repo</span><span className="arr">→</span>
+      <span className="step hl"><CloudIc /> {f.dests.length > 0 ? `${labels.join(" · ")} — personal` : "personal, once uploaded"}</span>
+    </>
+  );
+
+  const note = f.repo ? (
+    f.unlinkedRepo ? (
+      <div className="why-note">This folder has a git repo, but no workspace in your organizations claims it — so its sessions upload as <b>personal</b>: your private space, visible only to you. <b>If this is company code</b>, an admin can attach <span className="mono">{f.repo}</span> to a project and future sessions route to that organization.</div>
+    ) : orgDest ? (
+      <div className="why-note">This folder’s git repo routes to {labels.filter((l) => l !== "let.ai").map((l, i) => <b key={l}>{i > 0 ? " and " : ""}{l}</b>)}. Where an organization runs its own Session Vault, session content rests on its servers.</div>
+    ) : (
+      <div className="why-note">Uploads from this folder have {personalOnly ? "so far gone to your private space" : "not started yet"}. Routing is decided by your workbench at upload time.</div>
+    )
+  ) : (
+    <div className="why-note">No git repository — sessions from this folder upload as personal and attach to no workspace. Only you can see them.</div>
+  );
+
+  return (
+    <>
+      <div className="chain">{chain}</div>
+      {note}
+      <div className="why-note" style={{ marginTop: 10 }}>
+        <b>Sessions in this folder</b> <span className="psub">· last activity {fmtRelative(f.lastUploadAtMs)}</span>
+      </div>
+      {sessions === undefined ? (
+        <div className="why-note">Loading sessions…</div>
+      ) : sessions.length === 0 ? (
+        <div className="why-note">No session files in the recent scan window.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {sessions.slice(0, 8).map((s) => <SessionRow key={s.path} s={s} />)}
+          {sessions.length > 8 && <div className="psub" style={{ marginTop: 4 }}>+ {sessions.length - 8} more</div>}
+        </div>
+      )}
+      {destinations.length === 0 && null}
+    </>
+  );
+}
+
+export function FolderRow({ f }: { f: FolderInfo }) {
+  const { openRows, toggleRow, openDest, loadSessions } = useApp();
+  const open = openRows.has(f.id);
+  return (
+    <div className={`frow${open ? " open" : ""}`} data-id={f.id}>
+      <div className="line" onClick={() => { if (!open) loadSessions(f.id); toggleRow(f.id); }}>
+        <CellA f={f} />
+        <CellB f={f} destAction={openDest} />
+        <CellC f={f} />
+        <div className="chev"></div>
+      </div>
+      <div className="fwhy">{open && <FolderWhy f={f} />}</div>
+    </div>
+  );
+}
+
+interface Group { title: string; note: string; destKey?: string; items: FolderInfo[]; }
+
+export function groupsFor(list: FolderInfo[], groupBy: GroupBy, destLabel: (key: string) => string): Group[] {
   if (groupBy === "tool") {
     return TOOL_ORDER.map((t) => ({
       title: t,
       note: list.some((f) => f.tool === t) ? (TOOL_NOTE[t] ? `· ${TOOL_NOTE[t]}` : "") : "· nothing found on this device",
       items: list.filter((f) => f.tool === t),
-    }));
+    })).filter((g) => g.items.length > 0 || TOOL_NOTE[g.title] !== undefined);
   }
-  const keyFn = groupBy === "dir" ? (f: Folder) => (f.path.startsWith("/workspace") ? "/workspace" : "~ (home)")
-    : groupBy === "dest" ? (f: Folder) => (excluded.has(f.id) ? "Excluded" : f.dest)
-    : (f: Folder) => (excluded.has(f.id) ? "Excluded" : f.vis);
-  const m = new Map<string, Folder[]>();
+  if (groupBy === "dir") {
+    const m = new Map<string, FolderInfo[]>();
+    for (const f of list) {
+      const parts = f.path.split("/");
+      const k = parts.length > 1 ? parts.slice(0, 2).join("/") || "/" : f.path;
+      if (!m.has(k)) m.set(k, []);
+      m.get(k)!.push(f);
+    }
+    return [...m.entries()].map(([title, items]) => ({ title, note: "", items }));
+  }
+  // dest: a folder fanning out to several stores appears under each.
+  const m = new Map<string, FolderInfo[]>();
   for (const f of list) {
-    const k = keyFn(f);
-    if (!m.has(k)) m.set(k, []);
-    m.get(k)!.push(f);
+    const keys = f.dests.length > 0 ? f.dests : ["(not uploaded yet)"];
+    for (const k of keys) {
+      if (!m.has(k)) m.set(k, []);
+      m.get(k)!.push(f);
+    }
   }
-  return [...m.entries()].map(([title, items]) => ({ title, note: "", items }));
+  return [...m.entries()].map(([key, items]) => ({
+    title: key === "(not uploaded yet)" ? key : destLabel(key),
+    destKey: key === "(not uploaded yet)" ? undefined : key,
+    note: "",
+    items,
+  }));
 }
 
 export function Folders() {
-  const { view, personalOn, applyPersonal, groupBy, setGroupBy, query, setQuery, excluded, openFortress } = useApp();
+  const { view, groupBy, setGroupBy, query, setQuery, activeFolders, destinations, openDest } = useApp();
   const [menuOpen, setMenuOpen] = useState(false);
 
+  const destLabel = (key: string) => destinations.find((d) => d.key === key)?.label ?? key;
   const q = query.trim().toLowerCase();
-  const list = FOLDERS.filter((f) => !q ||
-    [f.path, f.repo, f.project, f.company, f.dest, f.vis, f.tool,
-      f.shared ? "marta nilsson priya shah tomas berg payments" : ""]
+  const list = activeFolders.filter((f) => !q ||
+    [f.path, f.repo, f.tool, ...f.dests.map(destLabel)]
       .filter(Boolean).join(" ").toLowerCase().includes(q));
-  const groups = groupsFor(list, groupBy, excluded).filter((g) => g.items.length || groupBy === "tool");
-
-  // Destination group headers are the fortress itself — clickable, pipe-branded.
-  const groupTitle = (title: string) => {
-    const ft = FORTRESSES.find((x) => x.destMatch === title);
-    return ft
-      ? <b className="grplink" data-fortress={ft.id} onClick={() => openFortress(ft.id)}>{destLabel(title)}</b>
-      : <b>{title}</b>;
-  };
+  const groups = groupsFor(list, groupBy, destLabel);
 
   return (
     <section className={`view${view === "folders" ? " active" : ""}`} id="view-folders">
       <div className="kicker">This device</div>
       <h1>Folders &amp; Destinations</h1>
-      <p className="lede">Every folder where an agentic tool keeps sessions, and the exact place each one is stored. Open a row to see <i>why</i> it goes where it goes, and who can see it.</p>
-
-      {!personalOn && (
-        <div className="banner info" id="personalOffBanner" style={{ display: "flex" }}>
-          <span className="badge">i</span>
-          <span><b>Personal session sync is off.</b> Dimmed folders stay on this machine only. Company folders continue to sync.</span>
-          <button className="btn" id="reenableBtn" onClick={() => applyPersonal(true)}>Turn back on</button>
-        </div>
-      )}
+      <p className="lede">Every folder where an agentic tool keeps sessions, and the exact place each one is stored. Open a row to see <i>why</i> it goes where it goes.</p>
 
       <div className="toolbar">
         <GPill id="groupPill" label="Group by" value={GLBL[groupBy]} valueId="groupVal" menuId="groupMenu" open={menuOpen} setOpen={setMenuOpen}>
@@ -163,17 +156,22 @@ export function Folders() {
         </GPill>
         <div className="search">
           <SearchIc />
-          <input id="folderSearch" placeholder="Search folders, repos, projects, destinations…" value={query} onChange={(e) => setQuery(e.target.value)} />
+          <input id="folderSearch" placeholder="Search folders, repos, destinations…" value={query} onChange={(e) => setQuery(e.target.value)} />
         </div>
       </div>
 
       <div id="folderList">
         {!list.length ? (
-          <div className="ftable"><div className="empty">Nothing matches “{query}”.</div></div>
+          <div className="ftable"><div className="empty">{q ? `Nothing matches “${query}”.` : "No session folders found on this device yet."}</div></div>
         ) : groups.map((g) => (
           <div className="toolgrp" key={g.title}>
-            <div className="toolhdr">{groupTitle(g.title)}<span className="cnt">{g.items.length ? "· " + plural(g.items.reduce((n, f) => n + f.sessions, 0), "session") + " " : ""}{g.note}</span></div>
-            {g.items.length > 0 && <div className="ftable">{g.items.map((f) => <FolderRow key={f.id} f={f} />)}</div>}
+            <div className="toolhdr">
+              {g.destKey
+                ? <b className="grplink" onClick={() => openDest(g.destKey as string)}>{g.title}</b>
+                : <b>{g.title}</b>}
+              <span className="cnt">{g.items.length ? "· " + plural(g.items.reduce((n, f) => n + f.sessions, 0), "session") + " " : ""}{g.note}</span>
+            </div>
+            {g.items.length > 0 && <div className="ftable">{g.items.map((f) => <FolderRow key={`${g.title}:${f.id}`} f={f} />)}</div>}
           </div>
         ))}
       </div>

@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { copyText, useApp } from "../store";
-import { LOG_LINES } from "../data";
 import { GPill } from "../components/GPill";
 import { CheckIc, CopyIc, MaxiMiniIc, SearchIc } from "../icons";
 
@@ -8,29 +7,45 @@ const LEVEL_LABEL: Record<"all" | "up" | "warn", string> = { all: "Everything", 
 const LEVEL_OPTIONS: ["all" | "up" | "warn", string][] = [["all", "Everything"], ["up", "Uploads"], ["warn", "Warnings & errors"]];
 
 export function Logs() {
-  const { view, deviceName, logFull, setLogFull } = useApp();
+  const { view, snap, logs, logFull, setLogFull } = useApp();
   const [level, setLevel] = useState<"all" | "up" | "warn">("all");
   const [levelMenuOpen, setLevelMenuOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
+  const paneRef = useRef<HTMLDivElement>(null);
 
   const q = filter.trim();
   const ql = q.toLowerCase();
-  const visible = LOG_LINES.map((l) => {
+  const visible = logs.map((l) => {
     const okLevel = level === "all" || l.level === level;
-    const okText = !ql || (l.ts + l.body).toLowerCase().includes(ql);
+    const okText = !ql || l.body.toLowerCase().includes(ql);
     return okLevel && okText;
   });
   const shown = visible.filter(Boolean).length;
-  const total = LOG_LINES.length;
+  const total = logs.length;
+
+  useEffect(() => {
+    if (!autoScroll || !paneRef.current) return;
+    paneRef.current.scrollTop = paneRef.current.scrollHeight;
+  }, [logs, autoScroll, level, filter]);
 
   const copyVisible = () => {
-    const text = LOG_LINES.filter((_, i) => visible[i]).map((l) => l.ts + l.body).join("\n");
+    const text = logs.filter((_, i) => visible[i]).map((l) => l.body).join("\n");
     if (copyText(text)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1200);
     }
+  };
+
+  const download = () => {
+    const blob = new Blob([logs.map((l) => l.body).join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "hx-client.log";
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -40,7 +55,7 @@ export function Logs() {
       <p className="lede">The one technical page — the <code className="hx">hx</code> daemon’s own words, for when something needs a closer look. Logs stay on this machine.</p>
 
       <div id="logShell" className={logFull ? "full" : undefined}>
-        <div className="logtitle">Client Logs — <span className="devname">{deviceName}</span></div>
+        <div className="logtitle">Client Logs — <span className="devname">{snap?.device.name ?? "this device"}</span></div>
         <div className="logbar">
           <GPill id="logLevelPill" label="Show" value={LEVEL_LABEL[level]} valueId="logLevelVal" menuId="logLevelMenu" open={levelMenuOpen} setOpen={setLevelMenuOpen}>
             {LEVEL_OPTIONS.map(([lf, label]) => (
@@ -56,7 +71,7 @@ export function Logs() {
             {copied ? <CheckIc /> : <CopyIc />}
           </button>
           <button className={`fpill${autoScroll ? " sel" : ""}`} id="autoScrollBtn" onClick={() => setAutoScroll(!autoScroll)}>Auto-scroll: {autoScroll ? "On" : "Off"}</button>
-          <button className="btn ghost">Download</button>
+          <button className="btn ghost" onClick={download}>Download</button>
           <button className="iconbtn" id="logMaxBtn" title="Full-page view" onClick={() => setLogFull(!logFull)}>
             <MaxiMiniIc full={logFull} />
           </button>
@@ -66,10 +81,11 @@ export function Logs() {
           <span style={{ flex: 1 }}></span>
           <button className="btn link sm" id="logFilterClear" onClick={() => setFilter("")}>Clear</button>
         </div>
-        <div className="logpane scrolly" id="logPane">
-          {LOG_LINES.map((l, i) => (
+        <div className="logpane scrolly" id="logPane" ref={paneRef}>
+          {logs.length === 0 && <div className="ln">No log lines yet — the daemon writes to ~/.let/hx/stdout.log as it runs.</div>}
+          {logs.map((l, i) => (
             <div key={i} className={`ln${l.level === "up" ? " up" : l.level === "warn" ? " warnl" : ""}`} data-l={l.level} style={{ display: visible[i] ? "" : "none" }}>
-              <span className="ts">{l.ts}</span>{l.body}
+              {l.body}
             </div>
           ))}
         </div>

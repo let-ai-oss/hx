@@ -22,7 +22,17 @@ beforeAll(() => {
     files: { "/index.html": indexPath, "/assets/app.js": appPath },
   };
   auth = createUiAuth();
-  ctx = { auth, assets, port: PORT };
+  const providers = {
+    snapshot: () => Promise.resolve({ generatedAt: 1 } as never),
+    sessions: (folderId: string) =>
+      Promise.resolve(folderId === "known" ? ([{ id: "s1" }] as never[]) : []),
+    preview: (filePath: string) =>
+      Promise.resolve(filePath === "/ok.jsonl" ? [{ role: "Me" as const, text: "hi" }] : null),
+    logs: () => Promise.resolve([{ body: "[hx] tick", level: "info" as const }]),
+    probe: () => Promise.resolve({ up: true }),
+    whoami: () => Promise.resolve({ email: "dev@local.test" }),
+  };
+  ctx = { auth, assets, providers, port: PORT };
 });
 
 const req = (
@@ -132,6 +142,35 @@ describe("handleUiRequest — auth flow", () => {
     assert.equal(launch.status, 401); // launch token is not a session token
     const ok = await handleUiRequest(req("/api/ping", { token: auth.sessionToken }), ctx);
     assert.equal(ok.status, 204);
+  });
+
+  it("serves data endpoints only with a session token", async () => {
+    assert.equal((await handleUiRequest(req("/api/snapshot"), ctx)).status, 401);
+    const snap = await handleUiRequest(req("/api/snapshot", { token: auth.sessionToken }), ctx);
+    assert.equal(snap.status, 200);
+    assert.deepEqual(await snap.json(), { generatedAt: 1 });
+
+    const noFolder = await handleUiRequest(req("/api/sessions", { token: auth.sessionToken }), ctx);
+    assert.equal(noFolder.status, 400);
+    const sessions = await handleUiRequest(
+      req("/api/sessions?folder=known", { token: auth.sessionToken }),
+      ctx,
+    );
+    assert.equal(sessions.status, 200);
+
+    const badPreview = await handleUiRequest(
+      req("/api/session-preview?path=/etc/passwd", { token: auth.sessionToken }),
+      ctx,
+    );
+    assert.equal(badPreview.status, 404); // provider vetoes non-discovered paths
+    const okPreview = await handleUiRequest(
+      req("/api/session-preview?path=/ok.jsonl", { token: auth.sessionToken }),
+      ctx,
+    );
+    assert.equal(okPreview.status, 200);
+
+    const logs = await handleUiRequest(req("/api/logs", { token: auth.sessionToken }), ctx);
+    assert.equal(logs.status, 200);
   });
 
   it("404s unknown authed api routes without leaking to anonymous callers", async () => {

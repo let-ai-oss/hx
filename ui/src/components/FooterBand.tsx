@@ -11,8 +11,7 @@ export function FooterBand() {
         </div>
         <div className="oss">
           <div className="osslbl">Open source</div>
-          <a href="https://github.com/hx-framework/hx"><OctocatIc /> github.com/hx-framework/hx</a>
-          <a href="https://hxframework.org">About the HX framework</a>
+          <a href="https://github.com/let-ai-oss/hx" target="_blank" rel="noreferrer"><OctocatIc /> github.com/let-ai-oss/hx</a>
         </div>
       </div>
     </footer>

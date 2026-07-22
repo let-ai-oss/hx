@@ -14,10 +14,22 @@ import { KbdModal } from "./modals/KbdModal";
 import { InspectorModal } from "./modals/InspectorModal";
 
 function Chrome() {
-  const { deviceName } = useApp();
+  const { snap, error, loading } = useApp();
+  const deviceName = snap?.device.name;
   useEffect(() => {
-    document.title = `HX Client — ${deviceName}`;
+    document.title = deviceName ? `HX Client — ${deviceName}` : "HX Client";
   }, [deviceName]);
+  if (loading && !snap) {
+    return <div className="bootstate">Loading…</div>;
+  }
+  if (error && !snap) {
+    return (
+      <div className="bootstate">
+        <b>Can’t reach the hx ui server.</b>
+        <p>Start it with <code className="hx">hx ui</code> and open the printed link — the address bar link carries a one-time key this page needs.</p>
+      </div>
+    );
+  }
   return (
     <>
       <Topbar />

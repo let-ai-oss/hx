@@ -36,7 +36,16 @@ import {
   removeServerInfo,
   writeServerInfo,
 } from "./ui/instance.js";
-import { tryServeUi } from "./ui/server.js";
+import { tryServeUi, type UiProviders } from "./ui/server.js";
+import {
+  buildSessions,
+  buildSnapshot,
+  cachedWhoami,
+  isDiscoveredPath,
+  readConfigForProbe,
+  tailDaemonLog,
+} from "./ui/data.js";
+import { previewSessionFile } from "./ui/preview.js";
 
 function log(msg: string): void {
   process.stdout.write(`${msg}\n`);
@@ -910,8 +919,22 @@ async function cmdUi(): Promise<void> {
   const strict = requested !== null;
   const basePort = requested ?? UI_DEFAULT_PORT;
 
+  const providers: UiProviders = {
+    snapshot: () => buildSnapshot(),
+    sessions: (folderId) => buildSessions(folderId),
+    preview: async (filePath) =>
+      (await isDiscoveredPath(filePath)) ? previewSessionFile(filePath) : null,
+    logs: (maxLines) => tailDaemonLog(maxLines),
+    probe: async () => {
+      const cfg = await readConfigForProbe();
+      if (!cfg) return { up: false, reason: "not connected" };
+      return probeConnection(cfg);
+    },
+    whoami: () => cachedWhoami(),
+  };
+
   let port = basePort;
-  let server = tryServeUi(basePort, auth, assets);
+  let server = tryServeUi(basePort, auth, assets, providers);
   if (!server && !strict) {
     // The default port is taken — maybe by an earlier `hx ui`. Reuse a live
     // instance of ours instead of racing it; otherwise scan forward.
@@ -926,7 +949,7 @@ async function cmdUi(): Promise<void> {
       await removeServerInfo();
     }
     for (let p = basePort + 1; p <= basePort + UI_PORT_SCAN_SPAN && !server; p++) {
-      server = tryServeUi(p, auth, assets);
+      server = tryServeUi(p, auth, assets, providers);
       if (server) port = p;
     }
     if (server) {
