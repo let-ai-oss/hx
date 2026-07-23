@@ -27,7 +27,11 @@ export interface FolderInfo {
   family: string;
   tool: string;
   path: string;
+  /** Sessions whose transcript is on this machine now. */
   sessions: number;
+  /** Sessions synced from this folder per the cloud (durable; includes ones
+   *  whose local file was deleted). null when the gateway didn't report it. */
+  cloudSessions: number | null;
   repo: string | null;
   branch: string | null;
   dests: string[];

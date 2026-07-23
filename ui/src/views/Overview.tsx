@@ -31,6 +31,13 @@ export function Overview() {
   // "not caught up" and "nothing in flight" can never contradict each other.
   const inFlight = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
   const held = snap?.sync.waiting ?? 0; // held on an unavailable store (subset)
+  // Durable cloud total = sum of per-folder cloud counts (this device's synced
+  // sessions, incl. ones whose local file was deleted). Shown next to the
+  // on-disk total when the gateway reported it and it's larger.
+  const cloudTotal = act.some((f) => f.cloudSessions != null)
+    ? act.reduce((n, f) => n + (f.cloudSessions ?? f.sessions), 0)
+    : null;
+  const onDisk = snap?.sync.total ?? 0;
   const firstUnlinked = unlinkedFolders[0];
   const daemon = snap?.device.daemon;
 
@@ -59,9 +66,11 @@ export function Overview() {
           </div></span></div>
         </div>
         <div className="stat">
-          <span className="lbl">Sessions on disk</span>
-          <div className="big statlink" id="ovSessionsLink" onClick={() => setInspOpen(true)}><span id="ovSessions">{snap?.sync.total ?? "…"}</span><div className="pop">Preview what leaves this machine →</div></div>
-          <div className="sub">{fmtBytes(snap?.sync.totalBytes ?? 0)} · active last 30 days</div>
+          <span className="lbl">Sessions</span>
+          <div className="big statlink" id="ovSessionsLink" onClick={() => setInspOpen(true)}><span id="ovSessions">{snap ? onDisk : "…"}</span><div className="pop">Preview what leaves this machine →</div></div>
+          <div className="sub">{cloudTotal != null && cloudTotal > onDisk
+            ? <>on this machine · <span className="dashy">{cloudTotal} in cloud<div className="pop"><b>{cloudTotal} sessions synced from this device</b><div style={{ marginTop: 6 }}>The cloud keeps every session you’ve synced — including ones whose local transcript you’ve since deleted (e.g. cleaned-up worktrees). This machine currently holds {onDisk} on disk.</div></div></span></>
+            : `${fmtBytes(snap?.sync.totalBytes ?? 0)} · on this machine`}</div>
         </div>
         <div className="stat">
           <span className="lbl">Destinations</span>

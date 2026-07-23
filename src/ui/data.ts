@@ -49,7 +49,12 @@ export interface FolderVM {
   family: string;
   tool: string;
   path: string;
+  /** Sessions whose transcript is on THIS machine now (discovered on disk). */
   sessions: number;
+  /** Sessions this device has synced from this folder, per the gateway (the
+   *  durable count — includes ones whose local file was deleted). null when
+   *  the gateway wasn't reached / is too old to report it. */
+  cloudSessions: number | null;
   repo: string | null;
   branch: string | null;
   /** Destination store keys observed in state offsets ("letai" | org id). */
@@ -191,6 +196,7 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
         tool: familyLabel(family),
         path: cwd,
         sessions: 0,
+        cloudSessions: null,
         repo: null,
         branch: null,
         dests: [],
@@ -432,6 +438,9 @@ interface GatewayFolder {
   path: string;
   folderQuery: string;
   repoSlug: string | null;
+  /** Sessions this device has uploaded from this folder (the durable cloud
+   *  count — includes sessions whose local file was since deleted). */
+  sessionCount: number;
   workspaces: { orgId: string; orgName: string; projectId: string; projectName: string }[];
   sharing: {
     orgId: string;
@@ -499,6 +508,10 @@ export function applyEnrichment(
       collapsed.find((c) => c.path === f.path) ??
       collapsed.find((c) => c.prefix !== null && `${f.path}/`.startsWith(c.prefix));
     if (!hit) continue;
+    // The durable count of sessions this device synced from the folder — shown
+    // alongside the on-disk count so a user who deleted local transcripts (or
+    // cleaned up worktrees) still sees the full total the cloud holds.
+    if (typeof hit.g.sessionCount === "number") f.cloudSessions = hit.g.sessionCount;
     const primary = hit.g.workspaces[0];
     f.workspace = primary ? { orgName: primary.orgName, projectName: primary.projectName } : null;
     // The gateway's workspace list is the authoritative attribution answer.

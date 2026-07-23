@@ -143,6 +143,7 @@ describe("applyEnrichment", () => {
         path: "/home/u/w/app",
         folderQuery: "/home/u/w/app",
         repoSlug: "acme/app",
+        sessionCount: 52, // durable cloud count (more than the 1 on disk)
         workspaces: [{ orgId: "org1", orgName: "Acme", projectId: "p1", projectName: "App" }],
         sharing: {
           orgId: "org1",
@@ -172,6 +173,9 @@ describe("applyEnrichment", () => {
     assert.deepEqual(folders[0]?.sharing?.people, ["Marta"]);
     assert.equal(dests[0]?.label, "Acme");
     assert.equal(dests[0]?.storage?.status, "connected");
+    // On-disk count stays local truth (1); the cloud count comes from the gateway.
+    assert.equal(folders[0]?.sessions, 1);
+    assert.equal(folders[0]?.cloudSessions, 52);
   });
 
   it("leaves rows untouched when the gateway has no enrichment", () => {
@@ -180,6 +184,7 @@ describe("applyEnrichment", () => {
     assert.equal(folders[0]?.workspace, null);
     assert.equal(folders[0]?.sharing, null);
     assert.equal(folders[0]?.attributed, null);
+    assert.equal(folders[0]?.cloudSessions, null); // no cloud count offline
   });
 
   it("confirms unlinked when the gateway answers with zero workspaces", () => {
@@ -187,11 +192,12 @@ describe("applyEnrichment", () => {
       fact("/a.jsonl", { cwd: "/home/u/w/app", repoSlug: "acme/app" }, { offsets: { letai: 1 } }),
     ]);
     applyEnrichment(folders, [], {
-      folders: [{ path: "/home/u/w/app", folderQuery: "/home/u/w/app", repoSlug: "acme/app", workspaces: [], sharing: null }],
+      folders: [{ path: "/home/u/w/app", folderQuery: "/home/u/w/app", repoSlug: "acme/app", sessionCount: 3, workspaces: [], sharing: null }],
       vaults: {},
     });
     assert.equal(folders[0]?.attributed, false);
     assert.equal(folders[0]?.unlinkedRepo, true);
+    assert.equal(folders[0]?.cloudSessions, 3);
   });
 });
 

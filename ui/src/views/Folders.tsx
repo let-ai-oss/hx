@@ -108,8 +108,11 @@ function FolderWhy({ f }: { f: FolderInfo }) {
       {note}
       {visibility}
       <div className="why-note" style={{ marginTop: 10 }}>
-        <b>Sessions in this folder</b> <span className="psub">· last activity {fmtRelative(f.lastUploadAtMs)}</span>
+        <b>Sessions in this folder</b> <span className="psub">· {f.sessions} on this machine{f.cloudSessions != null && f.cloudSessions > f.sessions ? `, ${f.cloudSessions} in the cloud` : ""} · last activity {fmtRelative(f.lastUploadAtMs)}</span>
       </div>
+      {f.cloudSessions != null && f.cloudSessions > f.sessions && (
+        <div className="why-note psub">The cloud keeps {f.cloudSessions - f.sessions} more you’ve synced from here — sessions whose local transcript has since been deleted (e.g. cleaned-up worktrees). Only the {f.sessions} still on disk are listed below.</div>
+      )}
       {sessions === undefined ? (
         <div className="why-note">Loading sessions…</div>
       ) : sessions.length === 0 ? (

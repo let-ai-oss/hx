@@ -645,3 +645,6 @@
 }
 .bootstate b { color: var(--text); font-size: 18px; }
 .bootstate p { max-width: 480px; margin: 0; }
+
+/* Per-folder secondary count (on-disk vs cloud) */
+.cellC-sub { font-size: 12px; color: var(--text-subtle); opacity: 0.8; margin-top: 1px; }

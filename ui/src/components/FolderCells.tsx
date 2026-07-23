@@ -76,5 +76,15 @@ export function CellB({ f, isExcluded = false, destAction }: { f: FolderInfo; is
 }
 
 export function CellC({ f }: { f: FolderInfo }) {
-  return <div className="cell cellC">{plural(f.sessions, "session")}</div>;
+  // Show both counts whenever the cloud holds more than is on disk (deleted
+  // local transcripts / cleaned-up worktrees still count in the cloud). When
+  // they're equal, or the gateway didn't report a cloud count, show one line.
+  const cloud = f.cloudSessions;
+  const showBoth = cloud != null && cloud > f.sessions;
+  return (
+    <div className="cell cellC">
+      <div>{plural(f.sessions, "session")}{showBoth ? " here" : ""}</div>
+      {showBoth && <div className="cellC-sub">{cloud} in cloud</div>}
+    </div>
+  );
 }
