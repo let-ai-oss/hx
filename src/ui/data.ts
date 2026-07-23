@@ -153,7 +153,11 @@ async function headsFor(files: DiscoveredFile[]): Promise<Map<string, HeadMeta>>
           out.set(f.path, cached.head);
           return;
         }
-        const head = await readHead(f.path, f.source);
+        // Never walk the user's project dirs from the UI — the daemon already
+        // resolved each repo slug and cached it in state.json (read in
+        // groupFolders). Re-detecting here would touch macOS-protected folders
+        // and fire a redundant TCC prompt (see readHead / detectRepoSlug).
+        const head = await readHead(f.path, f.source, { resolveRepoFromDisk: false });
         if (!head.title) {
           head.title = extractTitleFallback(await readHeadLines(f.path));
         }
@@ -209,7 +213,11 @@ export function groupFolders(facts: FileFacts[]): FolderVM[] {
       byId.set(id, row);
     }
     row.sessions += 1;
-    if (head.repoSlug && !row.repo) row.repo = head.repoSlug;
+    // Repo slug comes from the daemon's cached state (state.repoSlug), not from
+    // a fresh on-disk walk — the UI must not re-enter project folders (macOS
+    // TCC). head.repoSlug is a fallback for any caller that still resolves it.
+    const repoSlug = state?.repoSlug ?? head.repoSlug ?? null;
+    if (repoSlug && !row.repo) row.repo = repoSlug;
     if (head.gitBranch && !row.branch) row.branch = head.gitBranch;
     if (state) {
       row.lastUploadAtMs = Math.max(row.lastUploadAtMs, state.lastUploadAtMs || 0);
