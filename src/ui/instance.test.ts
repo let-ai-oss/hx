@@ -68,6 +68,11 @@ describe("probeExistingInstance", () => {
     assert.deepEqual(result, { url: "http://localhost:8123/#k=fresh-tok" });
   });
 
+  it("uses the given uiHost in the printed url (127.0.0.1 for containers)", async () => {
+    const result = await probeExistingInstance(INFO, genuineServer(OWNER, "fresh-tok"), "127.0.0.1");
+    assert.deepEqual(result, { url: "http://127.0.0.1:8123/#k=fresh-tok" });
+  });
+
   it("rejects a squatter that can't produce a valid server proof", async () => {
     // Occupant returns a token but a bogus serverProof (doesn't know ownerKey).
     const result = await probeExistingInstance(

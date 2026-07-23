@@ -917,12 +917,24 @@ async function cmdUi(): Promise<void> {
   const basePort = requested ?? UI_DEFAULT_PORT;
 
   // In a container, the browser lives on the HOST, so loopback is unreachable —
-  // bind 0.0.0.0 so a published port (`docker run -p`) forwards in. The Host
-  // allowlist + token still gate every request, so this widens nothing that
-  // matters (see ui/container.ts). On a normal host this stays loopback and the
-  // whole flow below is exactly as it was.
+  // bind a wildcard so a published port (`docker run -p`) forwards in. Use "::"
+  // (dual-stack IPv4+IPv6, with an IPv4-only fallback in tryServeUi) rather than
+  // "0.0.0.0": Docker Desktop also publishes the port on the host's IPv6, and
+  // "localhost" resolves to IPv6 (::1) first on Windows — an IPv4-only listener
+  // leaves that path with no backend, so the browser gets ERR_EMPTY_RESPONSE.
+  // Dual-stack lets `localhost` work like it does for any normal container. The
+  // Host allowlist + token gate every request regardless of family (see
+  // ui/container.ts). On a normal host this stays loopback, flow unchanged.
   const inContainer = isInsideContainer();
-  const bindHost = inContainer ? "0.0.0.0" : "127.0.0.1";
+  const bindHost = inContainer ? "::" : "127.0.0.1";
+  // The link is opened on the HOST. In a container use 127.0.0.1, not localhost:
+  // Docker Desktop (Windows/macOS) also publishes the port on the host's IPv6,
+  // and `localhost` resolves to ::1 first there — Docker's IPv6 forward accepts
+  // the connection then drops it (the browser sees an empty response). 127.0.0.1
+  // forces the IPv4 path, which works on every OS (Docker Desktop, native Linux,
+  // Podman); it passes the Host allowlist and is a browser-secure origin just
+  // like localhost. Non-container keeps localhost (works, and we auto-open it).
+  const uiHost = inContainer ? "127.0.0.1" : "localhost";
 
   const providers: UiProviders = {
     snapshot: () => buildSnapshot(),
@@ -996,7 +1008,7 @@ async function cmdUi(): Promise<void> {
     // instance of ours instead of racing it; otherwise scan forward.
     const existing = await readServerInfo();
     if (existing) {
-      const alive = await probeExistingInstance(existing);
+      const alive = await probeExistingInstance(existing, fetch, uiHost);
       if (alive) {
         log(`[hx] HX Client UI already running at ${alive.url}`);
         log(launchLinkNote());
@@ -1011,7 +1023,7 @@ async function cmdUi(): Promise<void> {
       if (server) port = p;
     }
     if (server) {
-      log(`[hx] port ${basePort} is in use by another app — serving on http://localhost:${port}`);
+      log(`[hx] port ${basePort} is in use by another app — serving on http://${uiHost}:${port}`);
     }
   }
   if (!server) {
@@ -1052,7 +1064,7 @@ async function cmdUi(): Promise<void> {
     // no watcher — the UI's polling still keeps things fresh
   }
 
-  const launchUrl = `http://localhost:${port}/#k=${auth.mintLaunchToken()}`;
+  const launchUrl = `http://${uiHost}:${port}/#k=${auth.mintLaunchToken()}`;
   log(`[hx] HX Client UI → ${launchUrl}`);
   log(launchLinkNote());
   if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
