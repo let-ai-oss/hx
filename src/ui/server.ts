@@ -182,6 +182,29 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
     return json({ sessionToken });
   }
 
+  // Instance-reuse handshake: authenticated by proof-of-ownerKey (the second
+  // `hx ui` process reads ownerKey from the 0600 file — same uid), NOT by a
+  // session token, which the reuse caller doesn't have. Mints a fresh
+  // single-use launch token and proves our own ownerKey knowledge back, so the
+  // caller can confirm we're the genuine server before opening the browser.
+  if (path === "/api/instance/reissue") {
+    if (req.method !== "POST") return apiError(405, "method not allowed");
+    let nonce: unknown, proof: unknown;
+    try {
+      const body = (await req.json()) as { nonce?: unknown; proof?: unknown };
+      nonce = body.nonce;
+      proof = body.proof;
+    } catch {
+      return apiError(400, "invalid body");
+    }
+    if (typeof nonce !== "string" || typeof proof !== "string") return apiError(400, "invalid body");
+    if (!ctx.auth.verifyOwnerProof(nonce, proof)) return apiError(401, "invalid proof");
+    return json({
+      launchToken: ctx.auth.mintLaunchToken(),
+      serverProof: ctx.auth.serverProof(nonce),
+    });
+  }
+
   if (!ctx.auth.isValidSession(req.headers.get("x-hx-ui-token"))) {
     return apiError(401, "unauthorized");
   }

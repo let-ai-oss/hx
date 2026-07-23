@@ -1,19 +1,24 @@
 // Single-instance bookkeeping for `hx ui`.
 //
 // While the server runs it keeps ~/.let/hx/ui/server.json (0600):
-//   { port, pid, launchToken }
-// A second `hx ui` that finds its port taken reads this file, verifies the
-// occupant really is a live hx-ui owned by this user (unauthenticated
-// /api/instance identity + an authenticated exchange with the stored launch
-// token), and re-opens the browser at the running instance instead of
-// starting a rival server. A crash leaves a stale file; the verification
-// fails and the caller cleans it up and moves on.
+//   { port, pid, ownerKey }
+// ownerKey is a per-run secret that NEVER appears in a URL or argv — it lives
+// only in this 0600 file. A second `hx ui` that finds its port taken reads the
+// file and runs a mutual-HMAC handshake with the occupant: it proves it knows
+// ownerKey (so the occupant only reissues for the real owner) and requires the
+// occupant to prove the same (so a port-squatter can't impersonate the real
+// server and get the browser pointed at it). Only on a verified handshake does
+// the occupant hand back a FRESH single-use launch token to re-open the
+// browser. A crash leaves a stale file; the handshake fails and the caller
+// cleans it up and starts its own server.
 
 import { mkdirSync } from "node:fs";
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { HX_DIR } from "../hx-home.js";
 import { HX_VERSION } from "../version.js";
+import { CLIENT_PROOF_LABEL, SERVER_PROOF_LABEL, hmacProof, tokensMatch } from "./auth.js";
 
 export const UI_DIR = join(HX_DIR, "ui");
 
@@ -22,7 +27,8 @@ const infoPath = (dir: string): string => join(dir, "server.json");
 export interface ServerInfo {
   port: number;
   pid: number;
-  launchToken: string;
+  /** Same-uid ownership secret — never leaves this 0600 file. */
+  ownerKey: string;
 }
 
 export async function writeServerInfo(info: ServerInfo, dir: string = UI_DIR): Promise<void> {
@@ -47,8 +53,8 @@ export async function readServerInfo(dir: string = UI_DIR): Promise<ServerInfo |
       parsed.port < 1 ||
       parsed.port > 65535 ||
       typeof parsed.pid !== "number" ||
-      typeof parsed.launchToken !== "string" ||
-      !/^[A-Za-z0-9_-]+$/.test(parsed.launchToken)
+      typeof parsed.ownerKey !== "string" ||
+      !/^[A-Za-z0-9_-]+$/.test(parsed.ownerKey)
     ) {
       return null;
     }
@@ -75,34 +81,38 @@ export function instanceIdentity(): InstanceIdentity {
 const PROBE_TIMEOUT_MS = 1_500;
 
 /**
- * Is the recorded instance alive, ours, and answering on its port? Returns
- * the launch URL to re-open when yes; null means "treat as stale".
+ * Is the recorded instance alive, genuinely ours, and answering on its port?
+ * Runs the mutual-HMAC reuse handshake; returns a launch URL (carrying a fresh
+ * single-use token the occupant minted) when verified, null to treat as stale.
  */
 export async function probeExistingInstance(
   info: ServerInfo,
   fetcher: typeof fetch = fetch,
 ): Promise<{ url: string } | null> {
   const base = `http://127.0.0.1:${info.port}`;
+  const nonce = randomBytes(18).toString("base64url");
   try {
-    const identityRes = await fetcher(`${base}/api/instance`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    if (!identityRes.ok) return null;
-    const identity = (await identityRes.json()) as Partial<InstanceIdentity>;
-    if (identity.app !== "hx-ui") return null;
-
-    // Ownership proof: only the process that wrote server.json (same uid —
-    // the file is 0600) knows the launch token, and only the real server
-    // accepts it. A foreign app squatting the port fails here.
-    const authRes = await fetcher(`${base}/api/auth`, {
+    // We prove we know ownerKey (proof over our nonce); the occupant, if it's
+    // the real server, proves the same and returns a fresh launch token.
+    const res = await fetcher(`${base}/api/instance/reissue`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: info.launchToken }),
+      body: JSON.stringify({
+        nonce,
+        proof: hmacProof(info.ownerKey, CLIENT_PROOF_LABEL, nonce),
+      }),
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    if (!authRes.ok) return null;
-
-    return { url: `http://localhost:${info.port}/#k=${info.launchToken}` };
+    if (!res.ok) return null;
+    const body = (await res.json()) as { launchToken?: unknown; serverProof?: unknown };
+    if (typeof body.launchToken !== "string" || typeof body.serverProof !== "string") return null;
+    // The occupant must prove it, too — a squatter that doesn't know ownerKey
+    // fails here, so we never point the browser at an impostor.
+    if (!tokensMatch(body.serverProof, hmacProof(info.ownerKey, SERVER_PROOF_LABEL, nonce))) {
+      return null;
+    }
+    if (!/^[A-Za-z0-9_-]+$/.test(body.launchToken)) return null;
+    return { url: `http://localhost:${info.port}/#k=${body.launchToken}` };
   } catch {
     return null;
   }

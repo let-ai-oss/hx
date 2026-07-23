@@ -1,7 +1,10 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
+  CLIENT_PROOF_LABEL,
+  SERVER_PROOF_LABEL,
   createUiAuth,
+  hmacProof,
   isAllowedHost,
   isAllowedOrigin,
   mintToken,
@@ -28,19 +31,63 @@ describe("tokensMatch", () => {
   });
 });
 
-describe("createUiAuth", () => {
-  it("exchanges the launch token for the session token, idempotently", () => {
+describe("createUiAuth — launch tokens are single-use + short-TTL", () => {
+  it("exchanges a minted launch token exactly once", () => {
     const auth = createUiAuth();
     assert.equal(auth.exchange("wrong"), null);
-    assert.equal(auth.exchange(auth.launchToken), auth.sessionToken);
-    assert.equal(auth.exchange(auth.launchToken), auth.sessionToken);
+    const lt = auth.mintLaunchToken();
+    assert.equal(auth.exchange(lt), auth.sessionToken);
+    assert.equal(auth.exchange(lt), null); // consumed — replay rejected
   });
 
-  it("validates only the session token", () => {
+  it("mints distinct tokens; each is independently valid until used", () => {
     const auth = createUiAuth();
+    const a = auth.mintLaunchToken();
+    const b = auth.mintLaunchToken();
+    assert.notEqual(a, b);
+    assert.equal(auth.exchange(b), auth.sessionToken);
+    assert.equal(auth.exchange(a), auth.sessionToken); // b's use didn't consume a
+  });
+
+  it("rejects an expired launch token (5-min TTL)", () => {
+    const auth = createUiAuth();
+    const t0 = 1_000_000;
+    const lt = auth.mintLaunchToken(t0);
+    assert.equal(auth.exchange(lt, t0 + 5 * 60_000 + 1), null); // expired
+    const lt2 = auth.mintLaunchToken(t0);
+    assert.equal(auth.exchange(lt2, t0 + 60_000), auth.sessionToken); // within window
+  });
+
+  it("validates only the session token, never a launch token or the owner key", () => {
+    const auth = createUiAuth();
+    const lt = auth.mintLaunchToken();
     assert.equal(auth.isValidSession(auth.sessionToken), true);
-    assert.equal(auth.isValidSession(auth.launchToken), false);
+    assert.equal(auth.isValidSession(lt), false);
+    assert.equal(auth.isValidSession(auth.ownerKey), false);
     assert.equal(auth.isValidSession(null), false);
+  });
+});
+
+describe("createUiAuth — reuse handshake (mutual ownerKey proof)", () => {
+  it("verifies a correct client proof and rejects wrong/absent ones", () => {
+    const auth = createUiAuth();
+    const nonce = "n-abc";
+    const good = hmacProof(auth.ownerKey, CLIENT_PROOF_LABEL, nonce);
+    assert.equal(auth.verifyOwnerProof(nonce, good), true);
+    assert.equal(auth.verifyOwnerProof(nonce, "forged"), false);
+    assert.equal(auth.verifyOwnerProof(nonce, null), false);
+    // A proof over a different nonce must not verify (bound to the nonce).
+    assert.equal(auth.verifyOwnerProof("other", good), false);
+    // The server proof uses a DISTINCT label — a client proof can't pose as it.
+    assert.notEqual(auth.serverProof(nonce), good);
+    assert.equal(auth.serverProof(nonce), hmacProof(auth.ownerKey, SERVER_PROOF_LABEL, nonce));
+  });
+
+  it("a wrong owner key can neither prove nor be impersonated", () => {
+    const auth = createUiAuth();
+    const nonce = "n-xyz";
+    const wrongKeyProof = hmacProof(mintToken(), CLIENT_PROOF_LABEL, nonce);
+    assert.equal(auth.verifyOwnerProof(nonce, wrongKeyProof), false);
   });
 });
 

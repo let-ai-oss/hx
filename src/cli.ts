@@ -1000,7 +1000,11 @@ async function cmdUi(): Promise<void> {
     process.exit(1);
   }
 
-  await writeServerInfo({ port, pid: process.pid, launchToken: auth.launchToken });
+  // Only the ownerKey is persisted (0600) — never a launch token. It proves
+  // same-uid ownership for the reuse handshake; launch tokens are minted fresh,
+  // single-use, and short-lived, so a leaked one (browser-opener argv) can't be
+  // replayed.
+  await writeServerInfo({ port, pid: process.pid, ownerKey: auth.ownerKey });
 
   // Nudge connected browsers when anything under ~/.let/hx changes (state,
   // settings, journal, logs — all live there). Directory-level watch: the
@@ -1027,7 +1031,7 @@ async function cmdUi(): Promise<void> {
     // no watcher — the UI's polling still keeps things fresh
   }
 
-  const launchUrl = `http://localhost:${port}/#k=${auth.launchToken}`;
+  const launchUrl = `http://localhost:${port}/#k=${auth.mintLaunchToken()}`;
   log(`[hx] HX Client UI → ${launchUrl}`);
   if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
   log(`[hx] Ctrl+C to stop`);

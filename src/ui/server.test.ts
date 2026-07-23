@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createUiAuth, type UiAuth } from "./auth.js";
+import {
+  CLIENT_PROOF_LABEL,
+  SERVER_PROOF_LABEL,
+  createUiAuth,
+  hmacProof,
+  type UiAuth,
+} from "./auth.js";
 import { createEventHub, handleUiRequest, type UiServerCtx } from "./server.js";
 import type { UiAssets } from "./assets.js";
 
@@ -126,20 +132,52 @@ describe("handleUiRequest — auth flow", () => {
     assert.ok(body.version.length > 0);
   });
 
-  it("exchanges the launch token for the session token", async () => {
+  it("exchanges a single-use launch token for the session token, once", async () => {
     const bad = await handleUiRequest(
       req("/api/auth", { method: "POST", body: { token: "wrong" } }),
       ctx,
     );
     assert.equal(bad.status, 401);
 
+    const lt = auth.mintLaunchToken();
     const good = await handleUiRequest(
-      req("/api/auth", { method: "POST", body: { token: auth.launchToken } }),
+      req("/api/auth", { method: "POST", body: { token: lt } }),
       ctx,
     );
     assert.equal(good.status, 200);
     const body = (await good.json()) as { sessionToken: string };
     assert.equal(body.sessionToken, auth.sessionToken);
+
+    // Replaying the same launch token (e.g. captured from a browser-opener
+    // argv) is rejected — it was consumed.
+    const replay = await handleUiRequest(
+      req("/api/auth", { method: "POST", body: { token: lt } }),
+      ctx,
+    );
+    assert.equal(replay.status, 401);
+  });
+
+  it("reissues a fresh launch token only on a valid ownerKey proof", async () => {
+    const nonce = "nonce-1";
+    // No proof / wrong proof → 401, and no session token needed to call it.
+    assert.equal(
+      (await handleUiRequest(req("/api/instance/reissue", { method: "POST", body: { nonce, proof: "no" } }), ctx)).status,
+      401,
+    );
+    const proof = hmacProof(auth.ownerKey, CLIENT_PROOF_LABEL, nonce);
+    const ok = await handleUiRequest(
+      req("/api/instance/reissue", { method: "POST", body: { nonce, proof } }),
+      ctx,
+    );
+    assert.equal(ok.status, 200);
+    const body = (await ok.json()) as { launchToken: string; serverProof: string };
+    // The reissued token works for a real exchange, and the server proved itself.
+    assert.equal(body.serverProof, hmacProof(auth.ownerKey, SERVER_PROOF_LABEL, nonce));
+    const ex = await handleUiRequest(
+      req("/api/auth", { method: "POST", body: { token: body.launchToken } }),
+      ctx,
+    );
+    assert.equal(ex.status, 200);
   });
 
   it("rejects malformed auth bodies", async () => {
@@ -153,7 +191,7 @@ describe("handleUiRequest — auth flow", () => {
   it("gates /api behind the session token", async () => {
     const anon = await handleUiRequest(req("/api/ping"), ctx);
     assert.equal(anon.status, 401);
-    const launch = await handleUiRequest(req("/api/ping", { token: auth.launchToken }), ctx);
+    const launch = await handleUiRequest(req("/api/ping", { token: auth.mintLaunchToken() }), ctx);
     assert.equal(launch.status, 401); // launch token is not a session token
     const ok = await handleUiRequest(req("/api/ping", { token: auth.sessionToken }), ctx);
     assert.equal(ok.status, 204);
