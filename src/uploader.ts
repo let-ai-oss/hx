@@ -92,6 +92,16 @@ export class HxHttpError extends Error {
       (this.blocker?.reason === "vault_offline" || this.message.includes("vault_offline"))
     );
   }
+
+  /** 410 session_deleted: the session was PERMANENTLY deleted server-side. The
+   *  one terminal per-session signal in the protocol — callers record it in
+   *  state (deletedSessions) and never upload any lane of the session again.
+   *  Retrying would only re-410 forever; re-uploading is exactly what the
+   *  server-side tombstone exists to refuse. Same body from the cloud gateway
+   *  and a fortress-direct gateway, so this is the single code path. */
+  get sessionDeleted(): boolean {
+    return this.status === 410 && this.message.includes("session_deleted");
+  }
 }
 
 /** Reduce an untrusted gateway destination list to the fixed, non-sensitive
@@ -391,7 +401,11 @@ export interface VerifySessionsItem {
 export interface VerifySessionsResult {
   family: string;
   sessionId: string;
-  status: "ok" | "divergent" | "skipped";
+  // "deleted" = permanently deleted server-side (tombstoned) — terminal; the
+  // audit records it and stops ever uploading the session again. Older daemons
+  // ignore the unrecognized status (a silent no-op), which is what makes the
+  // widening backward-safe.
+  status: "ok" | "divergent" | "skipped" | "deleted";
   storeBytes: number | null;
 }
 

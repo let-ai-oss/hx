@@ -38,7 +38,9 @@ import {
   destKey,
   getArtifactHash,
   getFileState,
+  isDeletedSession,
   loadState,
+  recordDeletedSession,
   recordFileFailure,
   minOffset,
   offsetFor,
@@ -1079,7 +1081,11 @@ async function auditCanonicals(
     // only the let.ai destination's offset — matching the server, which skips
     // vault-routed sessions. A late-joining/offline vault catches up via its own
     // per-destination offset (0 → replace), needing no audit.
-    if (fs && offsetFor(fs, null) > 0) candidates.push({ path: f.path, fState: fs });
+    // Tombstoned (server-deleted) sessions are excluded outright — the server
+    // answers "deleted" for them anyway; skipping saves the round trip.
+    if (fs && offsetFor(fs, null) > 0 && !isDeletedSession(state, fs.family, fs.sessionId)) {
+      candidates.push({ path: f.path, fState: fs });
+    }
   }
   if (candidates.length === 0) return;
 
@@ -1110,6 +1116,17 @@ async function auditCanonicals(
     const byKey = new Map(results.map((r) => [`${r.family}:${r.sessionId}`, r]));
     for (const { path: filePath, fState } of batch) {
       const r = byKey.get(`${fState.family}:${fState.sessionId}`);
+      // MUST come before the divergent branch: a deleted session's canonical is
+      // gone server-side, so it would otherwise read as "divergent" and drive
+      // the full replace re-upload the tombstone exists to prevent. Terminal:
+      // record the stop-flag; every subsequent pass skips the session entirely.
+      if (r?.status === "deleted") {
+        await recordDeletedSession(fState.family, fState.sessionId, scope);
+        log(
+          `[hx] ${fState.sessionId.slice(0, 8)}… was permanently deleted on the server — uploads stopped (local file kept)`,
+        );
+        continue;
+      }
       if (r?.status !== "divergent") continue;
       if ((fState.healPausedUntilMs ?? 0) > Date.now()) continue; // ping-pong latch
       healed += 1;
@@ -1367,6 +1384,13 @@ export async function tickOnce(
       }
       if (shouldSkipFile(settings, seeded)) continue;
     }
+    // Server-side permanent delete: terminal per-session stop — no request, no
+    // backoff, covers every rediscovered twin of the session (the flag is
+    // session-keyed, not per-file).
+    {
+      const entry = state.files[f.path];
+      if (entry && isDeletedSession(state, entry.family, entry.sessionId)) continue;
+    }
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
@@ -1390,6 +1414,20 @@ export async function tickOnce(
           err.blocker,
         );
         log(`  [hx] ${describeSkip(err.reason)}; retrying ${path.basename(f.path)} in ${Math.round(delay / 1000)}s`);
+        continue;
+      }
+      if (err instanceof HxHttpError && err.sessionDeleted) {
+        // Permanent server-side delete (410 tombstone): record the terminal
+        // stop-flag instead of any backoff — this session never uploads again
+        // from this device. The local file is the user's own and stays.
+        const entry = state.files[f.path];
+        if (entry) {
+          await recordDeletedSession(entry.family, entry.sessionId, scope);
+          await clearFileFailure(f.path, scope);
+          log(
+            `  [hx] ${entry.sessionId.slice(0, 8)}… permanently deleted on the server — uploads stopped (local file kept)`,
+          );
+        }
         continue;
       }
       if (err instanceof HxHttpError && err.serverUnavailable) {
@@ -1431,6 +1469,13 @@ export async function tickOnce(
           }
         }
         if (pendingChild?.nextAttemptAtMs && pendingChild.nextAttemptAtMs > Date.now()) continue;
+        // A deleted parent blocks every child lane (the stop-flag matches the
+        // bare sessionId, so a stale child family can't slip past it either).
+        if (
+          isDeletedSession(state, pendingChild?.family ?? "", pendingChild?.sessionId ?? c.parentSessionId)
+        ) {
+          continue;
+        }
         try {
           const did = await ingestChildOne(cfg, c, parentByArtifactSession, opts, log);
           if (did) uploaded += 1;
@@ -1443,6 +1488,14 @@ export async function tickOnce(
         } catch (err) {
           failed += 1;
           log(`  [error] ${c.path}: ${(err as Error).message}`);
+          if (err instanceof HxHttpError && err.sessionDeleted) {
+            // Parent session permanently deleted server-side — terminal for
+            // every lane; record the session stop-flag and stop retrying.
+            const family = pendingChild?.family ?? "claude-cli";
+            await recordDeletedSession(family, pendingChild?.sessionId ?? c.parentSessionId, scope);
+            await clearFileFailure(c.path, scope);
+            continue;
+          }
           if (err instanceof HxHttpError && err.vaultOffline) {
             // The child's session vault is offline (child lanes route through the
             // cloud gateway, never fortress-direct) — skip just this child with

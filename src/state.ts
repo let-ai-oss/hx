@@ -174,6 +174,17 @@ export interface HxState {
   /** Content-hash per uploaded sidecar artifact (key `<family>:<sessionId>:<kind>`)
    *  so tasks/plans only re-upload when their content actually changes. */
   artifacts?: Record<string, string>;
+  /** Sessions the SERVER permanently deleted (410 session_deleted / verify
+   *  status "deleted"), keyed `<family>:<sessionId>` → epoch-ms recorded.
+   *  Session-keyed (not per-file) on purpose: one session can have twin files,
+   *  and file entries are re-seeded on discovery — a per-file flag would miss
+   *  both. A tombstoned session never uploads again from this device: chunks,
+   *  child lanes, sidecars and the verify audit all consult this map. Entries
+   *  are pruned after DELETED_SESSION_RETENTION_MS (past the 30-day discovery
+   *  window, so a pruned entry can't resurrect anything — and the server-side
+   *  tombstone still refuses with 410 regardless). The local jsonl file is the
+   *  user's own and is never touched. */
+  deletedSessions?: Record<string, number>;
 }
 
 const STATE_DIR = HX_DIR;
@@ -459,6 +470,48 @@ export function clearBlockedFailuresFromState(
     delete entry.blocker;
   }
   return { files, sessions: sessions.size };
+}
+
+/** Past the 30-day discovery window with margin — see HxState.deletedSessions. */
+const DELETED_SESSION_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
+/** The `deletedSessions` key for one session. */
+export function deletedSessionKey(family: string, sessionId: string): string {
+  return `${family}:${sessionId}`;
+}
+
+/** Record a server-side permanent delete; idempotent. Prunes expired entries
+ *  opportunistically so the map can't grow without bound. */
+export async function recordDeletedSession(
+  family: string,
+  sessionId: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (!state.deletedSessions) state.deletedSessions = {};
+  const key = deletedSessionKey(family, sessionId);
+  if (!state.deletedSessions[key]) state.deletedSessions[key] = Date.now();
+  const cutoff = Date.now() - DELETED_SESSION_RETENTION_MS;
+  for (const [k, at] of Object.entries(state.deletedSessions)) {
+    if (at < cutoff) delete state.deletedSessions[k];
+  }
+  await schedulePersist(state, scope);
+}
+
+/** True when the server permanently deleted this session (any family recorded —
+ *  the id is matched exactly per family first, then by bare sessionId so a
+ *  stale-family child/sidecar path can't slip past the local stop either). */
+export function isDeletedSession(
+  state: HxState,
+  family: string,
+  sessionId: string,
+): boolean {
+  const map = state.deletedSessions;
+  if (!map) return false;
+  if (map[deletedSessionKey(family, sessionId)]) return true;
+  const suffix = `:${sessionId}`;
+  for (const k of Object.keys(map)) if (k.endsWith(suffix)) return true;
+  return false;
 }
 
 export async function getArtifactHash(

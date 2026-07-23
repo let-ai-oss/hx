@@ -104,6 +104,8 @@ export interface SessionInfo {
   pendingBytes: number;
   lastUploadAtMs: number;
   dests: string[];
+  /** Permanently deleted server-side — uploads stopped forever, local file kept. */
+  deleted?: boolean;
 }
 
 export interface LogLine {
