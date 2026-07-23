@@ -41,6 +41,7 @@ import {
   writeServerInfo,
 } from "./ui/instance.js";
 import { createEventHub, tryServeUi, type UiActions, type UiProviders } from "./ui/server.js";
+import { containerAccessNote, isInsideContainer } from "./ui/container.js";
 import {
   activitySince,
   buildSessions,
@@ -915,6 +916,14 @@ async function cmdUi(): Promise<void> {
   const strict = requested !== null;
   const basePort = requested ?? UI_DEFAULT_PORT;
 
+  // In a container, the browser lives on the HOST, so loopback is unreachable —
+  // bind 0.0.0.0 so a published port (`docker run -p`) forwards in. The Host
+  // allowlist + token still gate every request, so this widens nothing that
+  // matters (see ui/container.ts). On a normal host this stays loopback and the
+  // whole flow below is exactly as it was.
+  const inContainer = isInsideContainer();
+  const bindHost = inContainer ? "0.0.0.0" : "127.0.0.1";
+
   const providers: UiProviders = {
     snapshot: () => buildSnapshot(),
     sessions: (folderId) => buildSessions(folderId),
@@ -981,7 +990,7 @@ async function cmdUi(): Promise<void> {
   };
 
   let port = basePort;
-  let server = tryServeUi(basePort, auth, assets, providers, actions, events);
+  let server = tryServeUi(basePort, auth, assets, providers, actions, events, bindHost);
   if (!server && !strict) {
     // The default port is taken — maybe by an earlier `hx ui`. Reuse a live
     // instance of ours instead of racing it; otherwise scan forward.
@@ -991,13 +1000,14 @@ async function cmdUi(): Promise<void> {
       if (alive) {
         log(`[hx] HX Client UI already running at ${alive.url}`);
         log(launchLinkNote());
-        if (!hasFlag("no-open")) openBrowser(alive.url);
+        if (inContainer) for (const line of containerAccessNote(existing.port)) log(line);
+        else if (!hasFlag("no-open")) openBrowser(alive.url);
         return;
       }
       await removeServerInfo();
     }
     for (let p = basePort + 1; p <= basePort + UI_PORT_SCAN_SPAN && !server; p++) {
-      server = tryServeUi(p, auth, assets, providers, actions, events);
+      server = tryServeUi(p, auth, assets, providers, actions, events, bindHost);
       if (server) port = p;
     }
     if (server) {
@@ -1011,9 +1021,10 @@ async function cmdUi(): Promise<void> {
   }
 
   // Only the ownerKey is persisted (0600) — never a launch token. It proves
-  // same-uid ownership for the reuse handshake; launch tokens are minted fresh,
-  // single-use, and short-lived, so a leaked one (browser-opener argv) can't be
-  // replayed.
+  // same-uid ownership for the reuse handshake; launch tokens are minted fresh
+  // per run and are reusable only within a short TTL, so the residual from a
+  // leaked one (browser-opener argv) is bounded — and the Host allowlist +
+  // session token gate the API regardless.
   await writeServerInfo({ port, pid: process.pid, ownerKey: auth.ownerKey });
 
   // Nudge connected browsers when anything under ~/.let/hx changes (state,
@@ -1045,8 +1056,11 @@ async function cmdUi(): Promise<void> {
   log(`[hx] HX Client UI → ${launchUrl}`);
   log(launchLinkNote());
   if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
+  // In a container there's no browser to open — print how to reach it from the
+  // host instead. On a normal host, auto-open as before.
+  if (inContainer) for (const line of containerAccessNote(port)) log(line);
   log(`[hx] Ctrl+C to stop`);
-  if (!hasFlag("no-open")) openBrowser(launchUrl);
+  if (!inContainer && !hasFlag("no-open")) openBrowser(launchUrl);
 
   const shutdown = (): void => {
     void removeServerInfo().finally(() => {

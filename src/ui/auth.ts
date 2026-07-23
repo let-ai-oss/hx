@@ -1,6 +1,7 @@
 // Auth for the local HX Client UI server.
 //
-// Model: `hx ui` mints a single-use, short-TTL LAUNCH token and opens the
+// Model: `hx ui` mints a short-TTL LAUNCH token (reusable within the TTL — see
+// below) and opens the
 // browser at http://localhost:<port>/#k=<launch-token>. The SPA exchanges the
 // fragment (which never travels on the wire) via POST /api/auth for a SESSION
 // token it keeps in sessionStorage and sends on every /api call in the
@@ -50,11 +51,14 @@ export function hmacProof(ownerKey: string, label: string, nonce: string): strin
   return createHmac("sha256", ownerKey).update(`${label}:${nonce}`).digest("base64url");
 }
 
-// The launch token lives in the terminal (and, on auto-open, briefly in the
-// browser-opener argv) until the page exchanges it. Auto-open consumes it in
-// ~1s, so this window rarely matters — but the printed link is meant to be
-// openable manually/later, so keep it generous (an hour). Single-use is the
-// real replay protection; this only bounds a token that's never consumed.
+// The launch token lives wherever `hx ui` prints it: the terminal, the
+// browser-opener argv on auto-open, and — for a container run as its foreground
+// process — `docker logs`. Because it's reusable, the TTL (not single-use) is
+// the replay bound: anyone who can read the printed URL can exchange it until it
+// expires, so keep the window bounded. An hour is generous enough for manual /
+// copy-paste open (notably the container flow, where there's no auto-open to
+// consume it) while still bounding that residual. A fresh token is minted per
+// `hx ui` run, and the Host allowlist + session token gate the API regardless.
 export const LAUNCH_TTL_MS = 60 * 60_000;
 
 export interface UiAuth {
