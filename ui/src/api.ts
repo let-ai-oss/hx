@@ -156,42 +156,60 @@ export type ServerEvent =
 
 const TOKEN_KEY = "hx-ui-session-token";
 
+/** Distinguishable auth-bootstrap failures so the UI can guide precisely
+ *  instead of blaming the (reachable) server. */
+export type AuthErrorKind = "link-expired" | "no-key" | "network";
+
 class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly kind?: AuthErrorKind,
   ) {
     super(message);
   }
 }
 
-async function bootstrapToken(): Promise<string | null> {
+export function authErrorKind(err: unknown): AuthErrorKind | null {
+  return err instanceof ApiError ? err.kind ?? null : null;
+}
+
+async function bootstrapToken(): Promise<string> {
   const cached = sessionStorage.getItem(TOKEN_KEY);
   if (cached) return cached;
   const match = /[#&]k=([A-Za-z0-9_-]+)/.exec(window.location.hash);
-  if (!match) return null;
-  const res = await fetch("/api/auth", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token: match[1] }),
-  });
-  if (!res.ok) return null;
+  // No key in the URL and nothing cached: this tab was opened without the
+  // one-time link (e.g. bare localhost:8000, or a new tab).
+  if (!match) throw new ApiError(401, "open the link printed by `hx ui`", "no-key");
+  let res: Response;
+  try {
+    res = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: match[1] }),
+    });
+  } catch {
+    // The exchange couldn't reach the server at all.
+    throw new ApiError(0, "cannot reach the hx ui server", "network");
+  }
+  // Server answered but rejected the key: it was already used or has expired.
+  if (res.status === 401) throw new ApiError(401, "link already used or expired", "link-expired");
+  if (!res.ok) throw new ApiError(res.status, `auth → ${res.status}`, "link-expired");
   const { sessionToken } = (await res.json()) as { sessionToken: string };
   sessionStorage.setItem(TOKEN_KEY, sessionToken);
   history.replaceState(null, "", window.location.pathname + window.location.search);
   return sessionToken;
 }
 
-let tokenPromise: Promise<string | null> | null = null;
+let tokenPromise: Promise<string> | null = null;
 
-function sessionToken(): Promise<string | null> {
+function sessionToken(): Promise<string> {
   tokenPromise ??= bootstrapToken();
   return tokenPromise;
 }
 
 async function get<T>(path: string): Promise<T> {
   const token = await sessionToken();
-  if (!token) throw new ApiError(401, "no session token — reopen from `hx ui`");
   const res = await fetch(path, { headers: { "x-hx-ui-token": token } });
   if (!res.ok) throw new ApiError(res.status, `${path} → ${res.status}`);
   return (await res.json()) as T;
@@ -199,7 +217,6 @@ async function get<T>(path: string): Promise<T> {
 
 async function post<T>(path: string, body?: unknown): Promise<T> {
   const token = await sessionToken();
-  if (!token) throw new ApiError(401, "no session token — reopen from `hx ui`");
   const res = await fetch(path, {
     method: "POST",
     headers: {

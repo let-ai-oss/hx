@@ -48,7 +48,12 @@ export function hmacProof(ownerKey: string, label: string, nonce: string): strin
   return createHmac("sha256", ownerKey).update(`${label}:${nonce}`).digest("base64url");
 }
 
-const LAUNCH_TTL_MS = 5 * 60_000;
+// The launch token lives in the terminal (and, on auto-open, briefly in the
+// browser-opener argv) until the page exchanges it. Auto-open consumes it in
+// ~1s, so this window rarely matters — but the printed link is meant to be
+// openable manually/later, so keep it generous (an hour). Single-use is the
+// real replay protection; this only bounds a token that's never consumed.
+export const LAUNCH_TTL_MS = 60 * 60_000;
 
 export interface UiAuth {
   /** Same-uid ownership secret; lives only in the 0600 server-info file. */

@@ -2,6 +2,7 @@ import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import {
   CLIENT_PROOF_LABEL,
+  LAUNCH_TTL_MS,
   SERVER_PROOF_LABEL,
   createUiAuth,
   hmacProof,
@@ -49,13 +50,13 @@ describe("createUiAuth — launch tokens are single-use + short-TTL", () => {
     assert.equal(auth.exchange(a), auth.sessionToken); // b's use didn't consume a
   });
 
-  it("rejects an expired launch token (5-min TTL)", () => {
+  it("rejects a launch token past its TTL", () => {
     const auth = createUiAuth();
     const t0 = 1_000_000;
     const lt = auth.mintLaunchToken(t0);
-    assert.equal(auth.exchange(lt, t0 + 5 * 60_000 + 1), null); // expired
+    assert.equal(auth.exchange(lt, t0 + LAUNCH_TTL_MS + 1), null); // expired
     const lt2 = auth.mintLaunchToken(t0);
-    assert.equal(auth.exchange(lt2, t0 + 60_000), auth.sessionToken); // within window
+    assert.equal(auth.exchange(lt2, t0 + LAUNCH_TTL_MS - 1), auth.sessionToken); // within window
   });
 
   it("validates only the session token, never a launch token or the owner key", () => {

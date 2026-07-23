@@ -2,8 +2,10 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { flushSync } from "react-dom";
 import {
   api,
+  authErrorKind,
   subscribeEvents,
   type ActivityEntry,
+  type AuthErrorKind,
   type DestinationInfo,
   type FolderInfo,
   type LogLine,
@@ -73,6 +75,7 @@ interface AppState {
   snap: Snapshot | null;
   loading: boolean;
   error: string | null;
+  authError: AuthErrorKind | null;
   email: string | null;
   probe: ProbeInfo | null;
   probing: boolean;
@@ -153,6 +156,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<AuthErrorKind | null>(null);
   const [email, setEmail] = useState<string | null>(null);
   const [probe, setProbe] = useState<ProbeInfo | null>(null);
   const [probing, setProbing] = useState(false);
@@ -181,9 +185,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (!alive) return;
         setSnap(s);
         setError(null);
+        setAuthError(null);
       } catch (e) {
         if (!alive) return;
         setError((e as Error).message);
+        setAuthError(authErrorKind(e));
       } finally {
         if (alive) setLoading(false);
       }
@@ -516,7 +522,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     doctorOpen, setDoctorOpen,
     kbdOpen, setKbdOpen, inspOpen, setInspOpen, inspInitialPath, openInspector,
     logFull, setLogFull,
-    snap, loading, error, email,
+    snap, loading, error, authError, email,
     probe, probing, runProbe,
     logs,
     activity,

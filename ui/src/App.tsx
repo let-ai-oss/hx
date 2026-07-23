@@ -15,7 +15,7 @@ import { InspectorModal } from "./modals/InspectorModal";
 import { ConfirmModal } from "./modals/ConfirmModal";
 
 function Chrome() {
-  const { snap, error, loading } = useApp();
+  const { snap, error, authError, loading } = useApp();
   const deviceName = snap?.device.name;
   useEffect(() => {
     document.title = deviceName ? `HX Client — ${deviceName}` : "HX Client";
@@ -24,10 +24,28 @@ function Chrome() {
     return <div className="bootstate">Loading…</div>;
   }
   if (error && !snap) {
+    // Distinguish a stale/missing one-time key (the server is fine — the LINK
+    // isn't) from the server actually being unreachable.
+    if (authError === "link-expired") {
+      return (
+        <div className="bootstate">
+          <b>This link has already been used or expired.</b>
+          <p>Run <code className="hx">hx ui</code> again in your terminal and open the fresh link it prints — each link carries a one-time key.</p>
+        </div>
+      );
+    }
+    if (authError === "no-key") {
+      return (
+        <div className="bootstate">
+          <b>Open the link <code className="hx">hx ui</code> printed.</b>
+          <p>This page needs the one-time key in that link’s address — a bare <span className="mono">localhost</span> address or a new tab won’t have it.</p>
+        </div>
+      );
+    }
     return (
       <div className="bootstate">
         <b>Can’t reach the hx ui server.</b>
-        <p>Start it with <code className="hx">hx ui</code> and open the printed link — the address bar link carries a one-time key this page needs.</p>
+        <p>Make sure <code className="hx">hx ui</code> is still running, then open the link it printed.</p>
       </div>
     );
   }
