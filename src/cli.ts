@@ -33,7 +33,7 @@ import { watch as watchDir } from "node:fs";
 import { HX_DIR } from "./hx-home.js";
 import { openBrowser } from "./browser.js";
 import { loadUiAssets } from "./ui/assets.js";
-import { createUiAuth } from "./ui/auth.js";
+import { createUiAuth, LAUNCH_TTL_MS } from "./ui/auth.js";
 import {
   probeExistingInstance,
   readServerInfo,
@@ -883,6 +883,15 @@ async function cmdUninstall(): Promise<void> {
 const UI_DEFAULT_PORT = 8000;
 const UI_PORT_SCAN_SPAN = 20;
 
+// One line under the launch URL. The TTL and single-use apply to OPENING the
+// link — once open, the tab stays signed in until the server stops. Derived
+// from the auth TTL so the message can't drift from the real value.
+function launchLinkNote(): string {
+  const h = LAUNCH_TTL_MS / 3_600_000;
+  const ttl = h >= 1 && Number.isInteger(h) ? `${h}h` : `${Math.round(LAUNCH_TTL_MS / 60_000)} min`;
+  return `[hx]   open this link within ${ttl} (single-use); once open, the tab stays signed in until you stop hx ui`;
+}
+
 async function cmdUi(): Promise<void> {
   const portFlag = flag("port");
   let requested: number | null = null;
@@ -981,6 +990,7 @@ async function cmdUi(): Promise<void> {
       const alive = await probeExistingInstance(existing);
       if (alive) {
         log(`[hx] HX Client UI already running at ${alive.url}`);
+        log(launchLinkNote());
         if (!hasFlag("no-open")) openBrowser(alive.url);
         return;
       }
@@ -1033,6 +1043,7 @@ async function cmdUi(): Promise<void> {
 
   const launchUrl = `http://localhost:${port}/#k=${auth.mintLaunchToken()}`;
   log(`[hx] HX Client UI → ${launchUrl}`);
+  log(launchLinkNote());
   if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
   log(`[hx] Ctrl+C to stop`);
   if (!hasFlag("no-open")) openBrowser(launchUrl);
