@@ -5,13 +5,15 @@
 // loopback, so your host browser can't reach it — the page never loads. To make
 // a published port (`docker run -p 8000:8000`) actually forward to us, we must
 // listen on a wildcard instead. We bind "::" (dual-stack IPv4+IPv6, with an
-// IPv4-only "0.0.0.0" fallback if the container has no IPv6 — see tryServeUi)
-// rather than plain IPv4: Docker Desktop also publishes the port on the host's
-// IPv6, and "localhost" resolves to IPv6 (::1) first on Windows — an IPv4-only
-// listener leaves that path with no backend and the browser gets an empty
-// response. Dual-stack makes `localhost` work like it does for any normal
-// container. We switch this bind automatically on detecting a container, so
-// plain `hx ui` keeps working with no extra flags.
+// IPv4-only "0.0.0.0" fallback if the container has no IPv6 — see tryServeUi) so
+// an IPv6 client can reach us wherever the platform actually forwards IPv6 (e.g.
+// native Linux Docker). But the link `hx ui` PRINTS uses 127.0.0.1, not
+// localhost (see cli.ts `uiHost`): Docker Desktop (Windows/macOS) also publishes
+// the port on the host's IPv6, and "localhost" resolves to IPv6 (::1) first
+// there — Docker Desktop accepts that IPv6 connection then drops it (its IPv6
+// forwarding is unreliable), so the browser gets an empty response. The 127.0.0.1
+// literal forces the IPv4 path, which works on every platform. We switch this
+// bind automatically on detecting a container, so plain `hx ui` needs no flags.
 //
 // Is auto-binding a wildcard a security downgrade? No. The bind address only picks
 // which interfaces the socket listens on; it is NOT the access boundary. Two

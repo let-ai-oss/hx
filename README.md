@@ -131,16 +131,17 @@ the background mirror is unaffected.
 **In a container**, your browser is on the host, so `hx ui` detects the
 container and binds a wildcard (`::`, dual-stack — falling back to IPv4 `0.0.0.0`
 if the container has no IPv6) instead of the container's unreachable loopback,
-then prints how to open it — copy the printed `http://localhost:8000/…` link
-into your **host** browser. That requires the container to publish the port,
-e.g. `docker run -p 8000:8000 …` (a running container can't have `-p` added;
-recreate it). Dual-stack matters because Docker Desktop also publishes on the
-host's IPv6 and `localhost` resolves to IPv6 first on Windows — an IPv4-only
-listener would leave that path with no backend (an empty response). The wider
-bind is not a wider door: every request still passes the Host allowlist and
-carries the one-time key, so a hit on the raw container IP is refused, and
-nothing leaves the container unless you publish the port yourself. Works the
-same on Docker Desktop (macOS/Windows/WSL2), native Linux Docker, and Podman. Settings changes land in
+then prints a `http://127.0.0.1:8000/…` link — copy it into your **host**
+browser. That requires the container to publish the port, e.g. `docker run -p
+8000:8000 …` (a running container can't have `-p` added; recreate it). The link
+uses `127.0.0.1`, not `localhost`, on purpose: Docker Desktop (Windows/macOS)
+also publishes on the host's IPv6 and `localhost` resolves to IPv6 (`::1`) first
+there, but its IPv6 forwarding accepts the connection then drops it — the IPv4
+literal takes the path that works on every platform. The wider bind is not a
+wider door: every request still passes the Host allowlist and carries the
+one-time key, so a hit on the raw container IP is refused, and nothing leaves
+the container unless you publish the port yourself. Works the same on Docker
+Desktop (macOS/Windows/WSL2), native Linux Docker, and Podman. Settings changes land in
 `~/.let/hx/settings.json` and the daemon honors them within one poll interval
 (also visible to `hx status`, e.g. a `Paused` row).
 
