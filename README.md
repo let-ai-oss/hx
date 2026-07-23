@@ -129,14 +129,18 @@ ui` reuses the running instance instead of racing it. Ctrl-C stops the server;
 the background mirror is unaffected.
 
 **In a container**, your browser is on the host, so `hx ui` detects the
-container and binds `0.0.0.0` (instead of the container's unreachable loopback)
-and prints how to open it — copy the printed link into your **host** browser.
-That requires the container to publish the port, e.g. `docker run -p 8000:8000
-…` (a running container can't have `-p` added; recreate it). The wider bind is
-not a wider door: every request still passes the Host allowlist and carries the
-one-time key, so a hit on the raw container IP is refused, and nothing leaves
-the container unless you publish the port yourself. Works the same on Docker
-Desktop (macOS/Windows/WSL2), native Linux Docker, and Podman. Settings changes land in
+container and binds a wildcard (`::`, dual-stack — falling back to IPv4 `0.0.0.0`
+if the container has no IPv6) instead of the container's unreachable loopback,
+then prints how to open it — copy the printed `http://localhost:8000/…` link
+into your **host** browser. That requires the container to publish the port,
+e.g. `docker run -p 8000:8000 …` (a running container can't have `-p` added;
+recreate it). Dual-stack matters because Docker Desktop also publishes on the
+host's IPv6 and `localhost` resolves to IPv6 first on Windows — an IPv4-only
+listener would leave that path with no backend (an empty response). The wider
+bind is not a wider door: every request still passes the Host allowlist and
+carries the one-time key, so a hit on the raw container IP is refused, and
+nothing leaves the container unless you publish the port yourself. Works the
+same on Docker Desktop (macOS/Windows/WSL2), native Linux Docker, and Podman. Settings changes land in
 `~/.let/hx/settings.json` and the daemon honors them within one poll interval
 (also visible to `hx status`, e.g. a `Paused` row).
 

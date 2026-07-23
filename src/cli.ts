@@ -917,12 +917,16 @@ async function cmdUi(): Promise<void> {
   const basePort = requested ?? UI_DEFAULT_PORT;
 
   // In a container, the browser lives on the HOST, so loopback is unreachable —
-  // bind 0.0.0.0 so a published port (`docker run -p`) forwards in. The Host
-  // allowlist + token still gate every request, so this widens nothing that
-  // matters (see ui/container.ts). On a normal host this stays loopback and the
-  // whole flow below is exactly as it was.
+  // bind a wildcard so a published port (`docker run -p`) forwards in. Use "::"
+  // (dual-stack IPv4+IPv6, with an IPv4-only fallback in tryServeUi) rather than
+  // "0.0.0.0": Docker Desktop also publishes the port on the host's IPv6, and
+  // "localhost" resolves to IPv6 (::1) first on Windows — an IPv4-only listener
+  // leaves that path with no backend, so the browser gets ERR_EMPTY_RESPONSE.
+  // Dual-stack lets `localhost` work like it does for any normal container. The
+  // Host allowlist + token gate every request regardless of family (see
+  // ui/container.ts). On a normal host this stays loopback, flow unchanged.
   const inContainer = isInsideContainer();
-  const bindHost = inContainer ? "0.0.0.0" : "127.0.0.1";
+  const bindHost = inContainer ? "::" : "127.0.0.1";
 
   const providers: UiProviders = {
     snapshot: () => buildSnapshot(),

@@ -339,10 +339,12 @@ function sseResponse(hub: UiEventHub): Response {
  * taken (the caller decides between instance-reuse and scanning); rethrows
  * anything else (EACCES and friends are real errors, not "try the next port").
  *
- * `hostname` is 127.0.0.1 on a normal host; `hx ui` passes 0.0.0.0 only when it
- * detects a container, so a published port can forward in. The bind address is
- * not an access boundary — the Host allowlist and token gate every request
- * regardless of it (see container.ts / SECURITY.md).
+ * `hostname` is 127.0.0.1 on a normal host; `hx ui` passes "::" only when it
+ * detects a container, so a published port can forward in over either IP family
+ * (dual-stack). If the container has no IPv6, the "::" bind fails and we retry
+ * IPv4-only ("0.0.0.0"). The bind address is not an access boundary — the Host
+ * allowlist and token gate every request regardless of it (see container.ts /
+ * SECURITY.md).
  */
 export function tryServeUi(
   port: number,
@@ -354,16 +356,22 @@ export function tryServeUi(
   hostname = "127.0.0.1",
 ): Server<undefined> | null {
   const ctx: UiServerCtx = { auth, assets, providers, actions, events, port };
-  try {
-    return Bun.serve({
-      hostname,
-      port,
-      // SSE streams ride this connection later; pings stay well under it.
-      idleTimeout: 120,
-      fetch: (req) => handleUiRequest(req, ctx),
-    });
-  } catch (err) {
-    if ((err as { code?: string }).code === "EADDRINUSE") return null;
-    throw err;
-  }
+  const serveOn = (host: string): Server<undefined> | null => {
+    try {
+      return Bun.serve({
+        hostname: host,
+        port,
+        // SSE streams ride this connection later; pings stay well under it.
+        idleTimeout: 120,
+        fetch: (req) => handleUiRequest(req, ctx),
+      });
+    } catch (err) {
+      if ((err as { code?: string }).code === "EADDRINUSE") return null; // port taken
+      // A container without IPv6 can't bind "::" — fall back to IPv4-only so hx
+      // still comes up (localhost may then need 127.0.0.1, but it runs).
+      if (host === "::") return serveOn("0.0.0.0");
+      throw err;
+    }
+  };
+  return serveOn(hostname);
 }
