@@ -14,7 +14,7 @@ function probeLine(p: ProbeInfo | null, probing: boolean): { v: string; vs: stri
 
 export function DeviceDetail() {
   const {
-    view, goto, snap, email, doctorOpen, setDoctorOpen, activeFolders, probe, probing, runProbe,
+    view, goto, snap, email, activeFolders, probe, probing, runProbe,
     daemonAct, retryBlockedAct, update, checkUpdate, runUpdateAct,
   } = useApp();
   const [copied, setCopied] = useState(false);
@@ -43,7 +43,7 @@ export function DeviceDetail() {
   const daemon = device?.daemon;
   const running = Boolean(daemon?.loaded && daemon.pid);
   const doctor = snap?.doctor;
-  const waiting = (snap?.sync.behind ?? 0) + (snap?.sync.waiting ?? 0);
+  const waiting = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
   const q = probeLine(probe, probing);
   const nextRetry = doctor?.blockers.map((b) => b.nextRetryAtMs ?? 0).filter((t) => t > 0).sort()[0];
 
@@ -167,14 +167,13 @@ export function DeviceDetail() {
         </div>
       </div>
 
-      <div className="panel">
-        <h2>Maintenance</h2>
-        <div className="setrow">
-          <div className="txt"><b>Sync Doctor</b><p>Explains anything that isn’t syncing — which sessions are held, at which destination, since when, and any gaps the sync bar can’t see.</p></div>
-          <button className="btn ghost" id="doctorBtn" onClick={() => setDoctorOpen(!doctorOpen)}>Run Sync Doctor</button>
-        </div>
-        <div id="doctorOut" style={{ display: doctorOpen && doctor ? "" : "none", padding: "4px 0 14px" }}>
-          {doctor && (
+      <div className="panel" id="doctorSection">
+        <h2>Sync Doctor</h2>
+        <div className="h2sub">Live — anything that isn’t syncing (which sessions are held, at which destination, since when) and any gaps the sync bar can’t see. Updates on its own.</div>
+        <div id="doctorOut" style={{ padding: "8px 0 4px" }}>
+          {!doctor ? (
+            <div className="rowlist"><div className="row"><div className="who"><b>Loading…</b></div></div></div>
+          ) : (
             <div className="rowlist">
               <div className="row">
                 <span className={`dot${doctor.sync.percent < 100 ? " warn" : ""}`}></span>
@@ -215,7 +214,7 @@ export function DeviceDetail() {
           <summary>Prefer the command line?</summary>
           <p style={{ fontSize: 14.5, color: "var(--text-muted)", margin: "4px 0 10px" }}>Everything in this app is also <code className="hx">hx</code> in a terminal:</p>
           <div className="clirow"><span className="c">hx status</span><span className="d">The Overview — account, gateway, daemon, connection quality, sync progress.</span></div>
-          <div className="clirow"><span className="c">hx doctor sync</span><span className="d">“Run Sync Doctor” above — blocked sessions, gaps, and the fix (add <span className="mono">--json</span> for automation).</span></div>
+          <div className="clirow"><span className="c">hx doctor sync</span><span className="d">The Sync Doctor section above — blocked sessions, gaps, and the fix (add <span className="mono">--json</span> for automation).</span></div>
           <div className="clirow"><span className="c">hx retry --blocked</span><span className="d">Clear destination backoff and retry immediately.</span></div>
           <div className="clirow"><span className="c">hx logs</span><span className="d">Client Logs, as a live tail of the same files.</span></div>
           <div className="clirow"><span className="c">hx start · stop · restart</span><span className="d">The background mirror service.</span></div>

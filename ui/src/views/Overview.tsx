@@ -25,7 +25,12 @@ export function Overview() {
   const personalDests = destinations.filter((d) => d.personal);
   const doctor = snap?.doctor;
   const caughtUp = doctor ? doctor.ok && doctor.sync.done >= doctor.sync.total : null;
-  const waiting = (snap?.sync.behind ?? 0) + (snap?.sync.waiting ?? 0);
+  // Sessions not yet fully mirrored = total − done. This is the honest
+  // "in flight" number: it includes a session that's simply mid-upload (a
+  // growing/active transcript), not only ones held on an offline store — so
+  // "not caught up" and "nothing in flight" can never contradict each other.
+  const inFlight = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
+  const held = snap?.sync.waiting ?? 0; // held on an unavailable store (subset)
   const firstUnlinked = unlinkedFolders[0];
   const daemon = snap?.device.daemon;
 
@@ -84,16 +89,16 @@ export function Overview() {
             {caughtUp === false && doctor ? (
               <>
                 <b>{doctor.sync.done} of {doctor.sync.total} sessions mirrored ({doctor.sync.percent}%).</b>
-                <div style={{ marginTop: 6 }}>{doctor.blockedSessions > 0 ? `${plural(doctor.blockedSessions, "session")} held at a destination — ` : "The rest is in flight — "}Sync Doctor (Device Detail → Maintenance) explains exactly what’s pending and why.</div>
+                <div style={{ marginTop: 6 }}>{doctor.blockedSessions > 0 ? `${plural(doctor.blockedSessions, "session")} held at a destination — ` : "The rest is still uploading — an active session is normally a little behind. "}Device Detail → Sync Doctor explains exactly what’s pending and why.</div>
               </>
             ) : (
               <>
                 <b>Everything on this machine is mirrored.</b>
-                <div style={{ marginTop: 6 }}>All {snap?.sync.total ?? 0} sessions are safely stored at their destinations. If this ever says <b>No</b>, this card explains what’s blocked, and Sync Doctor (Device Detail → Maintenance) walks through the fix.</div>
+                <div style={{ marginTop: 6 }}>All {snap?.sync.total ?? 0} sessions are safely stored at their destinations. If this ever says <b>No</b>, this card explains what’s pending, and Device Detail → Sync Doctor walks through the fix.</div>
               </>
             )}
           </div></span></div>
-          <div className="sub">{waiting > 0 ? `${waiting} sending now` : "nothing in flight"}</div>
+          <div className="sub">{inFlight > 0 ? (held > 0 ? `${plural(held, "session")} held` : `${plural(inFlight, "session")} still syncing`) : "nothing in flight"}</div>
         </div>
       </div>
 
@@ -148,7 +153,7 @@ export function Overview() {
           <h2>Right Now</h2>
           <div className="facts">
             <div className="frw"><span className="k">Mirror</span><span><span className="v">{daemon ? (daemon.loaded && daemon.pid ? "Running" : "Stopped") : "…"}</span><div className="vs">{daemon?.pid ? `${daemon.managerName} · pid ${daemon.pid}` : daemon?.managerName ?? ""}</div></span></div>
-            <div className="frw"><span className="k">Waiting to send</span><span><span className="v">{waiting > 0 ? plural(waiting, "session") : "nothing"}</span><div className="vs">{waiting > 0 ? "uploads on the next pass" : "fully caught up"}</div></span></div>
+            <div className="frw"><span className="k">Still syncing</span><span><span className="v">{inFlight > 0 ? plural(inFlight, "session") : "nothing"}</span><div className="vs">{inFlight > 0 ? (held > 0 ? `${held} held on an offline store` : "finishing on the next pass") : "fully caught up"}</div></span></div>
             <div className="frw"><span className="k">Last upload</span><span><span className="v">{fmtRelative(snap?.sync.lastUploadAtMs ?? 0)}</span></span></div>
             <div className="frw"><span className="k">What’s uploaded</span><span><span className="v"><a href="#" onClick={(e) => { e.preventDefault(); goto("privacy"); }}>See what leaves this machine</a></span></span></div>
           </div>

@@ -60,8 +60,6 @@ interface AppState {
   openRows: Set<string>;
   toggleRow: (id: string) => void;
 
-  doctorOpen: boolean;
-  setDoctorOpen: (b: boolean) => void;
   kbdOpen: boolean;
   setKbdOpen: (b: boolean) => void;
   inspOpen: boolean;
@@ -142,7 +140,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [groupBy, setGroupByState] = useState<GroupBy>("tool");
   const [query, setQueryState] = useState("");
   const [openRows, setOpenRows] = useState<Set<string>>(new Set());
-  const [doctorOpen, setDoctorOpen] = useState(false);
   const [kbdOpen, setKbdOpen] = useState(false);
   const [inspOpen, setInspOpen] = useState(false);
   const [inspInitialPath, setInspInitialPath] = useState<string | null>(null);
@@ -477,12 +474,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   };
 
   const jumpDoctor = () => {
-    flushSync(() => {
-      setView("device");
-      setDoctorOpen(true);
-    });
+    flushSync(() => setView("device"));
     window.scrollTo(0, 0);
-    const mp = document.getElementById("doctorBtn")?.closest(".panel");
+    const mp = document.getElementById("doctorSection");
     if (mp) {
       mp.scrollIntoView({ behavior: "smooth", block: "center" });
       retrigger(mp, "flash");
@@ -519,7 +513,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const value: AppState = {
     view, goto, currentDest, openDest,
     groupBy, setGroupBy, query, setQuery, openRows, toggleRow,
-    doctorOpen, setDoctorOpen,
     kbdOpen, setKbdOpen, inspOpen, setInspOpen, inspInitialPath, openInspector,
     logFull, setLogFull,
     snap, loading, error, authError, email,

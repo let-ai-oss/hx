@@ -24,7 +24,7 @@ export function Topbar() {
   const up = connected && running;
   const label = !device ? "…" : !connected ? "Not connected" : running ? "Connected" : "Mirror stopped";
   const deviceName = device?.name ?? "this device";
-  const waiting = (snap?.sync.behind ?? 0) + (snap?.sync.waiting ?? 0);
+  const waiting = Math.max(0, (snap?.sync.total ?? 0) - (snap?.sync.done ?? 0));
   const initials = email ? email.slice(0, 2).toUpperCase() : "–";
 
   return (

@@ -70,7 +70,10 @@ export function SyncStatus() {
 
   const sync = snap?.sync;
   const doctor = snap?.doctor;
-  const waiting = (sync?.behind ?? 0) + (sync?.waiting ?? 0);
+  // Not yet fully mirrored = total − done (includes actively-uploading
+  // sessions, not only ones held on an offline store), so the count agrees
+  // with the "N of M mirrored" doctor line.
+  const waiting = Math.max(0, (sync?.total ?? 0) - (sync?.done ?? 0));
   const recent = snap?.recent ?? [];
   const last = recent[0];
   const destLabel = (key: string) => destinations.find((d) => d.key === key)?.label ?? key;
@@ -100,7 +103,7 @@ export function SyncStatus() {
         <div className="stat"><span className="lbl">{activity && activity.length > 0 ? "Sent today" : "Waiting"}</span>
           {activity && activity.length > 0
             ? <><div className="big">{todaySessions}</div><div className="sub">{todaySessions > 0 ? `sessions · ${fmtBytes(todayBytes)}` : "nothing yet today"}</div></>
-            : <><div className="big">{sync ? waiting : "…"}</div><div className="sub">{waiting > 0 ? "uploads on the next pass" : "nothing queued"}</div></>}
+            : <><div className="big">{sync ? waiting : "…"}</div><div className="sub">{waiting > 0 ? "still syncing" : "nothing queued"}</div></>}
         </div>
         <div className="stat"><span className="lbl">Last sent</span><div className="big">{fmtRelative(sync?.lastUploadAtMs ?? 0).replace(" ago", "")}</div><div className="sub">{last ? `ago, to ${last.dests.map(destLabel).join(" · ")}` : "ago"}</div></div>
       </div>
