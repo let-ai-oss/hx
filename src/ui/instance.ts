@@ -88,6 +88,7 @@ const PROBE_TIMEOUT_MS = 1_500;
 export async function probeExistingInstance(
   info: ServerInfo,
   fetcher: typeof fetch = fetch,
+  uiHost = "localhost",
 ): Promise<{ url: string } | null> {
   const base = `http://127.0.0.1:${info.port}`;
   const nonce = randomBytes(18).toString("base64url");
@@ -112,7 +113,7 @@ export async function probeExistingInstance(
       return null;
     }
     if (!/^[A-Za-z0-9_-]+$/.test(body.launchToken)) return null;
-    return { url: `http://localhost:${info.port}/#k=${body.launchToken}` };
+    return { url: `http://${uiHost}:${info.port}/#k=${body.launchToken}` };
   } catch {
     return null;
   }
