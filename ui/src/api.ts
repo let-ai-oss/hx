@@ -196,8 +196,9 @@ async function bootstrapToken(): Promise<string> {
     // The exchange couldn't reach the server at all.
     throw new ApiError(0, "cannot reach the hx ui server", "network");
   }
-  // Server answered but rejected the key: it was already used or has expired.
-  if (res.status === 401) throw new ApiError(401, "link already used or expired", "link-expired");
+  // Server answered but rejected the key: it has expired (or is from an
+  // earlier `hx ui` run).
+  if (res.status === 401) throw new ApiError(401, "link expired", "link-expired");
   if (!res.ok) throw new ApiError(res.status, `auth → ${res.status}`, "link-expired");
   const { sessionToken } = (await res.json()) as { sessionToken: string };
   sessionStorage.setItem(TOKEN_KEY, sessionToken);

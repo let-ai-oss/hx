@@ -29,8 +29,8 @@ function Chrome() {
     if (authError === "link-expired") {
       return (
         <div className="bootstate">
-          <b>This link has already been used or expired.</b>
-          <p>Run <code className="hx">hx ui</code> again in your terminal and open the fresh link it prints — each link carries a one-time key.</p>
+          <b>This sign-in link has expired.</b>
+          <p>Run <code className="hx">hx ui</code> again in your terminal and open the fresh link it prints (each link is valid for an hour).</p>
         </div>
       );
     }

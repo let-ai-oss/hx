@@ -9,10 +9,12 @@
 // dev server would receive them), while a header bound to the page's origin
 // is port-scoped and CSRF-proof by construction.
 //
-// The launch token is SINGLE-USE and short-lived: the browser opener passes it
-// as a process argv (world-readable via /proc on a shared host), so it must not
-// be replayable — the first exchange consumes it, and it expires quickly if
-// never consumed. It is minted fresh per browser-open, never reused.
+// The launch token is REUSABLE within a short TTL (1h). It is NOT single-use:
+// containers, link-preview/unfurl, prefetch, and multi-tab all commonly fetch
+// the link more than once, and a single-use token turns the second fetch into
+// a "link expired" error. The TTL bounds how long a token an attacker captured
+// (e.g. from the browser-opener argv on a shared multi-user host) stays valid;
+// see SECURITY.md for that residual. A fresh token is minted per browser-open.
 //
 // Ownership (the "is that instance really mine?" question a second `hx ui`
 // asks) rides a separate per-run OWNER KEY that lives ONLY in the 0600
@@ -59,9 +61,10 @@ export interface UiAuth {
   /** Same-uid ownership secret; lives only in the 0600 server-info file. */
   readonly ownerKey: string;
   readonly sessionToken: string;
-  /** Mint a fresh single-use, short-TTL launch token for one browser open. */
+  /** Mint a fresh short-TTL launch token for one browser open. */
   mintLaunchToken(nowMs?: number): string;
-  /** POST /api/auth: consume a launch token (once), return the session token. */
+  /** POST /api/auth: a valid, unexpired launch token → the session token.
+   *  Reusable within the token's TTL (not consumed on use). */
   exchange(launchToken: string | null, nowMs?: number): string | null;
   /** Gate for /api/* requests: the x-hx-ui-token header value. */
   isValidSession(headerToken: string | null): boolean;
@@ -99,13 +102,11 @@ export function createUiAuth(): UiAuth {
     exchange(candidate, nowMs = Date.now()) {
       if (!candidate) return null;
       const cand = createHash("sha256").update(candidate).digest();
-      for (let i = 0; i < launch.length; i++) {
-        const entry = launch[i]!;
+      for (const entry of launch) {
         if (entry.expiresAt <= nowMs) continue;
-        if (timingSafeEqual(cand, entry.digest)) {
-          launch.splice(i, 1); // single-use
-          return sessionToken;
-        }
+        // Reusable within the TTL — do NOT consume, so a preview/prefetch that
+        // hits the link first doesn't lock the real page out.
+        if (timingSafeEqual(cand, entry.digest)) return sessionToken;
       }
       return null;
     },

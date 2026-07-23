@@ -883,13 +883,13 @@ async function cmdUninstall(): Promise<void> {
 const UI_DEFAULT_PORT = 8000;
 const UI_PORT_SCAN_SPAN = 20;
 
-// One line under the launch URL. The TTL and single-use apply to OPENING the
-// link — once open, the tab stays signed in until the server stops. Derived
-// from the auth TTL so the message can't drift from the real value.
+// One line under the launch URL. The TTL applies to OPENING the link — once
+// open, the tab stays signed in until the server stops. Derived from the auth
+// TTL so the message can't drift from the real value.
 function launchLinkNote(): string {
   const h = LAUNCH_TTL_MS / 3_600_000;
   const ttl = h >= 1 && Number.isInteger(h) ? `${h}h` : `${Math.round(LAUNCH_TTL_MS / 60_000)} min`;
-  return `[hx]   open this link within ${ttl} (single-use); once open, the tab stays signed in until you stop hx ui`;
+  return `[hx]   open this link within ${ttl} to sign in; once open, the tab stays signed in until you stop hx ui`;
 }
 
 async function cmdUi(): Promise<void> {
