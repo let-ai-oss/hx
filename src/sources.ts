@@ -365,7 +365,11 @@ export interface HeadMeta {
   title: string | null;
 }
 
-export async function readHead(filePath: string, source: "claude" | "codex"): Promise<HeadMeta> {
+export async function readHead(
+  filePath: string,
+  source: "claude" | "codex",
+  opts: { resolveRepoFromDisk?: boolean } = {},
+): Promise<HeadMeta> {
   const out: HeadMeta = {
     sessionId: null,
     family: "unknown",
@@ -443,8 +447,14 @@ export async function readHead(filePath: string, source: "claude" | "codex"): Pr
     }
   }
 
-  // Derive the GitHub repo from the session's cwd (best-effort, fully local).
-  if (out.cwd) {
+  // Derive the GitHub repo from the session's cwd by walking up to `.git` on
+  // disk. This is the ONLY step here that touches the real working directory.
+  // The daemon needs the slug to route uploads and persists it to state.json;
+  // the UI passes resolveRepoFromDisk:false and reads that cached slug instead.
+  // Re-walking from the UI would re-enter the user's project folders — some
+  // under macOS-protected roots (Documents/Desktop/Downloads) — and fire a
+  // redundant TCC prompt for a value the daemon has already resolved.
+  if (out.cwd && opts.resolveRepoFromDisk !== false) {
     out.repoSlug = await detectRepoSlug(out.cwd);
   }
 

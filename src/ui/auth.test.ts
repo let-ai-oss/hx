@@ -32,13 +32,15 @@ describe("tokensMatch", () => {
   });
 });
 
-describe("createUiAuth — launch tokens are single-use + short-TTL", () => {
-  it("exchanges a minted launch token exactly once", () => {
+describe("createUiAuth — launch tokens are reusable within a short TTL", () => {
+  it("exchanges a minted launch token repeatedly while it's valid", () => {
     const auth = createUiAuth();
     assert.equal(auth.exchange("wrong"), null);
     const lt = auth.mintLaunchToken();
+    // Reusable — a preview/prefetch and the real page load both succeed.
     assert.equal(auth.exchange(lt), auth.sessionToken);
-    assert.equal(auth.exchange(lt), null); // consumed — replay rejected
+    assert.equal(auth.exchange(lt), auth.sessionToken);
+    assert.equal(auth.exchange(lt), auth.sessionToken);
   });
 
   it("mints distinct tokens; each is independently valid until used", () => {

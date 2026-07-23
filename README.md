@@ -123,10 +123,20 @@ per-folder exclusions, future-folder rules, a personal-sessions gate), daemon
 lifecycle controls, Sync Doctor, self-update, and a live log tail.
 
 The app is embedded in the `hx` binary and served from `http://localhost:8000`
-(loopback only; `--port` if 8000 is busy — by default hx scans forward and
-says so). The printed URL carries a one-time key — open exactly that link; a
-second `hx ui` reuses the running instance instead of racing it. Ctrl-C stops
-the server; the background mirror is unaffected. Settings changes land in
+(loopback; `--port` if 8000 is busy — by default hx scans forward and says so).
+The printed URL carries a one-time key — open exactly that link; a second `hx
+ui` reuses the running instance instead of racing it. Ctrl-C stops the server;
+the background mirror is unaffected.
+
+**In a container**, your browser is on the host, so `hx ui` detects the
+container and binds `0.0.0.0` (instead of the container's unreachable loopback)
+and prints how to open it — copy the printed link into your **host** browser.
+That requires the container to publish the port, e.g. `docker run -p 8000:8000
+…` (a running container can't have `-p` added; recreate it). The wider bind is
+not a wider door: every request still passes the Host allowlist and carries the
+one-time key, so a hit on the raw container IP is refused, and nothing leaves
+the container unless you publish the port yourself. Works the same on Docker
+Desktop (macOS/Windows/WSL2), native Linux Docker, and Podman. Settings changes land in
 `~/.let/hx/settings.json` and the daemon honors them within one poll interval
 (also visible to `hx status`, e.g. a `Paused` row).
 

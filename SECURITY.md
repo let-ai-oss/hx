@@ -50,13 +50,28 @@ attacks. The gateway/host lives in `hx-fortress`; the wire protocol in
 
 ### Local web UI (`hx ui`)
 
-`hx ui` serves the HX Client web app from the binary over plain HTTP bound to
-`127.0.0.1` only. Loopback is a browser-trusted origin, so no certificate is
-involved; nothing ever listens on a non-loopback interface. Its API is gated
-by a per-run bearer token: the launch URL carries a one-time key in the URL
-fragment (never sent on the wire), the page exchanges it for a session token
-held in `sessionStorage` and sent via a custom header — deliberately not a
-cookie, since localhost cookies are shared across every port. All requests
+`hx ui` serves the HX Client web app from the binary over plain HTTP. On a
+normal host it binds `127.0.0.1` only. Inside a container it binds `0.0.0.0`
+instead — the container's loopback is unreachable from the host browser, so a
+published port (`docker run -p`) needs a non-loopback listener to forward into.
+The bind address is **not** the access boundary. The Host allowlist rejects
+browser DNS-rebinding and any raw-container-IP request (403); a non-browser peer
+on the same bridge can forge `Host: localhost` and reach the socket, but the
+per-run bearer token — 256-bit, never sent to a peer — gates every data and
+action endpoint, so such a peer gets only the data-free static shell and a
+version string. Nothing crosses the container boundary unless the operator
+publishes the port (an explicit gesture); note `docker run --network host`
+shares the host netns, so `0.0.0.0` is then a real LAN bind (still token-gated).
+Loopback is a browser-trusted origin, so no certificate is involved. The API is
+gated by a per-run bearer token: the launch URL carries a key in the URL fragment
+(never sent on the wire), the page exchanges it for a session token held in
+`sessionStorage` and sent via a custom header — deliberately not a cookie,
+since localhost cookies are shared across every port. The launch token is
+reusable within a short TTL (not single-use — link previews, prefetch, and
+multi-tab commonly fetch the link more than once); the TTL bounds how long a
+token captured from the browser-opener argv on a shared multi-user host stays
+valid, and the owner key that gates the instance-reuse handshake lives only in
+the 0600 server-info file, never in a URL or argv. All requests
 pass a Host allowlist (DNS-rebinding gate) and non-GET requests an Origin
 check; responses carry a CSP whose `script-src` lists exact inline-script
 hashes. The server reads daemon state and settings; it never serializes the

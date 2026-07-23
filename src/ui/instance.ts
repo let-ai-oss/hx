@@ -8,7 +8,7 @@
 // ownerKey (so the occupant only reissues for the real owner) and requires the
 // occupant to prove the same (so a port-squatter can't impersonate the real
 // server and get the browser pointed at it). Only on a verified handshake does
-// the occupant hand back a FRESH single-use launch token to re-open the
+// the occupant hand back a FRESH launch token to re-open the
 // browser. A crash leaves a stale file; the handshake fails and the caller
 // cleans it up and starts its own server.
 
@@ -83,7 +83,7 @@ const PROBE_TIMEOUT_MS = 1_500;
 /**
  * Is the recorded instance alive, genuinely ours, and answering on its port?
  * Runs the mutual-HMAC reuse handshake; returns a launch URL (carrying a fresh
- * single-use token the occupant minted) when verified, null to treat as stale.
+ * launch token the occupant minted) when verified, null to treat as stale.
  */
 export async function probeExistingInstance(
   info: ServerInfo,

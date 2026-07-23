@@ -60,6 +60,21 @@ describe("groupFolders", () => {
     assert.equal(app.id, folderIdFor("claude-cli", "/w/app"));
   });
 
+  it("reads the repo slug from cached state, not a fresh head walk (UI never touches disk)", () => {
+    // The UI calls readHead with resolveRepoFromDisk:false, so head.repoSlug is
+    // null; the daemon's cached state.repoSlug must still supply the repo — and
+    // drive the unlinked-repo warning — without re-walking the working dir.
+    const rows = groupFolders([
+      fact(
+        "/a.jsonl",
+        { cwd: "/w/app", repoSlug: null },
+        { offsets: { letai: 10 }, repoSlug: "acme/app", attributed: false },
+      ),
+    ]);
+    assert.equal(rows[0]?.repo, "acme/app");
+    assert.equal(rows[0]?.unlinkedRepo, true); // repo known (from state) + confirmed-unattributed
+  });
+
   it("never infers unlinked from storage — letai-only offsets stay unknown", () => {
     // A cloud-hosted org's attributed sessions rest in the let.ai store too,
     // so letai-only offsets prove nothing about attribution.

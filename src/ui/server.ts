@@ -184,9 +184,10 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
 
   // Instance-reuse handshake: authenticated by proof-of-ownerKey (the second
   // `hx ui` process reads ownerKey from the 0600 file — same uid), NOT by a
-  // session token, which the reuse caller doesn't have. Mints a fresh
-  // single-use launch token and proves our own ownerKey knowledge back, so the
-  // caller can confirm we're the genuine server before opening the browser.
+  // session token, which the reuse caller doesn't have. Mints a fresh launch
+  // token (reusable within its TTL, like every launch token) and proves our own
+  // ownerKey knowledge back, so the caller can confirm we're the genuine server
+  // before opening the browser.
   if (path === "/api/instance/reissue") {
     if (req.method !== "POST") return apiError(405, "method not allowed");
     let nonce: unknown, proof: unknown;
@@ -334,9 +335,14 @@ function sseResponse(hub: UiEventHub): Response {
 }
 
 /**
- * Bind 127.0.0.1:<port>. Returns null when the port is taken (the caller
- * decides between instance-reuse and scanning); rethrows anything else
- * (EACCES and friends are real errors, not "try the next port").
+ * Bind <hostname>:<port> (loopback by default). Returns null when the port is
+ * taken (the caller decides between instance-reuse and scanning); rethrows
+ * anything else (EACCES and friends are real errors, not "try the next port").
+ *
+ * `hostname` is 127.0.0.1 on a normal host; `hx ui` passes 0.0.0.0 only when it
+ * detects a container, so a published port can forward in. The bind address is
+ * not an access boundary — the Host allowlist and token gate every request
+ * regardless of it (see container.ts / SECURITY.md).
  */
 export function tryServeUi(
   port: number,
@@ -345,11 +351,12 @@ export function tryServeUi(
   providers: UiProviders,
   actions: UiActions,
   events: UiEventHub,
+  hostname = "127.0.0.1",
 ): Server<undefined> | null {
   const ctx: UiServerCtx = { auth, assets, providers, actions, events, port };
   try {
     return Bun.serve({
-      hostname: "127.0.0.1",
+      hostname,
       port,
       // SSE streams ride this connection later; pings stay well under it.
       idleTimeout: 120,

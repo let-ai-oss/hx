@@ -132,7 +132,7 @@ describe("handleUiRequest — auth flow", () => {
     assert.ok(body.version.length > 0);
   });
 
-  it("exchanges a single-use launch token for the session token, once", async () => {
+  it("exchanges a launch token for the session token, reusably within its TTL", async () => {
     const bad = await handleUiRequest(
       req("/api/auth", { method: "POST", body: { token: "wrong" } }),
       ctx,
@@ -148,13 +148,13 @@ describe("handleUiRequest — auth flow", () => {
     const body = (await good.json()) as { sessionToken: string };
     assert.equal(body.sessionToken, auth.sessionToken);
 
-    // Replaying the same launch token (e.g. captured from a browser-opener
-    // argv) is rejected — it was consumed.
-    const replay = await handleUiRequest(
+    // A second fetch of the same link (preview/prefetch/second tab) still
+    // works — the token isn't consumed.
+    const again = await handleUiRequest(
       req("/api/auth", { method: "POST", body: { token: lt } }),
       ctx,
     );
-    assert.equal(replay.status, 401);
+    assert.equal(again.status, 200);
   });
 
   it("reissues a fresh launch token only on a valid ownerKey proof", async () => {
