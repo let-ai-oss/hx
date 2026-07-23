@@ -50,6 +50,9 @@ import {
   upsertFileState,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
+import { appendActivity, trimActivity } from "./activity.js";
+import { rememberOrgNames } from "./org-names.js";
+import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
 import {
@@ -218,27 +221,32 @@ const ROUTE_CACHE = new Map<StateScope, Map<string, Route>>();
  *  route — one pointed at the Fortress gateway with its capability token as the
  *  bearer. Discovery failures fall back to cloud inside resolveRoute (off the hot
  *  path); see route.ts. */
-async function uploadConfigFor(
-  cfg: HxConfig,
-  repoSlug: string | null | undefined,
-): Promise<{ cfg: HxConfig; fortress: boolean }> {
-  if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
-  const scope = scopeOf(cfg);
+function routeCacheFor(scope: StateScope): Map<string, Route> {
   let cache = ROUTE_CACHE.get(scope);
   if (!cache) {
     cache = new Map<string, Route>();
     ROUTE_CACHE.set(scope, cache);
   }
+  return cache;
+}
+
+async function uploadConfigFor(
+  cfg: HxConfig,
+  repoSlug: string | null | undefined,
+): Promise<{ cfg: HxConfig; fortress: boolean; attributedOrgIds?: string[] }> {
+  if (!repoSlug || !cfg.accessToken) return { cfg, fortress: false };
   const route = await resolveRoute({
     repo: repoSlug,
     gatewayBaseUrl: cfg.gatewayBaseUrl,
     accessToken: cfg.accessToken,
-    cache,
+    cache: routeCacheFor(scopeOf(cfg)),
   });
-  if (route.mode !== "fortress-direct") return { cfg, fortress: false };
+  const attributedOrgIds = route.attributedOrgIds;
+  if (route.mode !== "fortress-direct") return { cfg, fortress: false, attributedOrgIds };
   return {
     cfg: { ...cfg, gatewayBaseUrl: route.gatewayUrl, accessToken: route.token },
     fortress: true,
+    attributedOrgIds,
   };
 }
 
@@ -312,6 +320,14 @@ function trimAtLastNewline(buf: Buffer, startOffset: number): { trimmed: Buffer;
 async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise<FileState> {
   const existing = await getFileState(file.path, scope);
   if (existing) {
+    // Legacy entries predate the cwd/repoSlug columns the settings filters
+    // match on — re-seed them once from the head so exclusions apply.
+    if (existing.cwd === undefined) {
+      const head = await readHead(file.path, file.source);
+      existing.cwd = head.cwd ? collapseHome(head.cwd) : path.dirname(file.path);
+      existing.repoSlug = head.repoSlug;
+      await upsertFileState(existing, scope);
+    }
     if (existing.lastMtimeMs !== file.mtimeMs || existing.lastKnownSize !== file.size) {
       existing.lastMtimeMs = file.mtimeMs;
       existing.lastKnownSize = file.size;
@@ -324,6 +340,8 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
     path: file.path,
     family: head.family,
     sessionId: head.sessionId ?? path.basename(file.path, ".jsonl"),
+    cwd: head.cwd ? collapseHome(head.cwd) : path.dirname(file.path),
+    repoSlug: head.repoSlug,
     offsets: {},
     lastKnownSize: file.size,
     lastMtimeMs: file.mtimeMs,
@@ -331,6 +349,24 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
   };
   await upsertFileState(seeded, scope);
   return seeded;
+}
+
+/**
+ * Drop files the device's settings keep local (excluded folders, path rules,
+ * personal gate). Matching happens on the persisted state identity; a file
+ * with no state entry yet passes — its first ingest seeds the entry and the
+ * pre-upload check in tickOnce keeps its bytes on the machine.
+ */
+export function filterWatched(
+  files: DiscoveredFile[],
+  state: HxState,
+  settings: HxSettings,
+): DiscoveredFile[] {
+  return files.filter((f) => {
+    const fs = state.files[f.path];
+    if (!fs) return true;
+    return !shouldSkipFile(settings, fs);
+  });
 }
 
 const FALLBACK_TITLE_MAX = 80;
@@ -408,6 +444,15 @@ async function ingestOne(
   // Fortress next pass; it is never re-sent to the cloud.
   const route = await uploadConfigFor(cfg, head.repoSlug);
   const uploadCfg = route.cfg;
+  // Persist gateway-confirmed workspace attribution — the personal gate's
+  // exact signal (see settings.ts). Only when the gateway echoes it.
+  if (Array.isArray(route.attributedOrgIds)) {
+    const attributed = route.attributedOrgIds.length > 0;
+    if (fState.attributed !== attributed) {
+      fState.attributed = attributed;
+      await upsertFileState(fState, scope);
+    }
+  }
 
   // CCD session metadata (title + group id) is byte-independent — resolve once.
   const ccdByCli = await getCcdRecentsByCliId(Date.now()).catch(() => null);
@@ -574,6 +619,15 @@ async function ingestOne(
         log(
           `  ${path.relative(process.env.HOME ?? "", file.path)} (+${trimmed.length}B → ${step.vaultOrgId ?? "let.ai"}, ${fState.family}, ${fState.sessionId.slice(0, 8)}…)`,
         );
+        // Local journal for the UI's traffic chart — best-effort, never awaited
+        // into the upload path's error handling.
+        void appendActivity({
+          at: Date.now(),
+          sessionId: fState.sessionId,
+          family: fState.family,
+          bytes: trimmed.length,
+          dest: destKey(step.vaultOrgId),
+        });
       } catch (err) {
         // One destination's vault being unavailable must not stall the others — log
         // and move on; its offset stays put so the next pass retries just it.
@@ -1156,7 +1210,8 @@ export async function computeSyncSnapshot(only?: string): Promise<SyncSnapshot> 
   let files = [...claude, ...codex];
   if (only) files = files.filter((f) => f.path === only);
   const state = await loadState();
-  return snapshotFrom(electUploaders(files, state), state);
+  const settings = await readSettings();
+  return snapshotFrom(filterWatched(electUploaders(files, state), state, settings), state);
 }
 
 /** A state entry that is no longer discoverable on disk yet never finished
@@ -1249,7 +1304,11 @@ export async function computeSyncReport(): Promise<SyncReport> {
       sourceGone: !existsSync(p),
     });
   }
-  const elected = electUploaders(all, state);
+  // Settings filtering applies to the ELECTED set only: `discovered` and
+  // `liveSessions` above stay unfiltered so an excluded-but-present file can
+  // never masquerade as a vanished-source gap.
+  const settings = await readSettings();
+  const elected = filterWatched(electUploaders(all, state), state, settings);
   return { snapshot: snapshotFrom(elected, state), behind, skipped: collectSkipped(elected, state) };
 }
 
@@ -1270,7 +1329,8 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
-  files = electUploaders(files, state, log);
+  const settings = await readSettings();
+  files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
   let uploaded = 0;
@@ -1281,6 +1341,32 @@ export async function tickOnce(
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
     if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
+    // A file seen for the first time has no state entry for filterWatched to
+    // match — seed it now and re-check before any byte leaves the machine.
+    // With the personal gate armed, a repo file with UNKNOWN attribution asks
+    // the gateway first (one bounded, cached route lookup) so the very first
+    // chunk already respects the gate exactly.
+    if (!pending || (!settings.personalSync && state.files[f.path]?.attributed === undefined)) {
+      const seeded = pending ?? (await ensureFileState(f, scope));
+      if (
+        !settings.personalSync &&
+        seeded.repoSlug &&
+        seeded.attributed === undefined &&
+        cfg.accessToken
+      ) {
+        const r = await resolveRoute({
+          repo: seeded.repoSlug,
+          gatewayBaseUrl: cfg.gatewayBaseUrl,
+          accessToken: cfg.accessToken,
+          cache: routeCacheFor(scope),
+        });
+        if (Array.isArray(r.attributedOrgIds)) {
+          seeded.attributed = r.attributedOrgIds.length > 0;
+          await upsertFileState(seeded, scope);
+        }
+      }
+      if (shouldSkipFile(settings, seeded)) continue;
+    }
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
@@ -1295,6 +1381,7 @@ export async function tickOnce(
         // fine. Skip just this file — short retries first, then a longer backoff
         // (recordFileFailure doubles per failure) — and record the reason so
         // `hx status` can show it. Everything else keeps uploading.
+        if (err.blocker) void rememberOrgNames(err.blocker.destinations);
         const delay = await recordFileFailure(
           f.path,
           SESSION_SKIP_RETRY_BASE_MS,
@@ -1404,6 +1491,7 @@ export async function startWatch(
     `[hx] watching ${CLAUDE_PROJECTS_DIR}, ${CODEX_SESSIONS_DIR}, ${CODEX_ARCHIVED_DIR}`,
   );
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
+  void trimActivity(); // cap the UI journal once per daemon lifetime
 
   // Last time anything reached the gateway (upload or beat). Uploads count as
   // contact, so a busy daemon never sends a redundant heartbeat.
@@ -1444,9 +1532,28 @@ export async function startWatch(
   // audit by its next interval.
   let passBusy = false;
 
+  // User-driven pause (settings.json, written by the UI server or a future
+  // CLI). Checked every tick so a pause/resume takes effect within one poll.
+  // Heartbeats keep running while paused — the device reads "online, paused",
+  // not vanished. Log only the transitions, not every skipped tick.
+  let wasPaused = false;
+
   const run = async () => {
     if (Date.now() < pauseUploadsUntilMs) return;
     if (passBusy) return;
+    const settings = await readSettings();
+    if (isPaused(settings)) {
+      if (!wasPaused) {
+        wasPaused = true;
+        const until = settings.pause?.untilMs;
+        log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
+      }
+      return;
+    }
+    if (wasPaused) {
+      wasPaused = false;
+      log(`[hx] sync resumed`);
+    }
     passBusy = true;
     try {
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);

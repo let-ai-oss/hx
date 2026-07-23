@@ -262,6 +262,16 @@ function alreadyLatest(
   };
 }
 
+/** Cheap update check for the UI: current vs advertised remote version. */
+export async function checkForUpdate(
+  gatewayBaseUrl: string,
+): Promise<{ current: string; latest: string | null; updateAvailable: boolean }> {
+  const downloadBase = `${gatewayBaseUrl.replace(/\/+$/, "")}/download`;
+  assertSecureFetchUrl(downloadBase, "hx update check");
+  const latest = await fetchRemoteVersion(downloadBase);
+  return { current: HX_VERSION, latest, updateAvailable: isRemoteNewer(HX_VERSION, latest) };
+}
+
 /**
  * Fetch the release's advertised semver from the download proxy. Returns null
  * on any failure (older release without the asset, network blip, non-semver

@@ -26,7 +26,31 @@ import {
   formatStatusBlocker,
   formatSyncDoctorText,
 } from "./diagnostics.js";
-import { clearBlockedFailures, resetStateCache } from "./state.js";
+import { isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
+import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
+import { checkForUpdate } from "./update.js";
+import { watch as watchDir } from "node:fs";
+import { HX_DIR } from "./hx-home.js";
+import { openBrowser } from "./browser.js";
+import { loadUiAssets } from "./ui/assets.js";
+import { createUiAuth, LAUNCH_TTL_MS } from "./ui/auth.js";
+import {
+  probeExistingInstance,
+  readServerInfo,
+  removeServerInfo,
+  writeServerInfo,
+} from "./ui/instance.js";
+import { createEventHub, tryServeUi, type UiActions, type UiProviders } from "./ui/server.js";
+import {
+  activitySince,
+  buildSessions,
+  buildSnapshot,
+  cachedWhoami,
+  isDiscoveredPath,
+  readConfigForProbe,
+  tailDaemonLog,
+} from "./ui/data.js";
+import { previewSessionFile } from "./ui/preview.js";
 
 function log(msg: string): void {
   process.stdout.write(`${msg}\n`);
@@ -196,9 +220,11 @@ async function autoStartDaemon(
       return;
     }
     // Already loaded — restart it if the token was just reminted (it's holding
-    // the revoked one) or there's still a backlog to push.
+    // the revoked one) or there's still a backlog to push. A user-paused device
+    // is deliberately behind — restarting wouldn't (and shouldn't) change that.
+    const settings = await readSettings();
     const snap = await computeSyncSnapshot().catch(() => null);
-    const behind = snap ? snap.done < snap.total : false;
+    const behind = !isPaused(settings) && (snap ? snap.done < snap.total : false);
     const remaining = snap ? Math.max(0, snap.total - snap.done) : 0;
     if (opts.tokenRefreshed || behind) {
       const dotfileConsent = await resolveDotfileConsent(ops);
@@ -338,6 +364,18 @@ function localLog(msg: string): void {
   log(`[local] ${msg}`);
 }
 
+// Daemon log lines carry a local-time stamp: stdout.log is append-only across
+// days, so an un-stamped "heartbeat error" is undatable after the fact. Only
+// the watch lanes stamp — tables/help/interactive output stay clean.
+function stamped(base: (msg: string) => void): (msg: string) => void {
+  return (msg) => {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const ts = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    base(`${ts} ${msg}`);
+  };
+}
+
 async function cmdWatch(): Promise<void> {
   const cfg = await ensureConfig();
   // --local: regular behavior untouched, PLUS a second fully independent lane
@@ -349,8 +387,8 @@ async function cmdWatch(): Promise<void> {
   const oneShot = process.argv.includes("--once") || process.argv.includes("-1");
   const only = flag("only");
   const [main, local] = await Promise.all([
-    startWatch(cfg, { oneShot, only }, log),
-    localCfg ? startWatch(localCfg, { oneShot, only }, localLog) : null,
+    startWatch(cfg, { oneShot, only }, stamped(log)),
+    localCfg ? startWatch(localCfg, { oneShot, only }, stamped(localLog)) : null,
   ]);
   if (!oneShot) {
     process.on("SIGINT", () => {
@@ -501,6 +539,17 @@ async function cmdStatus(): Promise<void> {
     }
   }
 
+  // User-driven pause (settings.json — set from the HX Client UI). Shown
+  // before the probe so a paused device explains its own backlog.
+  const settings = await readSettings();
+  if (isPaused(settings)) {
+    const until = settings.pause?.untilMs;
+    rows.push([
+      "Paused",
+      until ? `yes — resumes ${new Date(until).toLocaleString()}` : "yes — until resumed",
+    ]);
+  }
+
   // Local sync state remains useful even when the network probe is down: a
   // persisted destination hold should still name the affected org/repo.
   const report = await computeSyncReport().catch(() => null);
@@ -593,28 +642,21 @@ async function cmdRetry(): Promise<void> {
     return;
   }
 
-  // state.json has a single-writer contract. Stop an installed daemon before
-  // mutating its backoffs, reload the final on-disk state, then bring the same
-  // service back immediately. A deliberately-stopped client gets one foreground
-  // retry pass but remains stopped afterward.
+  // state.json has a single-writer contract; retryBlocked() stops an installed
+  // daemon before mutating its backoffs and brings the same service back. A
+  // deliberately-stopped client gets one foreground retry pass but remains
+  // stopped afterward.
   const ops = getDaemonOps();
   const before = await ops.state().catch(() => ({ loaded: false, pid: null }));
-  if (before.loaded) await ops.stop();
-  resetStateCache();
-  const cleared = await clearBlockedFailures();
-
-  if (before.loaded) {
-    const dotfileConsent = await resolveDotfileConsent(ops);
-    await ops.install({ binPath: process.execPath, dotfileConsent });
+  const dotfileConsent = before.loaded ? await resolveDotfileConsent(ops) : "denied";
+  const r = await retryBlocked(cfg, { dotfileConsent, log });
+  if (r.restarted) {
     log(
-      `Released ${cleared.sessions} blocked session${cleared.sessions === 1 ? "" : "s"}; daemon restarted for an immediate retry.`,
+      `Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"}; daemon restarted for an immediate retry.`,
     );
   } else {
-    log(
-      `Released ${cleared.sessions} blocked session${cleared.sessions === 1 ? "" : "s"}; running one retry pass now.`,
-    );
-    const retried = await tickOnce(cfg, { oneShot: true }, log);
-    log(`Retry pass complete. uploaded=${retried.uploaded} failed=${retried.failed}`);
+    log(`Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"}; ran one retry pass now.`);
+    if (r.pass) log(`Retry pass complete. uploaded=${r.pass.uploaded} failed=${r.pass.failed}`);
   }
   log("Check the result with `hx status`.");
 }
@@ -670,47 +712,11 @@ async function cmdDisconnect(): Promise<void> {
   // `hx disconnect --local` tears down only the tee lane, mirroring
   // `hx connect --local` — the main connection (and daemon) keep running.
   if (hasFlag("local")) return cmdDisconnectLocal();
-  const cfg = await readConfig();
-  if (cfg?.accessToken) {
-    // Tell the server to revoke this device and hide its sessions, matching a
-    // workbench-side removal. Best-effort: a network failure shouldn't strand
-    // the user — the local token is cleared regardless, and the device can
-    // still be removed from the workbench UI. The ~/.let/hx/device-id file is left
-    // in place so a later `hx connect` from this machine restores the sessions.
-    // Bound the call and drain the response. An undrained fetch body keeps the
-    // undici socket — and the event loop — alive, so the command would hang
-    // after the POST instead of exiting (the bug as of v54). The AbortController
-    // also caps the wait when the gateway accepts the connection but is slow to
-    // answer (e.g. a saturated upload backlog), matching the probe idiom.
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), DISCONNECT_TIMEOUT_MS);
-    try {
-      // Best-effort notify, but never over cleartext — a throw here is caught
-      // and we still clear local state below, so the token isn't leaked to an
-      // http gateway just to announce a disconnect.
-      assertSecureFetchUrl(cfg.gatewayBaseUrl, "hx disconnect");
-      const res = await fetch(`${cfg.gatewayBaseUrl}/devices/disconnect`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${cfg.accessToken}` },
-        signal: ctrl.signal,
-      });
-      await res.arrayBuffer(); // release the socket so the process can exit
-    } catch {
-      // ignore — best-effort; fall through to clearing local state
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  if (cfg?.gatewayBaseUrl) {
-    // config.json is the single source of truth for the gateway, so keep the
-    // URL and drop only the token + identity. A later `hx connect` then
-    // reconnects to the same gateway with no reinstall (remove
-    // ~/.let/hx/config.json to re-point elsewhere).
-    await writeConfig({ gatewayBaseUrl: cfg.gatewayBaseUrl });
-    log("Disconnected.");
-  } else {
-    log("Was not connected.");
-  }
+  // Server-side revoke is best-effort (a network failure shouldn't strand the
+  // user); the local token is cleared regardless, and ~/.let/hx/device-id is
+  // left in place so a later `hx connect` restores the sessions.
+  const disconnected = await disconnectDevice(await readConfig());
+  log(disconnected ? "Disconnected." : "Was not connected.");
 }
 
 // Tear down the `--local` tee: best-effort revoke against the local dev
@@ -874,6 +880,184 @@ async function cmdUninstall(): Promise<void> {
   log(`"Added by hx installer" line and remove it.`);
 }
 
+const UI_DEFAULT_PORT = 8000;
+const UI_PORT_SCAN_SPAN = 20;
+
+// One line under the launch URL. The TTL and single-use apply to OPENING the
+// link — once open, the tab stays signed in until the server stops. Derived
+// from the auth TTL so the message can't drift from the real value.
+function launchLinkNote(): string {
+  const h = LAUNCH_TTL_MS / 3_600_000;
+  const ttl = h >= 1 && Number.isInteger(h) ? `${h}h` : `${Math.round(LAUNCH_TTL_MS / 60_000)} min`;
+  return `[hx]   open this link within ${ttl} (single-use); once open, the tab stays signed in until you stop hx ui`;
+}
+
+async function cmdUi(): Promise<void> {
+  const portFlag = flag("port");
+  let requested: number | null = null;
+  if (portFlag !== undefined) {
+    requested = Number(portFlag);
+    if (!Number.isInteger(requested) || requested < 1 || requested > 65535) {
+      log(`invalid --port: ${portFlag}`);
+      process.exitCode = 64;
+      return;
+    }
+  }
+
+  const assets = await loadUiAssets();
+  if (!assets) {
+    log("The web UI isn't bundled in this build and ui/dist doesn't exist.");
+    log("From a source checkout, build it once: bun run build:ui");
+    process.exit(1);
+  }
+
+  const auth = createUiAuth();
+  const strict = requested !== null;
+  const basePort = requested ?? UI_DEFAULT_PORT;
+
+  const providers: UiProviders = {
+    snapshot: () => buildSnapshot(),
+    sessions: (folderId) => buildSessions(folderId),
+    preview: async (filePath) =>
+      (await isDiscoveredPath(filePath)) ? previewSessionFile(filePath) : null,
+    logs: (maxLines) => tailDaemonLog(maxLines),
+    activity: (hours) => activitySince(hours),
+    probe: async () => {
+      const cfg = await readConfigForProbe();
+      if (!cfg) return { up: false, reason: "not connected" };
+      return probeConnection(cfg);
+    },
+    whoami: () => cachedWhoami(),
+  };
+
+  const events = createEventHub();
+  let updateRunning = false;
+  const actions: UiActions = {
+    readSettings: () => readSettings(),
+    writeSettings: (patch) => writeSettings(patch as Partial<HxSettings>),
+    // A browser click must not edit dotfiles, so the container backend starts
+    // without restart persistence — the CLI path (`hx start`) covers that.
+    daemon: (action) => daemonAction(action, "denied"),
+    retryBlocked: async () => {
+      const cfg = await readConfig();
+      if (!cfg?.accessToken) return { sessions: 0, files: 0, restarted: false };
+      return retryBlocked(cfg, { dotfileConsent: "denied", log });
+    },
+    updateCheck: async () => {
+      const cfg = await readConfig();
+      if (!cfg?.gatewayBaseUrl) {
+        return { current: HX_VERSION, latest: null, updateAvailable: false };
+      }
+      return checkForUpdate(cfg.gatewayBaseUrl);
+    },
+    startUpdate: async () => {
+      if (updateRunning) return false;
+      const cfg = await readConfig();
+      if (!cfg?.gatewayBaseUrl) {
+        events.emit({ type: "update-error", message: "not connected to a gateway" });
+        return true;
+      }
+      updateRunning = true;
+      void runUpdate({
+        gatewayBaseUrl: cfg.gatewayBaseUrl,
+        log,
+        onProgress: (ev) => events.emit({ type: "update-progress", ...ev }),
+      })
+        .then((r) =>
+          events.emit({
+            type: "update-done",
+            alreadyLatest: r.alreadyLatest ?? false,
+            version: r.remoteVersion ?? r.localVersion,
+            daemonRestarted: r.daemonRestarted,
+          }),
+        )
+        .catch((err) => events.emit({ type: "update-error", message: (err as Error).message }))
+        .finally(() => {
+          updateRunning = false;
+        });
+      return true;
+    },
+    disconnect: async () => ({ disconnected: await disconnectDevice(await readConfig()) }),
+  };
+
+  let port = basePort;
+  let server = tryServeUi(basePort, auth, assets, providers, actions, events);
+  if (!server && !strict) {
+    // The default port is taken — maybe by an earlier `hx ui`. Reuse a live
+    // instance of ours instead of racing it; otherwise scan forward.
+    const existing = await readServerInfo();
+    if (existing) {
+      const alive = await probeExistingInstance(existing);
+      if (alive) {
+        log(`[hx] HX Client UI already running at ${alive.url}`);
+        log(launchLinkNote());
+        if (!hasFlag("no-open")) openBrowser(alive.url);
+        return;
+      }
+      await removeServerInfo();
+    }
+    for (let p = basePort + 1; p <= basePort + UI_PORT_SCAN_SPAN && !server; p++) {
+      server = tryServeUi(p, auth, assets, providers, actions, events);
+      if (server) port = p;
+    }
+    if (server) {
+      log(`[hx] port ${basePort} is in use by another app — serving on http://localhost:${port}`);
+    }
+  }
+  if (!server) {
+    const range = strict ? `${basePort}` : `${basePort}-${basePort + UI_PORT_SCAN_SPAN}`;
+    log(`port ${range} is in use — stop the other process or pass --port <n> (try: lsof -i :${basePort})`);
+    process.exit(1);
+  }
+
+  // Only the ownerKey is persisted (0600) — never a launch token. It proves
+  // same-uid ownership for the reuse handshake; launch tokens are minted fresh,
+  // single-use, and short-lived, so a leaked one (browser-opener argv) can't be
+  // replayed.
+  await writeServerInfo({ port, pid: process.pid, ownerKey: auth.ownerKey });
+
+  // Nudge connected browsers when anything under ~/.let/hx changes (state,
+  // settings, journal, logs — all live there). Directory-level watch: the
+  // daemon's atomic tmp+rename writes would silently detach a file watch.
+  // Throttled so the 1.5 s tick cadence doesn't turn into a refetch storm.
+  const CHANGE_NUDGE_MIN_MS = 1_500;
+  let lastNudgeMs = 0;
+  let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    watchDir(HX_DIR, { persistent: false }, () => {
+      const now = Date.now();
+      if (now - lastNudgeMs >= CHANGE_NUDGE_MIN_MS) {
+        lastNudgeMs = now;
+        events.emit({ type: "changed" });
+      } else if (!nudgeTimer) {
+        nudgeTimer = setTimeout(() => {
+          nudgeTimer = null;
+          lastNudgeMs = Date.now();
+          events.emit({ type: "changed" });
+        }, CHANGE_NUDGE_MIN_MS);
+      }
+    });
+  } catch {
+    // no watcher — the UI's polling still keeps things fresh
+  }
+
+  const launchUrl = `http://localhost:${port}/#k=${auth.mintLaunchToken()}`;
+  log(`[hx] HX Client UI → ${launchUrl}`);
+  log(launchLinkNote());
+  if (assets.mode === "disk") log(`[hx] serving ui/dist from disk (source checkout)`);
+  log(`[hx] Ctrl+C to stop`);
+  if (!hasFlag("no-open")) openBrowser(launchUrl);
+
+  const shutdown = (): void => {
+    void removeServerInfo().finally(() => {
+      server.stop(true);
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
 async function main(): Promise<void> {
   const cmd = process.argv[2];
   switch (cmd) {
@@ -920,6 +1104,9 @@ async function main(): Promise<void> {
     case "logs":
       await cmdLogs();
       break;
+    case "ui":
+      await cmdUi();
+      break;
     case "update":
       await cmdUpdate();
       break;
@@ -940,6 +1127,7 @@ async function main(): Promise<void> {
       log("  status     Show connection status and link quality");
       log("  doctor sync  Explain blocked sessions (pass --json for automation)");
       log("  logs       Tail the daemon's stdout / stderr");
+      log("  ui         Open the local HX Client UI (http://localhost:8000; --port, --no-open)");
       log("");
       log("Maintenance:");
       log("  backfill   Upload tasks + plans for sessions already on disk");

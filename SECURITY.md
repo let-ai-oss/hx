@@ -48,6 +48,22 @@ third-party dependencies (report upstream), social engineering, and physical
 attacks. The gateway/host lives in `hx-fortress`; the wire protocol in
 `hx-protocol`.
 
+### Local web UI (`hx ui`)
+
+`hx ui` serves the HX Client web app from the binary over plain HTTP bound to
+`127.0.0.1` only. Loopback is a browser-trusted origin, so no certificate is
+involved; nothing ever listens on a non-loopback interface. Its API is gated
+by a per-run bearer token: the launch URL carries a one-time key in the URL
+fragment (never sent on the wire), the page exchanges it for a session token
+held in `sessionStorage` and sent via a custom header — deliberately not a
+cookie, since localhost cookies are shared across every port. All requests
+pass a Host allowlist (DNS-rebinding gate) and non-GET requests an Origin
+check; responses carry a CSP whose `script-src` lists exact inline-script
+hashes. The server reads daemon state and settings; it never serializes the
+device token into any response, and `state.json` stays daemon-owned (mutating
+maintenance actions stop the daemon first, exactly like the CLI). Findings
+against this surface are in scope.
+
 ### Self-update trust model
 
 `hx` updates itself by fetching a binary and its SHA-256 from the gateway's

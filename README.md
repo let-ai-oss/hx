@@ -97,6 +97,7 @@ bridge it. Run that, or open a new terminal.
 hx connect [--local] [--device-name NAME]   # approve device + start mirror
 hx status                                    # connection status + link quality
 hx logs                                      # tail the daemon
+hx ui [--port N] [--no-open]                 # open the HX Client web app
 hx start | stop | restart                    # background-mirror service
 hx update                                    # fetch the latest binary, restart daemon
 hx disconnect [--local]                      # forget the device token
@@ -107,6 +108,27 @@ hx --version
 hx watch [--local] [--once] [--only /abs/path.jsonl]
 hx tick  [--local]                           # one upload pass, exit
 ```
+
+## Web UI
+
+```sh
+hx ui [--port N] [--no-open]
+```
+
+Serves the **HX Client** web app — everything the daemon knows, in a browser:
+watched folders and where each one uploads (with the why: repo → workspace →
+destination), sync status with a live traffic chart, a transcript inspector
+showing the exact bytes that leave the machine, privacy controls (pause,
+per-folder exclusions, future-folder rules, a personal-sessions gate), daemon
+lifecycle controls, Sync Doctor, self-update, and a live log tail.
+
+The app is embedded in the `hx` binary and served from `http://localhost:8000`
+(loopback only; `--port` if 8000 is busy — by default hx scans forward and
+says so). The printed URL carries a one-time key — open exactly that link; a
+second `hx ui` reuses the running instance instead of racing it. Ctrl-C stops
+the server; the background mirror is unaffected. Settings changes land in
+`~/.let/hx/settings.json` and the daemon honors them within one poll interval
+(also visible to `hx status`, e.g. a `Paused` row).
 
 `--local` is **additive**: regular behavior is untouched, and sessions are
 *also* mirrored to a local dev gateway (`http://localhost:9000`). `hx connect

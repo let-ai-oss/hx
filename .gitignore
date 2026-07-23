@@ -5,6 +5,7 @@ node_modules/
 dist/
 build/
 *.tsbuildinfo
+src/ui-assets.gen.ts
 
 # Logs
 *.log

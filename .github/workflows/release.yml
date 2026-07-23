@@ -5,6 +5,8 @@ on:
     branches: ["main"]
     paths:
       - "src/**"
+      - "ui/**"
+      - "scripts/**"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/release.yml"
@@ -33,6 +35,17 @@ jobs:
       # harmless. Keep it for parity + lockfile validation.
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      # One Vite build serves all four targets — the embedded assets are
+      # target-independent; the per-target compiles below pick up the
+      # generated src/ui-assets.gen.ts. Keep in sync with dev-build.yml.
+      - name: Build web UI
+        run: |
+          cd ui
+          bun install --frozen-lockfile
+          bun run build
+          cd ..
+          bun run gen:ui
 
       - name: Read hx version
         id: version
