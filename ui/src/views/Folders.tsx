@@ -10,15 +10,17 @@ const GLBL: Record<GroupBy, string> = { tool: "Tool", dir: "Directory", dest: "D
 
 function SessionRow({ s }: { s: SessionInfo }) {
   const { openInspector } = useApp();
-  const status = s.pendingBytes > 0
-    ? `${fmtBytes(s.pendingBytes)} waiting to send`
-    : s.lastUploadAtMs > 0
-      ? `sent ${fmtClock(s.lastUploadAtMs)}`
-      : "not uploaded yet";
+  const status = s.deleted
+    ? "Deleted from HX — local file kept; no longer uploads"
+    : s.pendingBytes > 0
+      ? `${fmtBytes(s.pendingBytes)} waiting to send`
+      : s.lastUploadAtMs > 0
+        ? `sent ${fmtClock(s.lastUploadAtMs)}`
+        : "not uploaded yet";
   return (
     <div className="poprow" style={{ alignItems: "center", gap: 12 }}>
       <span className="grow" style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.title}</span>
-      <span className={`st ${s.pendingBytes > 0 ? "warny" : "on"}`} style={{ flexShrink: 0 }}>{status}</span>
+      <span className={`st ${s.deleted ? "off" : s.pendingBytes > 0 ? "warny" : "on"}`} style={{ flexShrink: 0 }}>{status}</span>
       <button className="btn ghost sm" style={{ flexShrink: 0 }} onClick={(e) => { e.stopPropagation(); openInspector(s.path); }}>Inspect</button>
     </div>
   );

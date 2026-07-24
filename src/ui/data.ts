@@ -19,7 +19,7 @@ import { readActivity, type ActivityEntry } from "../activity.js";
 import { readOrgNames } from "../org-names.js";
 import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
-import { loadState, minOffset, resetStateCache, type FileState } from "../state.js";
+import { isDeletedSession, loadState, minOffset, resetStateCache, type FileState } from "../state.js";
 import { HX_VERSION } from "../version.js";
 import { computeSyncReport } from "../watch.js";
 
@@ -87,6 +87,10 @@ export interface SessionVM {
   pendingBytes: number;
   lastUploadAtMs: number;
   dests: string[];
+  /** Permanently deleted server-side (tombstoned): uploads stopped forever,
+   *  local file kept. Rendered as "Deleted from HX" — new activity in the
+   *  session will no longer upload. */
+  deleted: boolean;
 }
 
 export interface DestinationVM {
@@ -374,21 +378,27 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
 export async function buildSessions(folderId: string): Promise<SessionVM[]> {
   resetStateCache();
   const facts = await collectFacts();
+  const fullState = await loadState();
   const out: SessionVM[] = [];
   for (const { file, head, state } of facts) {
     const family = head.family === "unknown" ? (file.source === "claude" ? "claude-cli" : "codex-cli") : head.family;
     const cwd = collapseHome(head.cwd ?? path.dirname(file.path));
     if (folderIdFor(family, cwd) !== folderId) continue;
     const uploaded = state ? minOffset(state) : 0;
+    const sessionId = head.sessionId ?? path.basename(file.path, ".jsonl");
+    const deleted = isDeletedSession(fullState, state?.family ?? family, sessionId);
     out.push({
       id: head.sessionId ?? path.basename(file.path),
       path: file.path,
       title: head.title ?? path.basename(file.path, ".jsonl"),
       sizeBytes: file.size,
       uploadedBytes: uploaded,
-      pendingBytes: Math.max(0, file.size - uploaded),
+      // A deleted session has nothing pending by definition — uploads are
+      // permanently stopped, whatever the local file grows to.
+      pendingBytes: deleted ? 0 : Math.max(0, file.size - uploaded),
       lastUploadAtMs: state?.lastUploadAtMs ?? 0,
       dests: Object.keys(state?.offsets ?? {}).filter((k) => (state?.offsets[k] ?? 0) > 0),
+      deleted,
     });
   }
   return out.sort((a, b) => b.lastUploadAtMs - a.lastUploadAtMs);
