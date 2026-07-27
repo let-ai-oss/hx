@@ -92,6 +92,20 @@ export function resolveDataRoots(
   };
 }
 
+/** Same physical directory? Realpaths both sides when resolvable, so a
+ *  symlinked spelling of an already-watched root reads as covered. */
+export function samePhysicalDir(a: string, b: string): boolean {
+  if (a === b) return true;
+  const key = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return key(a) === key(b);
+}
+
 /** True when `p` is (or sits under) one of the roots' config dirs. */
 export function isUnderRoots(p: string, roots: DataRoot[]): boolean {
   for (const r of roots) {

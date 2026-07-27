@@ -199,6 +199,14 @@ export interface HxState {
    *  and falls back to its own resolution when the stamp is absent (daemon
    *  not yet upgraded / never ran). Additive; older binaries ignore it. */
   effectiveRoots?: EffectiveRootsStamp;
+  /** Last elected uploader path per child lane (`parent:agent:runId`). Child
+   *  election is stateless (newest mtime wins); when a lane's winner FLIPS
+   *  (a copied tree raced the live file), the new winner must re-upload from
+   *  zero or its stale offsets would append onto a canonical another file
+   *  last wrote — and child lanes have no offsets audit to ever notice (see
+   *  planChildLaneResets in watch.ts). Entries age out with their sessions;
+   *  additive, older binaries ignore it. */
+  childUploaders?: Record<string, string>;
 }
 
 const STATE_DIR = HX_DIR;
@@ -289,6 +297,14 @@ export async function stampEffectiveRoots(
     codex: roots.codex,
     resolvedAtMs: Date.now(),
   };
+  await schedulePersist(state, scope);
+}
+
+/** Persist the cached state after in-place mutations (childUploaders map,
+ *  offset zeroing on a lane flip). Same single-writer discipline as every
+ *  other writer here — only the process that owns the lane calls this. */
+export async function persistState(scope: StateScope = "main"): Promise<void> {
+  const state = await loadState(scope);
   await schedulePersist(state, scope);
 }
 

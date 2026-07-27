@@ -7,6 +7,7 @@ import {
   collectBehind,
   collectSkipped,
   electChildUploaders,
+  planChildLaneResets,
   reconcileChildParent,
   snapshotFrom,
 } from "./watch.js";
@@ -181,6 +182,45 @@ describe("electChildUploaders", () => {
     const small = child({ path: "/p/small.jsonl", size: 5 });
     const big = child({ path: "/p/big.jsonl", size: 50 });
     assert.deepEqual(electChildUploaders([small, big]).map((c) => c.path), [big.path]);
+  });
+});
+
+describe("planChildLaneResets", () => {
+  const child = (p: string, over: Partial<DiscoveredChildFile> = {}): DiscoveredChildFile => ({
+    path: p,
+    size: 10,
+    mtimeMs: 100,
+    parentSessionId: "sid",
+    agentId: "a1",
+    runId: null,
+    metaPath: null,
+    rootDir: "/r/a",
+    ...over,
+  });
+
+  it("first sighting of a lane records the winner without a reset", () => {
+    const plan = planChildLaneResets([child("/r/a/agent-a1.jsonl")], {});
+    assert.deepEqual(plan.resetPaths, []);
+    assert.equal(plan.changed, true);
+    assert.deepEqual(plan.nextMap, { "sid:a1:": "/r/a/agent-a1.jsonl" });
+  });
+
+  it("a flipped winner is reset; a stable one is untouched", () => {
+    const prev = { "sid:a1:": "/r/a/agent-a1.jsonl", "sid:a2:": "/r/a/agent-a2.jsonl" };
+    const plan = planChildLaneResets(
+      [child("/r/copy/agent-a1.jsonl"), child("/r/a/agent-a2.jsonl", { agentId: "a2" })],
+      prev,
+    );
+    assert.deepEqual(plan.resetPaths, ["/r/copy/agent-a1.jsonl"]);
+    assert.equal(plan.nextMap["sid:a1:"], "/r/copy/agent-a1.jsonl");
+    assert.equal(plan.nextMap["sid:a2:"], "/r/a/agent-a2.jsonl");
+  });
+
+  it("no changes → changed:false, map preserved by reference semantics", () => {
+    const prev = { "sid:a1:": "/r/a/agent-a1.jsonl" };
+    const plan = planChildLaneResets([child("/r/a/agent-a1.jsonl")], prev);
+    assert.equal(plan.changed, false);
+    assert.deepEqual(plan.resetPaths, []);
   });
 });
 

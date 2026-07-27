@@ -254,8 +254,21 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok) throw new ApiError(res.status, `${path} → ${res.status}`);
+  // Surface the server's own error text when it sent one (the settings
+  // endpoint's strict 400s carry actionable messages) — a bare status code
+  // reads as a crash where the server actually explained the rejection.
+  if (!res.ok) throw new ApiError(res.status, await errorMessageFrom(res, path));
   return (await res.json()) as T;
+}
+
+async function errorMessageFrom(res: Response, path: string): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (body && typeof body.error === "string" && body.error) return body.error;
+  } catch {
+    /* non-JSON error body */
+  }
+  return `${path} → ${res.status}`;
 }
 
 /**

@@ -89,6 +89,18 @@ describe("parseDataDirs", () => {
     const s = await readSettings(p);
     assert.deepEqual(s.dataDirs, { claude: [join(homedir(), "data-root")], codex: [] });
   });
+
+  it("merges partial-family patches — an omitted family means unchanged, never wiped", async () => {
+    const p = tmpPath();
+    await writeSettings({ dataDirs: { claude: ["/data/c1"], codex: ["/data/x1"] } }, p);
+    // The validator accepts a claude-only patch; codex must survive it.
+    await writeSettings({ dataDirs: { claude: ["/data/c2"] } as never }, p);
+    const s = await readSettings(p);
+    assert.deepEqual(s.dataDirs, { claude: ["/data/c2"], codex: ["/data/x1"] });
+    // And an explicit empty list still clears intentionally.
+    await writeSettings({ dataDirs: { codex: [] } as never }, p);
+    assert.deepEqual((await readSettings(p)).dataDirs, { claude: ["/data/c2"], codex: [] });
+  });
 });
 
 describe("dataDirsPatchError", () => {

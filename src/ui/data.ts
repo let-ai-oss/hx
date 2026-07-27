@@ -18,7 +18,7 @@ import { assertSecureFetchUrl } from "../net.js";
 import { readActivity, type ActivityEntry } from "../activity.js";
 import { readOrgNames } from "../org-names.js";
 import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
-import { resolveDataRoots, type DataRoot, type ResolvedRoots, type RootOrigin } from "../roots.js";
+import { resolveDataRoots, samePhysicalDir, type DataRoot, type ResolvedRoots, type RootOrigin } from "../roots.js";
 import { readSettings } from "../settings.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
 import { isDeletedSession, loadState, minOffset, resetStateCache, type FileState } from "../state.js";
@@ -390,7 +390,7 @@ export function detectShellRoots(
   for (const family of ["claude", "codex"] as const) {
     const env = selfResolved[family].find((r) => r.origin === "env");
     if (!env) continue; // no env var, or it deduped into an already-known root
-    if (effective[family].some((r) => r.configDir === env.configDir)) continue;
+    if (effective[family].some((r) => samePhysicalDir(r.configDir, env.configDir))) continue;
     out[family] = env.configDir;
   }
   return out;

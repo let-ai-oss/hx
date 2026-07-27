@@ -52,6 +52,7 @@ import {
   offsetFor,
   recordHeal,
   reconcileDestinations,
+  persistState,
   setArtifactHash,
   setOffsetFor,
   stampEffectiveRoots,
@@ -1219,6 +1220,35 @@ function electUploaders(
  * newest mtime wins (tie: largest), losers are shadowed. Needs no state —
  * the child's identity is fully encoded in its discovered shape.
  */
+/**
+ * Pure planner for child-lane uploader flips. Election is stateless; when a
+ * lane's winner CHANGES (the copied-tree race: fresh copy out-mtimes the live
+ * file once, then loses again), the incoming winner's existing offsets
+ * describe a canonical some OTHER file last wrote — appending from them would
+ * interleave two files' bytes, and child lanes have no offsets audit to heal
+ * that. The plan: remember each lane's winner; on a flip, zero the new
+ * winner's offsets so its next upload is a clean replace-from-zero (children
+ * are small — one re-upload per flip is the whole cost). First sighting of a
+ * lane is NOT a flip: existing offsets belong to that same path.
+ */
+export function planChildLaneResets(
+  elected: DiscoveredChildFile[],
+  prev: Record<string, string>,
+): { nextMap: Record<string, string>; resetPaths: string[]; changed: boolean } {
+  const nextMap = { ...prev };
+  const resetPaths: string[] = [];
+  let changed = false;
+  for (const c of elected) {
+    const lane = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    const before = nextMap[lane];
+    if (before === c.path) continue;
+    if (before !== undefined) resetPaths.push(c.path);
+    nextMap[lane] = c.path;
+    changed = true;
+  }
+  return { nextMap, resetPaths, changed };
+}
+
 export function electChildUploaders(
   children: DiscoveredChildFile[],
   log?: (msg: string) => void,
@@ -1278,9 +1308,9 @@ export async function computeSyncSnapshot(
   rootsOverride?: ResolvedRoots,
 ): Promise<SyncSnapshot> {
   const settings = await readSettings();
-  // The UI server passes the daemon's stamped roots so its numbers describe
-  // what the background service actually watches; without an override we
-  // resolve for THIS process (daemon and CLI one-shots).
+  // Callers that must describe the BACKGROUND service's surface (the CLI's
+  // stamp-first paths) pass rootsOverride; without it we resolve for THIS
+  // process (the daemon itself, and true one-shots like `hx tick`).
   const roots = rootsOverride ?? resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
     discoverClaudeFiles(roots.claude),
@@ -1557,7 +1587,20 @@ export async function tickOnce(
     const parentByArtifactSession = buildChildParentIndex(state);
     try {
       const { children, runs } = await discoverClaudeChildren(roots.claude);
-      for (const c of electChildUploaders(children, log)) {
+      const electedChildren = electChildUploaders(children, log);
+      const lanePlan = planChildLaneResets(electedChildren, state.childUploaders ?? {});
+      if (lanePlan.changed) {
+        for (const p of lanePlan.resetPaths) {
+          const fs = state.files[p];
+          if (fs && Object.keys(fs.offsets).length > 0) {
+            fs.offsets = {};
+            log(`[hx] child lane uploader switched — re-uploading ${path.basename(p)} from zero`);
+          }
+        }
+        state.childUploaders = lanePlan.nextMap;
+        await persistState(scope);
+      }
+      for (const c of electedChildren) {
         let pendingChild = state.files[c.path];
         if (pendingChild) {
           const reconciled = reconcileChildParent(
@@ -1653,16 +1696,27 @@ export async function startWatch(
   // UI server and doctor describe what THIS long-running loop watches. Gated
   // to the main lane's persistent daemon: `hx tick` / `watch --once` / the
   // --local tee run with an arbitrary shell env and must not overwrite it.
+  // The latch advances only after the persist SUCCEEDS (an unwritable
+  // ~/.let/hx must retry next tick, not go silent for the daemon's lifetime),
+  // and the stamp refreshes on an interval even when unchanged, so a stomp by
+  // a stray foreground `hx watch` from an env-carrying shell heals itself.
+  const RESTAMP_INTERVAL_MS = 10 * 60_000;
   let lastRootsSig = "";
+  let lastStampAtMs = 0;
   const publishRoots = async (settings: HxSettings): Promise<void> => {
     if (opts.oneShot || scopeOf(cfg) !== "main") return;
     const roots = resolveDataRoots(settings);
     const sig = rootsSignature(roots);
-    if (sig === lastRootsSig) return;
-    const changed = lastRootsSig !== "";
-    lastRootsSig = sig;
-    await stampEffectiveRoots(roots);
-    if (changed) log(`[hx] watch roots updated: ${describeRoots(roots)}`);
+    if (sig === lastRootsSig && Date.now() - lastStampAtMs < RESTAMP_INTERVAL_MS) return;
+    const changed = lastRootsSig !== "" && sig !== lastRootsSig;
+    try {
+      await stampEffectiveRoots(roots);
+      lastRootsSig = sig;
+      lastStampAtMs = Date.now();
+      if (changed) log(`[hx] watch roots updated: ${describeRoots(roots)}`);
+    } catch (err) {
+      log(`[hx] couldn't persist watch roots: ${(err as Error).message}`);
+    }
   };
 
   // Last time anything reached the gateway (upload or beat). Uploads count as
@@ -1711,9 +1765,13 @@ export async function startWatch(
   let wasPaused = false;
 
   const run = async () => {
-    if (Date.now() < pauseUploadsUntilMs) return;
     if (passBusy) return;
     const settings = await readSettings();
+    // Stamping is observation, not an upload: it must track Watched Locations
+    // edits even while sync is paused or uploads are backing off, or the UI's
+    // roots list (and hx status) silently freezes in exactly those states.
+    await publishRoots(settings);
+    if (Date.now() < pauseUploadsUntilMs) return;
     if (isPaused(settings)) {
       if (!wasPaused) {
         wasPaused = true;
@@ -1728,7 +1786,6 @@ export async function startWatch(
     }
     passBusy = true;
     try {
-      await publishRoots(settings);
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();

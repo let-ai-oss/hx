@@ -35,6 +35,7 @@ export function Privacy() {
   const [cmdCopied, setCmdCopied] = useState(false);
   const ruleRef = useRef<HTMLInputElement>(null);
   const [dirVals, setDirVals] = useState<{ claude: string; codex: string }>({ claude: "", codex: "" });
+  const [dirErrs, setDirErrs] = useState<{ claude: string; codex: string }>({ claude: "", codex: "" });
 
   const paused = settings?.pause != null;
   const personalOn = settings?.personalSync !== false;
@@ -50,11 +51,29 @@ export function Privacy() {
     }
   };
 
-  const doAddDir = (family: "claude" | "codex") => {
-    const v = dirVals[family].trim();
+  const setDirErr = (family: "claude" | "codex", msg: string) =>
+    setDirErrs((prev) => ({ ...prev, [family]: msg }));
+
+  const doAddDir = async (family: "claude" | "codex", raw?: string) => {
+    const v = (raw ?? dirVals[family]).trim();
     if (!v) return;
-    addDataDir(family, v);
-    setDirVals((prev) => ({ ...prev, [family]: "" }));
+    // Pre-check the two knowable rejections so the input never appears to
+    // accept-and-drop; anything else surfaces the server's own 400 text.
+    if (!(v.startsWith("/") || v === "~" || v.startsWith("~/"))) {
+      setDirErr(family, "Enter an absolute path, or one starting with ~/.");
+      return;
+    }
+    if ((settings?.dataDirs?.[family] ?? []).length >= 8) {
+      setDirErr(family, "At most 8 locations per tool — remove one first.");
+      return;
+    }
+    const err = await addDataDir(family, v);
+    if (err) {
+      setDirErr(family, err);
+      return;
+    }
+    setDirErr(family, "");
+    if (raw === undefined) setDirVals((prev) => ({ ...prev, [family]: "" }));
   };
 
   return (
@@ -144,7 +163,7 @@ export function Privacy() {
                       <span className="ico"><FolderIc /></span>
                       <span className="p">{suggestion}</span>
                       <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>set in your shell — not watched by the background service</span>
-                      <button className="btn sm" onClick={() => addDataDir(key, suggestion)}>Add</button>
+                      <button className="btn sm" onClick={() => void doAddDir(key, suggestion)}>Add</button>
                     </div>
                   )}
                   <div className="ruleadd">
@@ -153,10 +172,13 @@ export function Privacy() {
                       placeholder={key === "claude" ? "/path/to/claude-data-dir" : "/path/to/codex-home"}
                       value={dirVals[key]}
                       onChange={(e) => setDirVals((prev) => ({ ...prev, [key]: e.target.value }))}
-                      onKeyDown={(e) => { if (e.key === "Enter") doAddDir(key); }}
+                      onKeyDown={(e) => { if (e.key === "Enter") void doAddDir(key); }}
                     />
-                    <button className="btn sm" disabled={!settings} onClick={() => doAddDir(key)}>Add</button>
+                    <button className="btn sm" disabled={!settings} onClick={() => void doAddDir(key)}>Add</button>
                   </div>
+                  {dirErrs[key] && (
+                    <div className="rulerow"><span className="st warny">{dirErrs[key]}</span></div>
+                  )}
                 </div>
               );
             })}

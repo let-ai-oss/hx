@@ -10,6 +10,7 @@ import {
   isUnderRoots,
   resolveDataRoots,
   rootsSignature,
+  samePhysicalDir,
   type DataRoot,
 } from "./roots.js";
 
@@ -42,14 +43,19 @@ describe("resolveDataRoots", () => {
       CLAUDE_CONFIG_DIR: b,
       CODEX_HOME: join(base, "codex-home"),
     });
+    // The default root's `exists` reflects the machine running the tests
+    // (CI has no ~/.claude) — assert identity/origin for it, exists only for
+    // the tmp-based entries, which are deterministic.
     assert.deepEqual(
-      r.claude.map((d) => [d.configDir, d.origin, d.exists]),
+      r.claude.map((d) => [d.configDir, d.origin]),
       [
-        [DEFAULT_CLAUDE_ROOT, "default", true],
-        [a, "settings", true],
-        [b, "env", false], // listed even though missing — arms for creation
+        [DEFAULT_CLAUDE_ROOT, "default"],
+        [a, "settings"],
+        [b, "env"],
       ],
     );
+    assert.equal(r.claude[1]?.exists, true);
+    assert.equal(r.claude[2]?.exists, false); // listed though missing — arms for creation
     assert.deepEqual(
       r.codex.map((d) => [d.configDir, d.origin]),
       [
@@ -95,12 +101,10 @@ describe("resolveDataRoots", () => {
       CLAUDE_CONFIG_DIR: missing,
     });
     assert.deepEqual(
-      r.claude.map((d) => [d.configDir, d.exists]),
-      [
-        [DEFAULT_CLAUDE_ROOT, true],
-        [missing, false],
-      ],
+      r.claude.map((d) => d.configDir),
+      [DEFAULT_CLAUDE_ROOT, missing],
     );
+    assert.equal(r.claude[1]?.exists, false);
   });
 });
 
@@ -111,6 +115,22 @@ describe("isUnderRoots", () => {
     assert.equal(isUnderRoots("/data/hx-a/projects/x/s.jsonl", roots), true);
     assert.equal(isUnderRoots("/data/hx-ab/projects/x/s.jsonl", roots), false);
     assert.equal(isUnderRoots("/elsewhere", roots), false);
+  });
+});
+
+describe("samePhysicalDir", () => {
+  it("matches identical strings, symlinked twins, and rejects distinct dirs", () => {
+    const base = tmp();
+    const real = join(base, "real");
+    const link = join(base, "link");
+    mkdirSync(real);
+    symlinkSync(real, link);
+    assert.equal(samePhysicalDir(real, real), true);
+    assert.equal(samePhysicalDir(real, link), true);
+    assert.equal(samePhysicalDir(real, join(base, "other")), false);
+    // Missing dirs fall back to string identity.
+    assert.equal(samePhysicalDir("/nope/a", "/nope/a"), true);
+    assert.equal(samePhysicalDir("/nope/a", "/nope/b"), false);
   });
 });
 

@@ -226,7 +226,12 @@ async function autoStartDaemon(
     // the revoked one) or there's still a backlog to push. A user-paused device
     // is deliberately behind — restarting wouldn't (and shouldn't) change that.
     const settings = await readSettings();
-    const snap = await computeSyncSnapshot().catch(() => null);
+    // Stamp-first roots: measure the backlog over what the DAEMON watches. A
+    // CLAUDE_CONFIG_DIR visible only to this shell would otherwise count
+    // sessions the daemon (correctly) never syncs — a permanently "behind"
+    // reading that restarts a healthy daemon on every invocation.
+    const { roots: snapRoots } = await effectiveRootsForCli(settings);
+    const snap = await computeSyncSnapshot(undefined, snapRoots).catch(() => null);
     const behind = !isPaused(settings) && (snap ? snap.done < snap.total : false);
     const remaining = snap ? Math.max(0, snap.total - snap.done) : 0;
     if (opts.tokenRefreshed || behind) {
@@ -682,7 +687,12 @@ async function cmdRetry(): Promise<void> {
     return;
   }
   const cfg = await ensureConfig();
-  const report = await computeSyncReport();
+  // Stamp-first roots: the blocked set must be computed over what the DAEMON
+  // watches, not this shell's env (a container daemon inherits shell env the
+  // cron/ssh shell running retry may lack — self-resolution would early-exit
+  // "no blocked sessions" and never release the daemon's holds).
+  const { roots: retryRoots } = await effectiveRootsForCli(await readSettings());
+  const report = await computeSyncReport(retryRoots);
   if (report.skipped.length === 0) {
     log("No blocked sessions to retry.");
     return;

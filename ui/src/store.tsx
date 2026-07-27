@@ -100,7 +100,8 @@ interface AppState {
   dataRoots: DataRootInfo[];
   dataRootsFrom: "daemon" | "local";
   shellDetected: { claude?: string; codex?: string };
-  addDataDir: (family: "claude" | "codex", dir: string) => void;
+  /** Resolves to null on success, or the server's error text to show inline. */
+  addDataDir: (family: "claude" | "codex", dir: string) => Promise<string | null>;
   removeDataDir: (family: "claude" | "codex", dir: string) => void;
   daemonAct: (action: "start" | "stop" | "restart") => Promise<string>;
   retryBlockedAct: () => Promise<string>;
@@ -389,13 +390,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const removeRule = (v: string) => {
     patch({ excludeRules: (settings?.excludeRules ?? []).filter((r) => r !== v) });
   };
-  // Watched-locations settings. The full dataDirs object is sent each time
-  // (same replace semantics as excludedFolders); the server validates and the
-  // daemon adopts the new root within one tick.
-  const addDataDir = (family: "claude" | "codex", dir: string) => {
+  // Watched-locations settings. The full dataDirs object is sent each time;
+  // the server validates strictly (400 + message) and the daemon adopts the
+  // new root within one tick. Unlike the generic patch(), add surfaces the
+  // server's rejection text so a refused location never LOOKS accepted.
+  const addDataDir = async (family: "claude" | "codex", dir: string): Promise<string | null> => {
     const cur = settings?.dataDirs ?? { claude: [], codex: [] };
-    if (cur[family].includes(dir)) return;
-    patch({ dataDirs: { ...cur, [family]: [...cur[family], dir] } });
+    if (cur[family].includes(dir)) return null;
+    try {
+      const s = await api.patchSettings({ dataDirs: { ...cur, [family]: [...cur[family], dir] } });
+      setSettings(s);
+      setTimeout(() => refetchSnap.current(), 2_000);
+      return null;
+    } catch (err) {
+      return err instanceof Error && err.message ? err.message : "couldn't save this location";
+    }
   };
   const removeDataDir = (family: "claude" | "codex", dir: string) => {
     const cur = settings?.dataDirs ?? { claude: [], codex: [] };

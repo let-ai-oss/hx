@@ -167,9 +167,21 @@ export async function writeSettings(
 ): Promise<HxSettings> {
   const current = await readSettings(path);
   const next: HxSettings = { ...current, ...patch };
-  // Normalize on write as well as read, so a patch that arrived un-normalized
+  // dataDirs merges PER FAMILY: the validator accepts a patch that names only
+  // one family, so an omitted family must mean "unchanged" — a whole-object
+  // replace would silently erase the other family's roots on a 200. Also
+  // normalize on write as well as read, so a patch that arrived un-normalized
   // (older UI, hand-edited file) never persists a non-canonical root.
-  next.dataDirs = parseDataDirs(next.dataDirs);
+  const patchDirs = (patch as { dataDirs?: unknown }).dataDirs;
+  if (patchDirs !== undefined && patchDirs !== null && typeof patchDirs === "object" && !Array.isArray(patchDirs)) {
+    const pd = patchDirs as Record<string, unknown>;
+    next.dataDirs = parseDataDirs({
+      claude: pd.claude === undefined ? current.dataDirs.claude : pd.claude,
+      codex: pd.codex === undefined ? current.dataDirs.codex : pd.codex,
+    });
+  } else {
+    next.dataDirs = parseDataDirs(next.dataDirs);
+  }
   const tmp = `${path}.tmp`;
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- see readSettings.
   await writeFile(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
