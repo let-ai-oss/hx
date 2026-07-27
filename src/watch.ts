@@ -1391,10 +1391,12 @@ export interface SyncReport {
   snapshot: SyncSnapshot;
   behind: SyncBehindEntry[];
   skipped: SyncSkippedEntry[];
-  /** Partially-uploaded state entries that sit under NO current data root —
-   *  a root was removed (or the daemon hasn't adopted one yet). They are not
-   *  "behind" (nothing will ever pick them up under the current config), so
-   *  they get their own count instead of nagging the behind list forever. */
+  /** DISTINCT partially-uploaded sessions sitting under NO current data root
+   *  — a root was removed (or the daemon hasn't adopted one yet). They are
+   *  not "behind" (nothing will ever pick them up under the current config),
+   *  so they get their own count instead of nagging the behind list forever.
+   *  Deduped per session, and a session with a live behind entry is never
+   *  double-billed here (see collectBehind). */
   unwatched: number;
 }
 
@@ -1464,9 +1466,13 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
 
 /** Pure fold of state entries into behind/unwatched buckets — unit-tested.
  *  behind = never-finished uploads whose file left discovery but still sits
- *  under a watched root (deleted or aged out); unwatched = the same shape
- *  under NO current root (a removed data root) — nothing will ever pick those
- *  up under the current config, so they must not nag the behind list. */
+ *  under a watched root (deleted or aged out); unwatched = DISTINCT SESSIONS
+ *  in the same shape under NO current root (a removed data root) — nothing
+ *  will ever pick those up under the current config, so they must not nag
+ *  the behind list. Sessions, not file entries: cwd-change twins are one
+ *  session, and a session still reportable as behind under a watched root is
+ *  accounted there, never double-billed as unwatched too (mirrors the
+ *  per-session dedupe hx status applies to the behind display). */
 export function collectBehind(
   state: HxState,
   discovered: Set<string>,
@@ -1474,17 +1480,20 @@ export function collectBehind(
   roots: DataRoot[],
 ): { behind: SyncBehindEntry[]; unwatched: number } {
   const behind: SyncBehindEntry[] = [];
-  let unwatched = 0;
+  const behindSessions = new Set<string>();
+  const unwatchedSessions = new Set<string>();
   for (const [p, fs] of Object.entries(state.files)) {
     if (discovered.has(p)) continue;
     if (liveSessions.has(`${fs.family}:${fs.sessionId}`)) continue; // shadowed twin
     if (fs.lastKnownSize === undefined) continue; // legacy entry — size unknown
     const uploaded = minOffset(fs);
     if (uploaded >= fs.lastKnownSize) continue;
+    const sessionKey = `${fs.family}:${fs.sessionId}`;
     if (!isUnderRoots(p, roots)) {
-      unwatched += 1;
+      unwatchedSessions.add(sessionKey);
       continue;
     }
+    behindSessions.add(sessionKey);
     behind.push({
       path: p,
       sessionId: fs.sessionId,
@@ -1493,7 +1502,10 @@ export function collectBehind(
       sourceGone: !existsSync(p),
     });
   }
-  return { behind, unwatched };
+  // Post-loop (entry order is arbitrary): drop unwatched sessions that also
+  // have a behind entry — one session, one row.
+  for (const key of behindSessions) unwatchedSessions.delete(key);
+  return { behind, unwatched: unwatchedSessions.size };
 }
 
 export async function tickOnce(

@@ -121,29 +121,43 @@ export function isUnderRoots(p: string, roots: DataRoot[]): boolean {
 }
 
 /**
- * Reject NEW dataDirs entries that are just the family default in disguise
- * (same string or a symlinked spelling). The resolver would dedupe them into
- * the default-origin entry anyway, leaving a ghost settings row that renders
- * no Remove button, looks like a no-op add, and permanently eats one of the
- * 8 slots. Entries already present in the CURRENT settings are exempt — the
- * UI PATCHes full arrays, and a stale alias (a dir symlinked to the default
- * after it was added) must not brick every later mutation with a 400 about
- * an entry the user didn't touch; the write path self-heals those instead
- * (see parseDataDirList). Returns an error message, or null when clean.
+ * Reject NEW dataDirs entries that are already-watched locations in disguise
+ * — the family default, an existing settings entry, or an earlier entry of
+ * the same patch, reached via a different (typically symlinked) spelling.
+ * The resolver would dedupe them at watch time anyway, leaving a ghost
+ * settings row that renders no Remove button, looks like a no-op add, and
+ * permanently eats one of the 8 slots. Entries already present in the
+ * CURRENT settings are exempt — the UI PATCHes full arrays, and a stale
+ * alias (a dir symlinked to a watched location after it was added) must not
+ * brick every later mutation with a 400 about an entry the user didn't
+ * touch; the write path self-heals those instead (see parseDataDirList).
+ * Returns an error message, or null when clean.
  */
-export function duplicateOfDefaultError(
+export function duplicateRootError(
   v: { claude?: unknown; codex?: unknown },
   existing?: { claude?: string[]; codex?: string[] },
 ): string | null {
   const check = (list: unknown, prior: string[], def: string, label: string): string | null => {
     if (!Array.isArray(list)) return null;
+    const accepted: string[] = [];
     for (const item of list) {
       if (typeof item !== "string") continue;
       const dir = normalizeDataDir(item);
-      if (!dir || prior.includes(dir)) continue;
+      if (!dir) continue;
+      if (prior.includes(dir)) {
+        accepted.push(dir);
+        continue; // pre-existing entry — the write path's to self-heal
+      }
       if (samePhysicalDir(dir, def)) {
         return `${label}: that location is already watched by default`;
       }
+      if (
+        prior.some((p) => samePhysicalDir(p, dir)) ||
+        accepted.some((a) => samePhysicalDir(a, dir))
+      ) {
+        return `${label}: that location is already watched`;
+      }
+      accepted.push(dir);
     }
     return null;
   };

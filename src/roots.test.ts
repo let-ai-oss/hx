@@ -7,7 +7,7 @@ import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import {
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
-  duplicateOfDefaultError,
+  duplicateRootError,
   isUnderRoots,
   resolveDataRoots,
   rootsSignature,
@@ -125,12 +125,12 @@ describe("isUnderRoots", () => {
   });
 });
 
-describe("duplicateOfDefaultError", () => {
+describe("duplicateRootError", () => {
   it("rejects the family default (any spelling) and passes real extras", () => {
-    assert.match(duplicateOfDefaultError({ claude: [DEFAULT_CLAUDE_ROOT] }) ?? "", /already watched/);
-    assert.match(duplicateOfDefaultError({ codex: [`${DEFAULT_CODEX_ROOT}/`] }) ?? "", /already watched/);
-    assert.equal(duplicateOfDefaultError({ claude: ["/data/elsewhere"], codex: [] }), null);
-    assert.equal(duplicateOfDefaultError({}), null);
+    assert.match(duplicateRootError({ claude: [DEFAULT_CLAUDE_ROOT] }) ?? "", /already watched/);
+    assert.match(duplicateRootError({ codex: [`${DEFAULT_CODEX_ROOT}/`] }) ?? "", /already watched/);
+    assert.equal(duplicateRootError({ claude: ["/data/elsewhere"], codex: [] }), null);
+    assert.equal(duplicateRootError({}), null);
   });
 
   it("exempts entries already present in current settings — stale aliases must not brick mutations", () => {
@@ -138,19 +138,34 @@ describe("duplicateOfDefaultError", () => {
     // to the default; validating only NEW entries lets unrelated mutations
     // through (the write path self-heals the alias).
     assert.equal(
-      duplicateOfDefaultError(
+      duplicateRootError(
         { claude: [DEFAULT_CLAUDE_ROOT], codex: [] },
         { claude: [DEFAULT_CLAUDE_ROOT], codex: [] },
       ),
       null,
     );
     assert.match(
-      duplicateOfDefaultError(
+      duplicateRootError(
         { claude: ["/data/other", DEFAULT_CLAUDE_ROOT] },
         { claude: ["/data/other"], codex: [] },
       ) ?? "",
       /already watched/,
     );
+  });
+
+  it("rejects a NEW symlinked spelling of an already-watched custom root", () => {
+    const base = tmp();
+    const real = join(base, "real-root");
+    const link = join(base, "twin-root");
+    mkdirSync(real);
+    symlinkSync(real, link);
+    // Twin of an existing settings entry → 400.
+    assert.match(
+      duplicateRootError({ claude: [real, link] }, { claude: [real], codex: [] }) ?? "",
+      /already watched/,
+    );
+    // Twin pair arriving in the SAME patch → 400 too.
+    assert.match(duplicateRootError({ claude: [real, link] }) ?? "", /already watched/);
   });
 });
 

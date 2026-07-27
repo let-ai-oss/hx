@@ -75,13 +75,16 @@ function parseDataDirList(v: unknown, defaultRoot: string): string[] {
     if (typeof item !== "string") continue;
     const dir = normalizeDataDir(item);
     if (!dir || out.includes(dir)) continue;
-    // Self-heal aliases of the family default (same string, or a dir that
-    // BECAME a symlink to it after being added): the resolver would dedupe
-    // them into the default anyway, but a lingering entry renders no Remove
-    // row and would trip full-array re-validation on every later mutation —
-    // bricking the whole card. Dropped on read AND persisted-dropped on the
-    // next write.
+    // Self-heal PHYSICAL aliases — of the family default, or of an entry
+    // already kept from this list (same dir via a symlinked spelling, or a
+    // dir that BECAME a symlink after it was added). The resolver would
+    // dedupe them at watch time anyway, but a lingering alias renders no
+    // Remove row (ghost), eats one of the 8 slots, and — for default
+    // aliases — used to trip full-array re-validation on every later
+    // mutation. Dropped on read AND persisted-dropped on the next write;
+    // first spelling wins.
     if (samePhysicalDir(dir, defaultRoot)) continue;
+    if (out.some((kept) => samePhysicalDir(kept, dir))) continue;
     out.push(dir);
     if (out.length >= MAX_DATA_DIRS_PER_FAMILY) break;
   }

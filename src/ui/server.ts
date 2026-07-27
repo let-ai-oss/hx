@@ -22,7 +22,7 @@ import { instanceIdentity } from "./instance.js";
 import type { SessionVM, UiSnapshot, LogLevel } from "./data.js";
 import type { PreviewLine } from "./preview.js";
 import { dataDirsPatchError } from "../settings.js";
-import { duplicateOfDefaultError } from "../roots.js";
+import { duplicateRootError } from "../roots.js";
 
 /** Read-only data the API serves; injected so the handler tests with fakes. */
 export interface UiProviders {
@@ -241,7 +241,7 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
             const current = (await ctx.actions.readSettings()) as {
               dataDirs?: { claude?: string[]; codex?: string[] };
             } | null;
-            err = duplicateOfDefaultError(
+            err = duplicateRootError(
               patch.dataDirs as { claude?: unknown; codex?: unknown },
               current?.dataDirs,
             );

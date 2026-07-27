@@ -271,6 +271,23 @@ describe("collectBehind", () => {
     assert.equal(unwatched, 1);
   });
 
+  it("counts unwatched as DISTINCT sessions, and never double-bills a behind session", () => {
+    const st: HxState = {
+      files: {
+        // Two entries, one session, both under a removed root → 1, not 2.
+        "/r/removed/projects/-p/s5.jsonl": entry("/r/removed/projects/-p/s5.jsonl", "s5"),
+        "/r/removed/projects/-q/s5-twin.jsonl": entry("/r/removed/projects/-q/s5-twin.jsonl", "s5"),
+        // Session with a behind entry under a watched root AND an unwatched
+        // twin → behind row only.
+        "/r/a/projects/-p/s6.jsonl": entry("/r/a/projects/-p/s6.jsonl", "s6"),
+        "/r/removed/projects/-p/s6-twin.jsonl": entry("/r/removed/projects/-p/s6-twin.jsonl", "s6"),
+      },
+    };
+    const { behind, unwatched } = collectBehind(st, new Set(), new Set(), roots);
+    assert.deepEqual(behind.map((b) => b.sessionId), ["s6"]);
+    assert.equal(unwatched, 1);
+  });
+
   it("skips discovered files, shadowed twins, finished and legacy entries", () => {
     const st: HxState = {
       files: {
