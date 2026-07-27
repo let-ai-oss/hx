@@ -36,12 +36,13 @@ export function hashContent(s: string): string {
 
 /**
  * Read <tasksDir>/<sessionId>/*.json into a normalized task list, probing the
- * given tasks dirs in root order — the first root that has a dir for this
- * session wins (a session's sidecars live under the same root the session ran
- * with; the same UUIDv4 session appearing under two roots is the copied-tree
- * twin case, and first-in-order is the deliberate tiebreak). Returns null when
- * no root has a tasks dir for the session; [] when a dir exists but is empty.
- * Files are sorted by numeric id so they read in creation order.
+ * given tasks dirs IN ORDER and taking the first that exists. Order matters
+ * when a copied tree left a frozen twin of the session's tasks under another
+ * root — callers put the live transcript's own root first (see
+ * orderTasksDirs in watch.ts) so the twin can't shadow the updating set.
+ * Returns null when no root has a tasks dir for the session; [] when a dir
+ * exists but is empty. Files are sorted by numeric id so they read in
+ * creation order.
  */
 export async function readTaskSet(
   sessionId: string,

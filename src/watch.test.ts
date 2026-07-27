@@ -183,6 +183,15 @@ describe("electChildUploaders", () => {
     const big = child({ path: "/p/big.jsonl", size: 50 });
     assert.deepEqual(electChildUploaders([small, big]).map((c) => c.path), [big.path]);
   });
+
+  it("full ties (cp -a twins: equal mtime AND size) resolve deterministically by path", () => {
+    const a = child({ path: "/r/a/agent-a1.jsonl" });
+    const b = child({ path: "/r/b/agent-a1.jsonl" });
+    // Same winner regardless of discovery order — a readdir-order flip must
+    // not swap uploaders (each swap would cost a replace-from-zero).
+    assert.deepEqual(electChildUploaders([a, b]).map((c) => c.path), ["/r/a/agent-a1.jsonl"]);
+    assert.deepEqual(electChildUploaders([b, a]).map((c) => c.path), ["/r/a/agent-a1.jsonl"]);
+  });
 });
 
 describe("planChildLaneResets", () => {

@@ -180,7 +180,10 @@ export async function writeSettings(
       codex: pd.codex === undefined ? current.dataDirs.codex : pd.codex,
     });
   } else {
-    next.dataDirs = parseDataDirs(next.dataDirs);
+    // No dataDirs in the patch — or garbage (null/array) a direct caller
+    // slipped past the API validator. Either way: keep the current roots;
+    // parse re-normalizes legacy on-disk values, never wipes.
+    next.dataDirs = parseDataDirs(current.dataDirs);
   }
   const tmp = `${path}.tmp`;
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- see readSettings.

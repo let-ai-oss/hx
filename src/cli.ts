@@ -561,8 +561,14 @@ async function cmdStatus(): Promise<void> {
   // Which data roots the mirror watches — the daemon's stamped truth when
   // present, else resolved for this process. The report below is computed
   // over the SAME set, so the numbers describe the locations this row names.
-  const { roots: watchRoots } = await effectiveRootsForCli(settings);
-  rows.push(["Watching", formatRootsRow(watchRoots)]);
+  // A stamp from a daemon that is NOT currently running is last-known state,
+  // and the row says so rather than presenting it as present-tense truth.
+  const { roots: watchRoots, from: rootsFrom } = await effectiveRootsForCli(settings);
+  const daemonDown = ops.managerName !== "none" && !(await ops.state().catch(() => null))?.pid;
+  rows.push([
+    "Watching",
+    `${formatRootsRow(watchRoots)}${rootsFrom === "daemon" && daemonDown ? " (last known — daemon stopped)" : ""}`,
+  ]);
 
   // Local sync state remains useful even when the network probe is down: a
   // persisted destination hold should still name the affected org/repo.

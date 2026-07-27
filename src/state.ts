@@ -204,8 +204,9 @@ export interface HxState {
    *  (a copied tree raced the live file), the new winner must re-upload from
    *  zero or its stale offsets would append onto a canonical another file
    *  last wrote — and child lanes have no offsets audit to ever notice (see
-   *  planChildLaneResets in watch.ts). Entries age out with their sessions;
-   *  additive, older binaries ignore it. */
+   *  planChildLaneResets in watch.ts). Not pruned — entries are two short
+   *  strings per lane and lanes are bounded by real agent activity, same
+   *  growth class as `files`. Additive; older binaries ignore it. */
   childUploaders?: Record<string, string>;
 }
 

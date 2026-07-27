@@ -28,7 +28,7 @@ export function Privacy() {
     view, goto, openInspector, destinations, allFolders, isExcluded,
     settings, setPersonal, pickPause, resumeAll,
     addRule, removeRule, askConfirm, disconnectAct,
-    dataRoots, dataRootsFrom, shellDetected, addDataDir, removeDataDir,
+    dataRoots, dataRootsFrom, shellDetected, addDataDir, removeDataDir, snap,
   } = useApp();
   const [pauseMenuOpen, setPauseMenuOpen] = useState(false);
   const [ruleVal, setRuleVal] = useState("");
@@ -137,7 +137,7 @@ export function Privacy() {
             <b>Where session logs are read from</b>
             <p>
               <code className="hx">hx</code> mirrors sessions from these data folders. The defaults are always watched.
-              If a tool writes somewhere else (a relocated <span className="mono">CLAUDE_CONFIG_DIR</span> or <span className="mono">CODEX_HOME</span>), add that folder here — new sessions in it start syncing within seconds{dataRootsFrom === "local" ? ". Shown from this app’s own view — the background service hasn’t reported its watch list yet" : ""}.
+              If a tool writes somewhere else (a relocated <span className="mono">CLAUDE_CONFIG_DIR</span> or <span className="mono">CODEX_HOME</span>), add that folder here — new sessions in it start syncing within seconds{dataRootsFrom === "local" ? ". Shown from this app’s own view — the background service hasn’t reported its watch list yet" : snap?.device.daemon.pid == null ? ". The background service is stopped — this is its last-known list" : ""}.
             </p>
             {ROOT_FAMILIES.map(({ key, label }) => {
               const roots = dataRoots.filter((r) => r.family === key);
@@ -150,7 +150,7 @@ export function Privacy() {
                       <span className="ico"><FolderIc /></span>
                       <span className="p">{r.display}</span>
                       <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>
-                        {r.origin === "default" ? "default" : r.origin === "env" ? "from environment" : plural(r.files, "session")}
+                        {r.origin === "default" ? "default" : r.origin === "env" ? "from environment" : plural(r.files, "file")}
                         {r.exists ? "" : " · not created yet"}
                       </span>
                       {r.origin === "settings" && (

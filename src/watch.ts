@@ -678,7 +678,7 @@ async function ingestOne(
 
   // Best-effort sidecar sync — a failure must never fail the transcript.
   if (artifactText !== null) {
-    await syncArtifacts(cfg, fState, artifactText, log).catch((err) => {
+    await syncArtifacts(cfg, fState, artifactText, log, file.rootDir).catch((err) => {
       log(`  [artifacts] ${fState.sessionId.slice(0, 8)}…: ${(err as Error).message}`);
     });
   }
@@ -922,6 +922,19 @@ async function syncTeamMirror(cfg: HxConfig, log: (msg: string) => void): Promis
   }
 }
 
+/** Tasks dirs in probe order: the live transcript's own root first. A copied
+ *  tree can hold a FROZEN twin of a session's tasks under another root (and
+ *  the default root always sorts first in resolution order) — so
+ *  first-existing-wins must probe the root the elected transcript actually
+ *  lives under before any twin, or the server mirrors a stale task list
+ *  forever while the transcript stays live. */
+function orderTasksDirs(roots: ResolvedRoots, preferredRootDir?: string): string[] {
+  const dirs = roots.claude.map((r) => claudeTasksDir(r.configDir));
+  if (!preferredRootDir) return dirs;
+  const pref = claudeTasksDir(preferredRootDir);
+  return [pref, ...dirs.filter((d) => d !== pref)];
+}
+
 /**
  * After a session's transcript chunk lands, sync its sidecar artifacts:
  *   • tasks — the whole ~/.claude/tasks/<sessionId>/ set, if any
@@ -933,10 +946,11 @@ async function syncArtifacts(
   fState: FileState,
   chunkText: string,
   log: (msg: string) => void,
+  preferredRootDir?: string,
 ): Promise<void> {
   const scope = scopeOf(cfg);
   const settings = await readSettings();
-  const tasksDirs = resolveDataRoots(settings).claude.map((r) => claudeTasksDir(r.configDir));
+  const tasksDirs = orderTasksDirs(resolveDataRoots(settings), preferredRootDir);
   const tasks = await readTaskSet(fState.sessionId, tasksDirs);
   if (tasks && tasks.length > 0) {
     const key = `${fState.family}:${fState.sessionId}:tasks`;
@@ -990,14 +1004,15 @@ export async function backfillArtifacts(
     log("[hx] no tasks dirs to backfill under the watched roots");
     return { tasks: 0, plans: 0, failed: 0 };
   }
-  // Map sessionId → { family, jsonl path } from discovered Claude logs so we
-  // stamp the right family and can find each session's plan attachment.
+  // Map sessionId → { family, jsonl path, rootDir } from discovered Claude
+  // logs so we stamp the right family, find each session's plan attachment,
+  // and probe the session's OWN root's tasks dir before any copied twin.
   const claude = await discoverClaudeFiles(roots.claude);
-  const byId = new Map<string, { family: string; path: string }>();
+  const byId = new Map<string, { family: string; path: string; rootDir: string }>();
   for (const f of claude) {
     const head = await readHead(f.path, f.source);
     const sid = head.sessionId ?? path.basename(f.path, ".jsonl");
-    if (!byId.has(sid)) byId.set(sid, { family: head.family, path: f.path });
+    if (!byId.has(sid)) byId.set(sid, { family: head.family, path: f.path, rootDir: f.rootDir });
   }
   let tasksN = 0;
   let plansN = 0;
@@ -1006,7 +1021,7 @@ export async function backfillArtifacts(
     const info = byId.get(sid);
     const family = (info?.family ?? "claude-cli") as never;
     try {
-      const tasks = await readTaskSet(sid, tasksDirs);
+      const tasks = await readTaskSet(sid, orderTasksDirs(roots, info?.rootDir));
       if (tasks && tasks.length > 0) {
         await uploadTasks(cfg, { family, sessionId: sid, tasks });
         await setArtifactHash(`${info?.family ?? "claude-cli"}:${sid}:tasks`, hashContent(JSON.stringify(tasks)), scopeOf(cfg));
@@ -1262,7 +1277,10 @@ export function electChildUploaders(
   }
   const active: DiscoveredChildFile[] = [];
   for (const list of byKey.values()) {
-    list.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size);
+    // Deterministic final tiebreak: `cp -a`/`rsync -a` twins share mtime AND
+    // size, and a readdir-order flip would otherwise swap the winner — which,
+    // for children, now costs a replace-from-zero via the lane-flip reset.
+    list.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size || a.path.localeCompare(b.path));
     active.push(list[0]!);
     for (const twin of list.slice(1)) {
       if (log && !loggedShadowed.has(twin.path)) {
@@ -1703,6 +1721,7 @@ export async function startWatch(
   const RESTAMP_INTERVAL_MS = 10 * 60_000;
   let lastRootsSig = "";
   let lastStampAtMs = 0;
+  let stampFailureLogged = false;
   const publishRoots = async (settings: HxSettings): Promise<void> => {
     if (opts.oneShot || scopeOf(cfg) !== "main") return;
     const roots = resolveDataRoots(settings);
@@ -1713,9 +1732,15 @@ export async function startWatch(
       await stampEffectiveRoots(roots);
       lastRootsSig = sig;
       lastStampAtMs = Date.now();
+      stampFailureLogged = false;
       if (changed) log(`[hx] watch roots updated: ${describeRoots(roots)}`);
     } catch (err) {
-      log(`[hx] couldn't persist watch roots: ${(err as Error).message}`);
+      // Retries every tick (the latch didn't advance) — log the streak once,
+      // not 57k times a day into stdout.log.
+      if (!stampFailureLogged) {
+        stampFailureLogged = true;
+        log(`[hx] couldn't persist watch roots (will keep retrying): ${(err as Error).message}`);
+      }
     }
   };
 
@@ -1766,26 +1791,31 @@ export async function startWatch(
 
   const run = async () => {
     if (passBusy) return;
-    const settings = await readSettings();
-    // Stamping is observation, not an upload: it must track Watched Locations
-    // edits even while sync is paused or uploads are backing off, or the UI's
-    // roots list (and hx status) silently freezes in exactly those states.
-    await publishRoots(settings);
-    if (Date.now() < pauseUploadsUntilMs) return;
-    if (isPaused(settings)) {
-      if (!wasPaused) {
-        wasPaused = true;
-        const until = settings.pause?.untilMs;
-        log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
-      }
-      return;
-    }
-    if (wasPaused) {
-      wasPaused = false;
-      log(`[hx] sync resumed`);
-    }
+    // Take the mutex around EVERYTHING that awaits, the stamp included: it
+    // persists state.json, and an audit firing inside that await would see
+    // passBusy false, start, and then overlap the pass we're about to run —
+    // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
     try {
+      const settings = await readSettings();
+      // Stamping is observation, not an upload: it must track Watched
+      // Locations edits even while sync is paused or uploads are backing
+      // off, or the UI's roots list (and hx status) silently freezes in
+      // exactly those states.
+      await publishRoots(settings);
+      if (Date.now() < pauseUploadsUntilMs) return;
+      if (isPaused(settings)) {
+        if (!wasPaused) {
+          wasPaused = true;
+          const until = settings.pause?.untilMs;
+          log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
+        }
+        return;
+      }
+      if (wasPaused) {
+        wasPaused = false;
+        log(`[hx] sync resumed`);
+      }
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();

@@ -101,6 +101,17 @@ describe("parseDataDirs", () => {
     await writeSettings({ dataDirs: { codex: [] } as never }, p);
     assert.deepEqual((await readSettings(p)).dataDirs, { claude: ["/data/c2"], codex: [] });
   });
+
+  it("treats garbage dataDirs in a patch as unchanged, never a wipe", async () => {
+    const p = tmpPath();
+    await writeSettings({ dataDirs: { claude: ["/data/c1"], codex: ["/data/x1"] } }, p);
+    await writeSettings({ dataDirs: null as never }, p);
+    await writeSettings({ dataDirs: ["/sneaky"] as never }, p);
+    assert.deepEqual((await readSettings(p)).dataDirs, {
+      claude: ["/data/c1"],
+      codex: ["/data/x1"],
+    });
+  });
 });
 
 describe("dataDirsPatchError", () => {
