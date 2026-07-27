@@ -233,9 +233,19 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
         // garbage, but an API write should fail loudly instead of appearing
         // to accept a location it actually threw away.
         if ("dataDirs" in patch) {
-          const err =
-            dataDirsPatchError(patch.dataDirs) ??
-            duplicateOfDefaultError(patch.dataDirs as { claude?: unknown; codex?: unknown });
+          let err = dataDirsPatchError(patch.dataDirs);
+          if (!err) {
+            // Judge only entries the caller is ADDING: pre-existing ones are
+            // the write path's to self-heal, never a reason to 400 an
+            // unrelated mutation (full-array PATCH semantics).
+            const current = (await ctx.actions.readSettings()) as {
+              dataDirs?: { claude?: string[]; codex?: string[] };
+            } | null;
+            err = duplicateOfDefaultError(
+              patch.dataDirs as { claude?: unknown; codex?: unknown },
+              current?.dataDirs,
+            );
+          }
           if (err) return apiError(400, err);
         }
         return json(await ctx.actions.writeSettings(patch));

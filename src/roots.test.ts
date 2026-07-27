@@ -132,6 +132,26 @@ describe("duplicateOfDefaultError", () => {
     assert.equal(duplicateOfDefaultError({ claude: ["/data/elsewhere"], codex: [] }), null);
     assert.equal(duplicateOfDefaultError({}), null);
   });
+
+  it("exempts entries already present in current settings — stale aliases must not brick mutations", () => {
+    // "/data/claude" is a pre-existing entry whose dir later became a symlink
+    // to the default; validating only NEW entries lets unrelated mutations
+    // through (the write path self-heals the alias).
+    assert.equal(
+      duplicateOfDefaultError(
+        { claude: [DEFAULT_CLAUDE_ROOT], codex: [] },
+        { claude: [DEFAULT_CLAUDE_ROOT], codex: [] },
+      ),
+      null,
+    );
+    assert.match(
+      duplicateOfDefaultError(
+        { claude: ["/data/other", DEFAULT_CLAUDE_ROOT] },
+        { claude: ["/data/other"], codex: [] },
+      ) ?? "",
+      /already watched/,
+    );
+  });
 });
 
 describe("samePhysicalDir", () => {

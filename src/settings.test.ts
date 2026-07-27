@@ -1,8 +1,9 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_CLAUDE_ROOT } from "./roots.js";
 import {
   DEFAULT_SETTINGS,
   MAX_DATA_DIRS_PER_FAMILY,
@@ -91,6 +92,23 @@ describe("parseDataDirs", () => {
     assert.equal(parsed.claude[1], join(homedir(), "x"));
     assert.ok(parsed.claude.length <= MAX_DATA_DIRS_PER_FAMILY);
     assert.deepEqual(parsed.codex, []);
+  });
+
+  it("self-heals entries that alias the family default (would brick mutations)", async () => {
+    const parsed = parseDataDirs({
+      claude: [DEFAULT_CLAUDE_ROOT, `${DEFAULT_CLAUDE_ROOT}/`, "/data/real"],
+      codex: [],
+    });
+    assert.deepEqual(parsed.claude, ["/data/real"]);
+    // A poisoned on-disk file heals on the next unrelated write.
+    const p = tmpPath();
+    writeFileSync(
+      p,
+      JSON.stringify({ dataDirs: { claude: [DEFAULT_CLAUDE_ROOT, "/data/real"], codex: [] } }),
+    );
+    await writeSettings({ personalSync: false }, p);
+    const raw = JSON.parse(readFileSync(p, "utf-8")) as { dataDirs: { claude: string[] } };
+    assert.deepEqual(raw.dataDirs.claude, ["/data/real"]);
   });
 
   it("survives a legacy settings file with no dataDirs field", async () => {

@@ -22,9 +22,17 @@
 //                  like excludeRules, they arm for when the dir appears.
 
 import { homedir } from "node:os";
-import { isAbsolute, join, normalize } from "node:path";
+import { join } from "node:path";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { HX_DIR } from "./hx-home.js";
+import { normalizeDataDir } from "./pathnorm.js";
+import {
+  DEFAULT_CLAUDE_ROOT,
+  DEFAULT_CODEX_ROOT,
+  samePhysicalDir,
+} from "./roots.js";
+
+export { normalizeDataDir } from "./pathnorm.js";
 
 export const SETTINGS_PATH = join(HX_DIR, "settings.json");
 
@@ -60,41 +68,20 @@ export const DEFAULT_SETTINGS: HxSettings = {
 /** Hard cap per family — bounds the discovery fan-out a config can demand. */
 export const MAX_DATA_DIRS_PER_FAMILY = 8;
 
-/**
- * Normalize one data-dir root: trim, expand a leading `~`, require an
- * absolute path, collapse `.`/`..` segments and trailing separators. Returns
- * null for anything unusable (relative, empty, control characters) — callers
- * drop such entries rather than half-honoring them. Env values go through
- * this exact same funnel (see roots.ts) so a garbage CLAUDE_CONFIG_DIR can't
- * produce a non-canonical root.
- */
-export function normalizeDataDir(raw: string): string | null {
-  if (typeof raw !== "string") return null;
-  let p = raw.trim();
-  if (!p || /[\0\r\n]/.test(p)) return null;
-  if (p === "~") p = HOME;
-  else if (p.startsWith("~/")) p = join(HOME, p.slice(2));
-  if (!isAbsolute(p)) return null;
-  p = normalize(p);
-  // normalize() preserves a trailing separator — strip it (never the root).
-  // Platform-aware: `\` is a legal filename character on POSIX, so stripping
-  // it there would silently watch the wrong directory.
-  while (
-    p.length > 1 &&
-    (p.endsWith("/") || (process.platform === "win32" && p.endsWith("\\")))
-  ) {
-    p = p.slice(0, -1);
-  }
-  return p;
-}
-
-function parseDataDirList(v: unknown): string[] {
+function parseDataDirList(v: unknown, defaultRoot: string): string[] {
   if (!Array.isArray(v)) return [];
   const out: string[] = [];
   for (const item of v) {
     if (typeof item !== "string") continue;
     const dir = normalizeDataDir(item);
     if (!dir || out.includes(dir)) continue;
+    // Self-heal aliases of the family default (same string, or a dir that
+    // BECAME a symlink to it after being added): the resolver would dedupe
+    // them into the default anyway, but a lingering entry renders no Remove
+    // row and would trip full-array re-validation on every later mutation —
+    // bricking the whole card. Dropped on read AND persisted-dropped on the
+    // next write.
+    if (samePhysicalDir(dir, defaultRoot)) continue;
     out.push(dir);
     if (out.length >= MAX_DATA_DIRS_PER_FAMILY) break;
   }
@@ -104,7 +91,10 @@ function parseDataDirList(v: unknown): string[] {
 /** Parse + normalize a dataDirs value from disk or a settings patch. */
 export function parseDataDirs(v: unknown): DataDirs {
   const o = (v && typeof v === "object" && !Array.isArray(v) ? v : {}) as Record<string, unknown>;
-  return { claude: parseDataDirList(o.claude), codex: parseDataDirList(o.codex) };
+  return {
+    claude: parseDataDirList(o.claude, DEFAULT_CLAUDE_ROOT),
+    codex: parseDataDirList(o.codex, DEFAULT_CODEX_ROOT),
+  };
 }
 
 /**

@@ -20,7 +20,10 @@
 import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { normalizeDataDir, type HxSettings } from "./settings.js";
+import { normalizeDataDir } from "./pathnorm.js";
+// Type-only: settings.ts imports our constants at runtime, so this edge must
+// stay fully erased or the two modules would form a require cycle.
+import type { HxSettings } from "./settings.js";
 
 export type RootOrigin = "default" | "settings" | "env";
 
@@ -118,30 +121,35 @@ export function isUnderRoots(p: string, roots: DataRoot[]): boolean {
 }
 
 /**
- * Reject dataDirs entries that are just the family default in disguise (same
- * string or a symlinked spelling). The resolver would dedupe them into the
- * default-origin entry anyway, leaving a ghost settings row that renders no
- * Remove button, looks like a no-op add, and permanently eats one of the 8
- * slots. Returns an error message, or null when clean.
+ * Reject NEW dataDirs entries that are just the family default in disguise
+ * (same string or a symlinked spelling). The resolver would dedupe them into
+ * the default-origin entry anyway, leaving a ghost settings row that renders
+ * no Remove button, looks like a no-op add, and permanently eats one of the
+ * 8 slots. Entries already present in the CURRENT settings are exempt — the
+ * UI PATCHes full arrays, and a stale alias (a dir symlinked to the default
+ * after it was added) must not brick every later mutation with a 400 about
+ * an entry the user didn't touch; the write path self-heals those instead
+ * (see parseDataDirList). Returns an error message, or null when clean.
  */
-export function duplicateOfDefaultError(v: {
-  claude?: unknown;
-  codex?: unknown;
-}): string | null {
-  const check = (list: unknown, def: string, label: string): string | null => {
+export function duplicateOfDefaultError(
+  v: { claude?: unknown; codex?: unknown },
+  existing?: { claude?: string[]; codex?: string[] },
+): string | null {
+  const check = (list: unknown, prior: string[], def: string, label: string): string | null => {
     if (!Array.isArray(list)) return null;
     for (const item of list) {
       if (typeof item !== "string") continue;
       const dir = normalizeDataDir(item);
-      if (dir && samePhysicalDir(dir, def)) {
+      if (!dir || prior.includes(dir)) continue;
+      if (samePhysicalDir(dir, def)) {
         return `${label}: that location is already watched by default`;
       }
     }
     return null;
   };
   return (
-    check(v.claude, DEFAULT_CLAUDE_ROOT, "dataDirs.claude") ??
-    check(v.codex, DEFAULT_CODEX_ROOT, "dataDirs.codex")
+    check(v.claude, existing?.claude ?? [], DEFAULT_CLAUDE_ROOT, "dataDirs.claude") ??
+    check(v.codex, existing?.codex ?? [], DEFAULT_CODEX_ROOT, "dataDirs.codex")
   );
 }
 
