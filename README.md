@@ -116,7 +116,7 @@ hx ui [--port N] [--no-open]
 ```
 
 Serves the **HX Client** web app — everything the daemon knows, in a browser:
-watched folders and where each one uploads (with the why: repo → workspace →
+watched folders and where each one uploads (with the why: repo →
 destination), sync status with a live traffic chart, a transcript inspector
 showing the exact bytes that leave the machine, privacy controls (pause,
 per-folder exclusions, future-folder rules, a personal-sessions gate), daemon
