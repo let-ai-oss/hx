@@ -175,9 +175,12 @@ export async function writeSettings(
   const patchDirs = (patch as { dataDirs?: unknown }).dataDirs;
   if (patchDirs !== undefined && patchDirs !== null && typeof patchDirs === "object" && !Array.isArray(patchDirs)) {
     const pd = patchDirs as Record<string, unknown>;
+    // Non-array per-family values (a direct caller's garbage — the API
+    // validator 400s them first) also mean "unchanged", same as omission:
+    // parseDataDirList would turn them into a silent one-family wipe.
     next.dataDirs = parseDataDirs({
-      claude: pd.claude === undefined ? current.dataDirs.claude : pd.claude,
-      codex: pd.codex === undefined ? current.dataDirs.codex : pd.codex,
+      claude: Array.isArray(pd.claude) ? pd.claude : current.dataDirs.claude,
+      codex: Array.isArray(pd.codex) ? pd.codex : current.dataDirs.codex,
     });
   } else {
     // No dataDirs in the patch — or garbage (null/array) a direct caller

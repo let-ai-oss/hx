@@ -1007,12 +1007,18 @@ export async function backfillArtifacts(
   // Map sessionId → { family, jsonl path, rootDir } from discovered Claude
   // logs so we stamp the right family, find each session's plan attachment,
   // and probe the session's OWN root's tasks dir before any copied twin.
+  // Newest mtime wins per session — discovery emits in pool-completion order,
+  // and first-wins would coin-flip between a frozen twin and the live file,
+  // letting a backfill replace a newer server task set with the copy-time one.
   const claude = await discoverClaudeFiles(roots.claude);
-  const byId = new Map<string, { family: string; path: string; rootDir: string }>();
+  const byId = new Map<string, { family: string; path: string; rootDir: string; mtimeMs: number }>();
   for (const f of claude) {
     const head = await readHead(f.path, f.source);
     const sid = head.sessionId ?? path.basename(f.path, ".jsonl");
-    if (!byId.has(sid)) byId.set(sid, { family: head.family, path: f.path, rootDir: f.rootDir });
+    const prev = byId.get(sid);
+    if (!prev || f.mtimeMs > prev.mtimeMs) {
+      byId.set(sid, { family: head.family, path: f.path, rootDir: f.rootDir, mtimeMs: f.mtimeMs });
+    }
   }
   let tasksN = 0;
   let plansN = 0;

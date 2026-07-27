@@ -533,18 +533,19 @@ async function cmdStatus(): Promise<void> {
   // `hx status` looked identical to before the stop). Placed above the probe
   // so it still shows when the gateway is unreachable.
   const ops = getDaemonOps();
-  if (ops.managerName !== "none") {
-    const ds = await ops.state().catch(() => null);
-    if (ds) {
-      rows.push([
-        "Daemon",
-        ds.pid
-          ? `running (${ops.managerName}, pid ${ds.pid})`
-          : ds.loaded
-            ? `loaded, not running (${ops.managerName})`
-            : "stopped — run `hx start` to resume",
-      ]);
-    }
+  // One probe, two consumers: the Daemon row and the Watching row's
+  // last-known suffix must describe the SAME reading (a start/stop between
+  // two probes would print "running" beside "daemon stopped").
+  const daemonState = ops.managerName !== "none" ? await ops.state().catch(() => null) : null;
+  if (daemonState) {
+    rows.push([
+      "Daemon",
+      daemonState.pid
+        ? `running (${ops.managerName}, pid ${daemonState.pid})`
+        : daemonState.loaded
+          ? `loaded, not running (${ops.managerName})`
+          : "stopped — run `hx start` to resume",
+    ]);
   }
 
   // User-driven pause (settings.json — set from the HX Client UI). Shown
@@ -564,7 +565,7 @@ async function cmdStatus(): Promise<void> {
   // A stamp from a daemon that is NOT currently running is last-known state,
   // and the row says so rather than presenting it as present-tense truth.
   const { roots: watchRoots, from: rootsFrom } = await effectiveRootsForCli(settings);
-  const daemonDown = ops.managerName !== "none" && !(await ops.state().catch(() => null))?.pid;
+  const daemonDown = ops.managerName !== "none" && !daemonState?.pid;
   rows.push([
     "Watching",
     `${formatRootsRow(watchRoots)}${rootsFrom === "daemon" && daemonDown ? " (last known — daemon stopped)" : ""}`,

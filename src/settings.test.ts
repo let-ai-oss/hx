@@ -107,6 +107,8 @@ describe("parseDataDirs", () => {
     await writeSettings({ dataDirs: { claude: ["/data/c1"], codex: ["/data/x1"] } }, p);
     await writeSettings({ dataDirs: null as never }, p);
     await writeSettings({ dataDirs: ["/sneaky"] as never }, p);
+    // Per-family garbage is the same class, one level down.
+    await writeSettings({ dataDirs: { claude: "junk", codex: null } as never }, p);
     assert.deepEqual((await readSettings(p)).dataDirs, {
       claude: ["/data/c1"],
       codex: ["/data/x1"],
