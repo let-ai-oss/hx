@@ -470,6 +470,12 @@
   .ruleadd .ico { color: var(--text-subtle); display: flex; }
   .ruleadd input { border: none; outline: none; background: none; flex: 1; font-family: var(--mono); font-size: 14px; color: var(--text); min-width: 0; }
   .ruleadd input::placeholder { color: var(--text-subtle); }
+  /* Watched-locations rows: right-aligned metadata never wraps or collapses;
+     the truncating variant (the shell-suggestion note) gives way gracefully
+     instead of pushing the row wide. Buttons keep their size. */
+  .rulerow .meta { color: var(--text-subtle); font-size: 13px; flex-shrink: 0; white-space: nowrap; }
+  .rulerow .meta.trunc { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .rulerow button, .ruleadd button { flex-shrink: 0; }
 
   .rowdiv { display: flex; align-items: center; gap: 12px; font-size: 13px; font-weight: 600; color: var(--text-subtle); padding: 14px 4px 4px; }
   .rowdiv::after { content: ""; flex: 1; height: 1px; background: var(--border); }
@@ -542,7 +548,10 @@
   /* ── Settings ────────────────────────────────────────── */
   .setrow { display: flex; gap: 18px; align-items: flex-start; padding: 18px 0; border-bottom: 1px solid var(--border); }
   .setrow:last-child { border-bottom: none; }
-  .setrow .txt { flex: 1; }
+  /* min-width: 0 lets the column shrink below its content's intrinsic width —
+     without it one long unbreakable path (a watched-location root) forces the
+     whole row past the panel edge instead of ellipsizing. */
+  .setrow .txt { flex: 1; min-width: 0; }
   .setrow .txt b { font-weight: 600; font-size: 15.5px; }
   .setrow .txt p { margin: 3px 0 0; color: var(--text-muted); font-size: 14.5px; max-width: 580px; }
   .pausestate { margin-top: 10px; font-size: 14.5px; font-weight: 600; color: var(--warn); display: none; }

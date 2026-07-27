@@ -143,42 +143,46 @@ export function Privacy() {
               const roots = dataRoots.filter((r) => r.family === key);
               const suggestion = shellDetected[key];
               return (
-                <div className="rulebox" style={{ marginTop: 10 }} key={key}>
-                  <div className="rulerow"><span className="none">{label}</span></div>
-                  {roots.map((r) => (
-                    <div className="rulerow" key={r.configDir}>
+                <div key={key}>
+                  <div className="rowdiv">{label}</div>
+                  <div className="rulebox" style={{ marginTop: 6 }}>
+                    {roots.map((r) => (
+                      <div className="rulerow" key={r.configDir}>
+                        <span className="ico"><FolderIc /></span>
+                        <span className="p" title={r.configDir}>{r.display}</span>
+                        <span className="meta">
+                          {r.origin === "default" ? "default" : r.origin === "env" ? "from environment" : plural(r.files, "file")}
+                          {r.exists ? "" : " · not created yet"}
+                        </span>
+                        {r.origin === "settings" && (
+                          <button className="btn ghost sm" onClick={() => removeDataDir(key, r.configDir)}>Remove</button>
+                        )}
+                      </div>
+                    ))}
+                    {suggestion && (
+                      <div className="rulerow">
+                        <span className="ico"><FolderIc /></span>
+                        <span className="p" title={suggestion}>{suggestion}</span>
+                        <span className="meta trunc" title="This folder is set via an environment variable your shell exports, but the background service doesn't read shell profiles — add it so it's always watched.">
+                          set in your shell — not watched yet
+                        </span>
+                        <button className="btn sm" onClick={() => void doAddDir(key, suggestion)}>Add</button>
+                      </div>
+                    )}
+                    <div className="ruleadd">
                       <span className="ico"><FolderIc /></span>
-                      <span className="p">{r.display}</span>
-                      <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>
-                        {r.origin === "default" ? "default" : r.origin === "env" ? "from environment" : plural(r.files, "file")}
-                        {r.exists ? "" : " · not created yet"}
-                      </span>
-                      {r.origin === "settings" && (
-                        <button className="btn ghost sm" onClick={() => removeDataDir(key, r.configDir)}>Remove</button>
-                      )}
+                      <input
+                        placeholder={key === "claude" ? "/path/to/claude-data-dir" : "/path/to/codex-home"}
+                        value={dirVals[key]}
+                        onChange={(e) => setDirVals((prev) => ({ ...prev, [key]: e.target.value }))}
+                        onKeyDown={(e) => { if (e.key === "Enter") void doAddDir(key); }}
+                      />
+                      <button className="btn sm" disabled={!settings} onClick={() => void doAddDir(key)}>Add</button>
                     </div>
-                  ))}
-                  {suggestion && (
-                    <div className="rulerow">
-                      <span className="ico"><FolderIc /></span>
-                      <span className="p">{suggestion}</span>
-                      <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>set in your shell — not watched by the background service</span>
-                      <button className="btn sm" onClick={() => void doAddDir(key, suggestion)}>Add</button>
-                    </div>
-                  )}
-                  <div className="ruleadd">
-                    <span className="ico"><FolderIc /></span>
-                    <input
-                      placeholder={key === "claude" ? "/path/to/claude-data-dir" : "/path/to/codex-home"}
-                      value={dirVals[key]}
-                      onChange={(e) => setDirVals((prev) => ({ ...prev, [key]: e.target.value }))}
-                      onKeyDown={(e) => { if (e.key === "Enter") void doAddDir(key); }}
-                    />
-                    <button className="btn sm" disabled={!settings} onClick={() => void doAddDir(key)}>Add</button>
+                    {dirErrs[key] && (
+                      <div className="rulerow"><span className="st warny">{dirErrs[key]}</span></div>
+                    )}
                   </div>
-                  {dirErrs[key] && (
-                    <div className="rulerow"><span className="st warny">{dirErrs[key]}</span></div>
-                  )}
                 </div>
               );
             })}
