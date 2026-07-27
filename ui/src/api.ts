@@ -29,23 +29,12 @@ export interface FolderInfo {
   path: string;
   /** Sessions whose transcript is on this machine now. */
   sessions: number;
-  /** Sessions synced from this folder per the cloud (durable; includes ones
-   *  whose local file was deleted). null when the gateway didn't report it. */
-  cloudSessions: number | null;
   repo: string | null;
   branch: string | null;
   dests: string[];
   lastUploadAtMs: number;
   attributed: boolean | null;
   unlinkedRepo: boolean;
-  workspace: { orgName: string; projectName: string } | null;
-  sharing: {
-    orgName: string;
-    sharing: boolean;
-    teams: { name: string; accentColor: string | null }[];
-    people: string[];
-    peopleCount: number;
-  } | null;
 }
 
 export interface DestinationInfo {
@@ -57,7 +46,6 @@ export interface DestinationInfo {
   bytes: number;
   lastUploadAtMs: number;
   blocked: { sessions: number; reason: string; orgName: string | null } | null;
-  storage: { kind: string | null; region: string | null; status: string } | null;
 }
 
 export interface RecentUpload {

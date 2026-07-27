@@ -367,14 +367,6 @@
   .why-note { font-size: 15px; color: var(--text-muted); max-width: 720px; }
   .why-note + .why-note { margin-top: 10px; }
   .why-act { margin-top: 14px; display: flex; gap: 10px; }
-  .people { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
-  .pchip {
-    display: inline-flex; align-items: center; gap: 8px;
-    background: var(--surface); border: 1px solid var(--border-strong);
-    border-radius: 999px; padding: 3px 13px 3px 4px; font-size: 14px;
-  }
-  .pchip .pa { width: 22px; height: 22px; border-radius: 999px; font-size: 9.5px; font-weight: 700; color: #fff; display: flex; align-items: center; justify-content: center; }
-  .pmore { font-size: 14px; color: var(--text-subtle); }
   .empty { padding: 28px; text-align: center; color: var(--text-subtle); font-size: 15px; }
   .prevrow { display: grid; grid-template-columns: minmax(140px, 1fr) 250px 110px; gap: 18px; align-items: start; padding: 14px 20px; border-bottom: 1px solid var(--border); cursor: pointer; }
   .prevrow:last-child { border-bottom: none; }
@@ -645,6 +637,3 @@
 }
 .bootstate b { color: var(--text); font-size: 18px; }
 .bootstate p { max-width: 480px; margin: 0; }
-
-/* Per-folder secondary count (on-disk vs cloud) */
-.cellC-sub { font-size: 12px; color: var(--text-subtle); opacity: 0.8; margin-top: 1px; }
