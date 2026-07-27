@@ -16,9 +16,6 @@ import { existsSync } from "node:fs";
 import { stat, open } from "node:fs/promises";
 import path from "node:path";
 import {
-  CLAUDE_PROJECTS_DIR,
-  CODEX_ARCHIVED_DIR,
-  CODEX_SESSIONS_DIR,
   type DiscoveredChildFile,
   type DiscoveredFile,
   type DiscoveredWorkflowRun,
@@ -27,6 +24,15 @@ import {
   discoverCodexFiles,
   readHead,
 } from "./sources.js";
+import {
+  type DataRoot,
+  type ResolvedRoots,
+  claudeTasksDir,
+  claudeTeamsDir,
+  isUnderRoots,
+  resolveDataRoots,
+  rootsSignature,
+} from "./roots.js";
 import {
   type FileSkipReason,
   type FileState,
@@ -46,8 +52,10 @@ import {
   offsetFor,
   recordHeal,
   reconcileDestinations,
+  persistState,
   setArtifactHash,
   setOffsetFor,
+  stampEffectiveRoots,
   touchMtime,
   upsertFileState,
 } from "./state.js";
@@ -670,7 +678,7 @@ async function ingestOne(
 
   // Best-effort sidecar sync — a failure must never fail the transcript.
   if (artifactText !== null) {
-    await syncArtifacts(cfg, fState, artifactText, log).catch((err) => {
+    await syncArtifacts(cfg, fState, artifactText, log, file.rootDir).catch((err) => {
       log(`  [artifacts] ${fState.sessionId.slice(0, 8)}…: ${(err as Error).message}`);
     });
   }
@@ -888,14 +896,17 @@ async function syncWorkflowRun(
   log(`  [workflow] ${sessionId.slice(0, 8)}…/${run.runId}`);
 }
 
-// Mirror the device's active agent teams (~/.claude/teams/*). The dirs exist
-// only while a team runs; an upload happens only when the set changes, and the
-// transition back to "no teams" uploads once (clearing the server mirror).
+// Mirror the device's active agent teams (<claudeRoot>/teams/* across every
+// watched root). The dirs exist only while a team runs; an upload happens only
+// when the set changes, and the transition back to "no teams" uploads once
+// (clearing the server mirror).
 async function syncTeamMirror(cfg: HxConfig, log: (msg: string) => void): Promise<void> {
   const scope = scopeOf(cfg);
   let teams;
   try {
-    teams = await readTeamConfigs();
+    const settings = await readSettings();
+    const teamsDirs = resolveDataRoots(settings).claude.map((r) => claudeTeamsDir(r.configDir));
+    teams = await readTeamConfigs(teamsDirs);
   } catch {
     return;
   }
@@ -911,6 +922,19 @@ async function syncTeamMirror(cfg: HxConfig, log: (msg: string) => void): Promis
   }
 }
 
+/** Tasks dirs in probe order: the live transcript's own root first. A copied
+ *  tree can hold a FROZEN twin of a session's tasks under another root (and
+ *  the default root always sorts first in resolution order) — so
+ *  first-existing-wins must probe the root the elected transcript actually
+ *  lives under before any twin, or the server mirrors a stale task list
+ *  forever while the transcript stays live. */
+function orderTasksDirs(roots: ResolvedRoots, preferredRootDir?: string): string[] {
+  const dirs = roots.claude.map((r) => claudeTasksDir(r.configDir));
+  if (!preferredRootDir) return dirs;
+  const pref = claudeTasksDir(preferredRootDir);
+  return [pref, ...dirs.filter((d) => d !== pref)];
+}
+
 /**
  * After a session's transcript chunk lands, sync its sidecar artifacts:
  *   • tasks — the whole ~/.claude/tasks/<sessionId>/ set, if any
@@ -922,9 +946,12 @@ async function syncArtifacts(
   fState: FileState,
   chunkText: string,
   log: (msg: string) => void,
+  preferredRootDir?: string,
 ): Promise<void> {
   const scope = scopeOf(cfg);
-  const tasks = await readTaskSet(fState.sessionId);
+  const settings = await readSettings();
+  const tasksDirs = orderTasksDirs(resolveDataRoots(settings), preferredRootDir);
+  const tasks = await readTaskSet(fState.sessionId, tasksDirs);
   if (tasks && tasks.length > 0) {
     const key = `${fState.family}:${fState.sessionId}:tasks`;
     const hash = hashContent(JSON.stringify(tasks));
@@ -969,19 +996,29 @@ export async function backfillArtifacts(
   cfg: HxConfig,
   log: (msg: string) => void,
 ): Promise<{ tasks: number; plans: number; failed: number }> {
-  const sessionIds = await listTaskSessionIds();
+  const settings = await readSettings();
+  const roots = resolveDataRoots(settings);
+  const tasksDirs = roots.claude.map((r) => claudeTasksDir(r.configDir));
+  const sessionIds = await listTaskSessionIds(tasksDirs);
   if (sessionIds.length === 0) {
-    log("[hx] no ~/.claude/tasks dirs to backfill");
+    log("[hx] no tasks dirs to backfill under the watched roots");
     return { tasks: 0, plans: 0, failed: 0 };
   }
-  // Map sessionId → { family, jsonl path } from discovered Claude logs so we
-  // stamp the right family and can find each session's plan attachment.
-  const claude = await discoverClaudeFiles();
-  const byId = new Map<string, { family: string; path: string }>();
+  // Map sessionId → { family, jsonl path, rootDir } from discovered Claude
+  // logs so we stamp the right family, find each session's plan attachment,
+  // and probe the session's OWN root's tasks dir before any copied twin.
+  // Newest mtime wins per session — discovery emits in pool-completion order,
+  // and first-wins would coin-flip between a frozen twin and the live file,
+  // letting a backfill replace a newer server task set with the copy-time one.
+  const claude = await discoverClaudeFiles(roots.claude);
+  const byId = new Map<string, { family: string; path: string; rootDir: string; mtimeMs: number }>();
   for (const f of claude) {
     const head = await readHead(f.path, f.source);
     const sid = head.sessionId ?? path.basename(f.path, ".jsonl");
-    if (!byId.has(sid)) byId.set(sid, { family: head.family, path: f.path });
+    const prev = byId.get(sid);
+    if (!prev || f.mtimeMs > prev.mtimeMs) {
+      byId.set(sid, { family: head.family, path: f.path, rootDir: f.rootDir, mtimeMs: f.mtimeMs });
+    }
   }
   let tasksN = 0;
   let plansN = 0;
@@ -990,7 +1027,7 @@ export async function backfillArtifacts(
     const info = byId.get(sid);
     const family = (info?.family ?? "claude-cli") as never;
     try {
-      const tasks = await readTaskSet(sid);
+      const tasks = await readTaskSet(sid, orderTasksDirs(roots, info?.rootDir));
       if (tasks && tasks.length > 0) {
         await uploadTasks(cfg, { family, sessionId: sid, tasks });
         await setArtifactHash(`${info?.family ?? "claude-cli"}:${sid}:tasks`, hashContent(JSON.stringify(tasks)), scopeOf(cfg));
@@ -1067,7 +1104,11 @@ async function auditCanonicals(
 ): Promise<void> {
   const scope = scopeOf(cfg);
   if (SELF_HEAL.get(scope) === false) return;
-  const [claude, codex] = await Promise.all([discoverClaudeFiles(), discoverCodexFiles()]);
+  const roots = resolveDataRoots(await readSettings());
+  const [claude, codex] = await Promise.all([
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
+  ]);
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
   const state = await loadState(scope);
@@ -1191,6 +1232,89 @@ function electUploaders(
 }
 
 /**
+ * Child-lane election — the same twin problem as electUploaders, keyed by the
+ * child's UPLOAD identity instead. A copied data root (the no-migration
+ * CLAUDE_CONFIG_DIR world makes copies routine) leaves the same
+ * (parentSessionId, agentId, runId) child at two paths; both would upload
+ * from-zero REPLACEs into one child canonical and ping-pong it forever —
+ * child lanes have no offsets audit to even notice. Same rule as parents:
+ * newest mtime wins (tie: largest), losers are shadowed. Needs no state —
+ * the child's identity is fully encoded in its discovered shape.
+ */
+/**
+ * Pure planner for child-lane uploader flips. Election is stateless; when a
+ * lane's winner CHANGES (the copied-tree race: fresh copy out-mtimes the live
+ * file once, then loses again), the incoming winner's existing offsets
+ * describe a canonical some OTHER file last wrote — appending from them would
+ * interleave two files' bytes, and child lanes have no offsets audit to heal
+ * that. The plan: remember each lane's winner; on a flip, zero the new
+ * winner's offsets so its next upload is a clean replace-from-zero (children
+ * are small — one re-upload per flip is the whole cost). An UNCONTESTED first
+ * sighting is not a flip: existing offsets belong to that same path. A
+ * CONTESTED first sighting (≥2 candidates, no memory of a winner) resets too:
+ * that's the upgrade path for machines whose twins predate the map — both
+ * files hold offsets from the old both-upload world, the canonical is already
+ * an interleaving, and this one replace-from-zero is the only heal child
+ * lanes will ever get (they have no offsets audit).
+ */
+export function planChildLaneResets(
+  elected: DiscoveredChildFile[],
+  prev: Record<string, string>,
+  contestedLanes: ReadonlySet<string> = new Set(),
+): { nextMap: Record<string, string>; resetPaths: string[]; changed: boolean } {
+  const nextMap = { ...prev };
+  const resetPaths: string[] = [];
+  let changed = false;
+  for (const c of elected) {
+    const lane = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    const before = nextMap[lane];
+    if (before === c.path) continue;
+    if (before !== undefined || contestedLanes.has(lane)) resetPaths.push(c.path);
+    nextMap[lane] = c.path;
+    changed = true;
+  }
+  return { nextMap, resetPaths, changed };
+}
+
+/** Lanes with more than one discovered candidate this tick. */
+export function contestedChildLanes(children: DiscoveredChildFile[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const c of children) {
+    const lane = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    counts.set(lane, (counts.get(lane) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([lane]) => lane));
+}
+
+export function electChildUploaders(
+  children: DiscoveredChildFile[],
+  log?: (msg: string) => void,
+): DiscoveredChildFile[] {
+  const byKey = new Map<string, DiscoveredChildFile[]>();
+  for (const c of children) {
+    const key = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    const list = byKey.get(key) ?? [];
+    list.push(c);
+    byKey.set(key, list);
+  }
+  const active: DiscoveredChildFile[] = [];
+  for (const list of byKey.values()) {
+    // Deterministic final tiebreak: `cp -a`/`rsync -a` twins share mtime AND
+    // size, and a readdir-order flip would otherwise swap the winner — which,
+    // for children, now costs a replace-from-zero via the lane-flip reset.
+    list.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size || a.path.localeCompare(b.path));
+    active.push(list[0]!);
+    for (const twin of list.slice(1)) {
+      if (log && !loggedShadowed.has(twin.path)) {
+        loggedShadowed.add(twin.path);
+        log(`[hx] ${twin.path} shadows ${list[0]!.path} (same child lane); not uploading the twin`);
+      }
+    }
+  }
+  return active;
+}
+
+/**
  * Catch-up snapshot from the discovered files + the persisted upload offsets:
  * a file is "done" once we've uploaded up to its (discovery-time) size, and
  * every file short of that contributes its remaining bytes to the backlog.
@@ -1219,15 +1343,22 @@ const SYNC_PROGRESS_EVERY = 20;
 /** One-shot catch-up snapshot (no upload) — backs `hx status` and the daemon
  *  restart decision. Main lane only: the `--local` tee tracks its own catch-up
  *  through its own tick's onProgress reports. */
-export async function computeSyncSnapshot(only?: string): Promise<SyncSnapshot> {
+export async function computeSyncSnapshot(
+  only?: string,
+  rootsOverride?: ResolvedRoots,
+): Promise<SyncSnapshot> {
+  const settings = await readSettings();
+  // Callers that must describe the BACKGROUND service's surface (the CLI's
+  // stamp-first paths) pass rootsOverride; without it we resolve for THIS
+  // process (the daemon itself, and true one-shots like `hx tick`).
+  const roots = rootsOverride ?? resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   let files = [...claude, ...codex];
   if (only) files = files.filter((f) => f.path === only);
   const state = await loadState();
-  const settings = await readSettings();
   return snapshotFrom(filterWatched(electUploaders(files, state), state, settings), state);
 }
 
@@ -1260,6 +1391,13 @@ export interface SyncReport {
   snapshot: SyncSnapshot;
   behind: SyncBehindEntry[];
   skipped: SyncSkippedEntry[];
+  /** DISTINCT partially-uploaded sessions sitting under NO current data root
+   *  — a root was removed (or the daemon hasn't adopted one yet). They are
+   *  not "behind" (nothing will ever pick them up under the current config),
+   *  so they get their own count instead of nagging the behind list forever.
+   *  Deduped per session, and a session with a live behind entry is never
+   *  double-billed here (see collectBehind). */
+  unwatched: number;
 }
 
 /** The still-on-disk sessions currently waiting on a temporarily-unavailable
@@ -1289,10 +1427,12 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
  *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
  *  server holds partial transcripts or a store is down. */
-export async function computeSyncReport(): Promise<SyncReport> {
+export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<SyncReport> {
+  const settings = await readSettings();
+  const roots = rootsOverride ?? resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   const all = [...claude, ...codex];
   const state = await loadState();
@@ -1306,13 +1446,54 @@ export async function computeSyncReport(): Promise<SyncReport> {
     const fs = state.files[f.path];
     if (fs) liveSessions.add(`${fs.family}:${fs.sessionId}`);
   }
+  const { behind, unwatched } = collectBehind(
+    state,
+    discovered,
+    liveSessions,
+    [...roots.claude, ...roots.codex],
+  );
+  // Settings filtering applies to the ELECTED set only: `discovered` and
+  // `liveSessions` above stay unfiltered so an excluded-but-present file can
+  // never masquerade as a vanished-source gap.
+  const elected = filterWatched(electUploaders(all, state), state, settings);
+  return {
+    snapshot: snapshotFrom(elected, state),
+    behind,
+    skipped: collectSkipped(elected, state),
+    unwatched,
+  };
+}
+
+/** Pure fold of state entries into behind/unwatched buckets — unit-tested.
+ *  behind = never-finished uploads whose file left discovery but still sits
+ *  under a watched root (deleted or aged out); unwatched = DISTINCT SESSIONS
+ *  in the same shape under NO current root (a removed data root) — nothing
+ *  will ever pick those up under the current config, so they must not nag
+ *  the behind list. Sessions, not file entries: cwd-change twins are one
+ *  session, and a session still reportable as behind under a watched root is
+ *  accounted there, never double-billed as unwatched too (mirrors the
+ *  per-session dedupe hx status applies to the behind display). */
+export function collectBehind(
+  state: HxState,
+  discovered: Set<string>,
+  liveSessions: Set<string>,
+  roots: DataRoot[],
+): { behind: SyncBehindEntry[]; unwatched: number } {
   const behind: SyncBehindEntry[] = [];
+  const behindSessions = new Set<string>();
+  const unwatchedSessions = new Set<string>();
   for (const [p, fs] of Object.entries(state.files)) {
     if (discovered.has(p)) continue;
     if (liveSessions.has(`${fs.family}:${fs.sessionId}`)) continue; // shadowed twin
     if (fs.lastKnownSize === undefined) continue; // legacy entry — size unknown
     const uploaded = minOffset(fs);
     if (uploaded >= fs.lastKnownSize) continue;
+    const sessionKey = `${fs.family}:${fs.sessionId}`;
+    if (!isUnderRoots(p, roots)) {
+      unwatchedSessions.add(sessionKey);
+      continue;
+    }
+    behindSessions.add(sessionKey);
     behind.push({
       path: p,
       sessionId: fs.sessionId,
@@ -1321,12 +1502,10 @@ export async function computeSyncReport(): Promise<SyncReport> {
       sourceGone: !existsSync(p),
     });
   }
-  // Settings filtering applies to the ELECTED set only: `discovered` and
-  // `liveSessions` above stay unfiltered so an excluded-but-present file can
-  // never masquerade as a vanished-source gap.
-  const settings = await readSettings();
-  const elected = filterWatched(electUploaders(all, state), state, settings);
-  return { snapshot: snapshotFrom(elected, state), behind, skipped: collectSkipped(elected, state) };
+  // Post-loop (entry order is arbitrary): drop unwatched sessions that also
+  // have a behind entry — one session, one row.
+  for (const key of behindSessions) unwatchedSessions.delete(key);
+  return { behind, unwatched: unwatchedSessions.size };
 }
 
 export async function tickOnce(
@@ -1335,9 +1514,14 @@ export async function tickOnce(
   log: (msg: string) => void,
   onProgress?: (snap: SyncSnapshot) => void,
 ): Promise<{ uploaded: number; failed: number; snapshot: SyncSnapshot }> {
+  // Settings first: they carry the extra data roots, so discovery has to see
+  // them. Each tick re-resolves — a root added through the UI is swept within
+  // one poll interval, no restart.
+  const settings = await readSettings();
+  const roots = resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
@@ -1346,7 +1530,6 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
-  const settings = await readSettings();
   files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
@@ -1455,8 +1638,33 @@ export async function tickOnce(
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
     try {
-      const { children, runs } = await discoverClaudeChildren();
-      for (const c of children) {
+      const { children, runs } = await discoverClaudeChildren(roots.claude);
+      const electedChildren = electChildUploaders(children, log);
+      const lanePlan = planChildLaneResets(
+        electedChildren,
+        state.childUploaders ?? {},
+        contestedChildLanes(children),
+      );
+      if (lanePlan.changed) {
+        for (const p of lanePlan.resetPaths) {
+          const fs = state.files[p];
+          if (fs) {
+            if (Object.keys(fs.offsets).length > 0) {
+              fs.offsets = {};
+              log(`[hx] child lane uploader switched — re-uploading ${path.basename(p)} from zero`);
+            }
+            // A takeover starts clean: inherited backoff belonged to the
+            // lane's previous stint and would bench the live file for up to
+            // 30 minutes (same rationale as reconcileChildParent's repair).
+            delete fs.consecutiveFailures;
+            delete fs.nextAttemptAtMs;
+            delete fs.skipReason;
+          }
+        }
+        state.childUploaders = lanePlan.nextMap;
+        await persistState(scope);
+      }
+      for (const c of electedChildren) {
         let pendingChild = state.files[c.path];
         if (pendingChild) {
           const reconciled = reconcileChildParent(
@@ -1540,11 +1748,47 @@ export async function startWatch(
   opts: WatchOptions,
   log: (msg: string) => void,
 ): Promise<{ stop: () => void }> {
-  log(
-    `[hx] watching ${CLAUDE_PROJECTS_DIR}, ${CODEX_SESSIONS_DIR}, ${CODEX_ARCHIVED_DIR}`,
-  );
+  const describeRoots = (r: ResolvedRoots): string =>
+    [...r.claude, ...r.codex]
+      .map((d) => `${collapseHome(d.configDir)}${d.origin === "default" ? "" : ` [${d.origin}]`}`)
+      .join(", ");
+  log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+
+  // Publish the resolved roots as device truth (state.effectiveRoots) so the
+  // UI server and doctor describe what THIS long-running loop watches. Gated
+  // to the main lane's persistent daemon: `hx tick` / `watch --once` / the
+  // --local tee run with an arbitrary shell env and must not overwrite it.
+  // The latch advances only after the persist SUCCEEDS (an unwritable
+  // ~/.let/hx must retry next tick, not go silent for the daemon's lifetime),
+  // and the stamp refreshes on an interval even when unchanged, so a stomp by
+  // a stray foreground `hx watch` from an env-carrying shell heals itself.
+  const RESTAMP_INTERVAL_MS = 10 * 60_000;
+  let lastRootsSig = "";
+  let lastStampAtMs = 0;
+  let stampFailureLogged = false;
+  const publishRoots = async (settings: HxSettings): Promise<void> => {
+    if (opts.oneShot || scopeOf(cfg) !== "main") return;
+    const roots = resolveDataRoots(settings);
+    const sig = rootsSignature(roots);
+    if (sig === lastRootsSig && Date.now() - lastStampAtMs < RESTAMP_INTERVAL_MS) return;
+    const changed = lastRootsSig !== "" && sig !== lastRootsSig;
+    try {
+      await stampEffectiveRoots(roots);
+      lastRootsSig = sig;
+      lastStampAtMs = Date.now();
+      stampFailureLogged = false;
+      if (changed) log(`[hx] watch roots updated: ${describeRoots(roots)}`);
+    } catch (err) {
+      // Retries every tick (the latch didn't advance) — log the streak once,
+      // not 57k times a day into stdout.log.
+      if (!stampFailureLogged) {
+        stampFailureLogged = true;
+        log(`[hx] couldn't persist watch roots (will keep retrying): ${(err as Error).message}`);
+      }
+    }
+  };
 
   // Last time anything reached the gateway (upload or beat). Uploads count as
   // contact, so a busy daemon never sends a redundant heartbeat.
@@ -1592,23 +1836,32 @@ export async function startWatch(
   let wasPaused = false;
 
   const run = async () => {
-    if (Date.now() < pauseUploadsUntilMs) return;
     if (passBusy) return;
-    const settings = await readSettings();
-    if (isPaused(settings)) {
-      if (!wasPaused) {
-        wasPaused = true;
-        const until = settings.pause?.untilMs;
-        log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
-      }
-      return;
-    }
-    if (wasPaused) {
-      wasPaused = false;
-      log(`[hx] sync resumed`);
-    }
+    // Take the mutex around EVERYTHING that awaits, the stamp included: it
+    // persists state.json, and an audit firing inside that await would see
+    // passBusy false, start, and then overlap the pass we're about to run —
+    // exactly the in-flight-chunk-reads-as-divergence race the flag prevents.
     passBusy = true;
     try {
+      const settings = await readSettings();
+      // Stamping is observation, not an upload: it must track Watched
+      // Locations edits even while sync is paused or uploads are backing
+      // off, or the UI's roots list (and hx status) silently freezes in
+      // exactly those states.
+      await publishRoots(settings);
+      if (Date.now() < pauseUploadsUntilMs) return;
+      if (isPaused(settings)) {
+        if (!wasPaused) {
+          wasPaused = true;
+          const until = settings.pause?.untilMs;
+          log(`[hx] sync paused${until ? ` until ${new Date(until).toLocaleTimeString()}` : " until resumed"}`);
+        }
+        return;
+      }
+      if (wasPaused) {
+        wasPaused = false;
+        log(`[hx] sync resumed`);
+      }
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();

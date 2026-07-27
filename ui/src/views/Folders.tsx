@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useApp, type GroupBy } from "../store";
-import { plural, TOOL_NOTE, TOOL_ORDER } from "../data";
+import { plural, TOOL_NOTE, TOOL_ORDER, toolNotesFor } from "../data";
 import { fmtBytes, fmtClock, fmtRelative, type FolderInfo, type SessionInfo } from "../api";
 import { GPill } from "../components/GPill";
 import { CellA, CellB, CellC } from "../components/FolderCells";
@@ -151,13 +151,18 @@ export function FolderRow({ f }: { f: FolderInfo }) {
 
 interface Group { title: string; note: string; destKey?: string; items: FolderInfo[]; }
 
-export function groupsFor(list: FolderInfo[], groupBy: GroupBy, destLabel: (key: string) => string): Group[] {
+export function groupsFor(
+  list: FolderInfo[],
+  groupBy: GroupBy,
+  destLabel: (key: string) => string,
+  toolNotes: Record<string, string> = TOOL_NOTE,
+): Group[] {
   if (groupBy === "tool") {
     return TOOL_ORDER.map((t) => ({
       title: t,
-      note: list.some((f) => f.tool === t) ? (TOOL_NOTE[t] ? `· ${TOOL_NOTE[t]}` : "") : "· nothing found on this device",
+      note: list.some((f) => f.tool === t) ? (toolNotes[t] ? `· ${toolNotes[t]}` : "") : "· nothing found on this device",
       items: list.filter((f) => f.tool === t),
-    })).filter((g) => g.items.length > 0 || TOOL_NOTE[g.title] !== undefined);
+    })).filter((g) => g.items.length > 0 || toolNotes[g.title] !== undefined);
   }
   if (groupBy === "dir") {
     const m = new Map<string, FolderInfo[]>();
@@ -187,7 +192,7 @@ export function groupsFor(list: FolderInfo[], groupBy: GroupBy, destLabel: (key:
 }
 
 export function Folders() {
-  const { view, groupBy, setGroupBy, query, setQuery, allFolders, destinations, openDest, settings, setPersonal } = useApp();
+  const { view, groupBy, setGroupBy, query, setQuery, allFolders, destinations, openDest, settings, setPersonal, dataRoots } = useApp();
   const [menuOpen, setMenuOpen] = useState(false);
 
   const destLabel = (key: string) => destinations.find((d) => d.key === key)?.label ?? key;
@@ -195,7 +200,7 @@ export function Folders() {
   const list = allFolders.filter((f) => !q ||
     [f.path, f.repo, f.tool, ...f.dests.map(destLabel)]
       .filter(Boolean).join(" ").toLowerCase().includes(q));
-  const groups = groupsFor(list, groupBy, destLabel);
+  const groups = groupsFor(list, groupBy, destLabel, toolNotesFor(dataRoots));
   const personalOff = settings?.personalSync === false;
 
   return (

@@ -5,7 +5,7 @@ import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import type { DiscoveredFile } from "./sources.js";
 import type { FileState, HxState } from "./state.js";
 
-const file = (p: string): DiscoveredFile => ({ path: p, size: 10, mtimeMs: 1, source: "claude" });
+const file = (p: string): DiscoveredFile => ({ path: p, size: 10, mtimeMs: 1, source: "claude", rootDir: "/home/u/.claude" });
 
 const entry = (p: string, over: Partial<FileState>): FileState => ({
   path: p,

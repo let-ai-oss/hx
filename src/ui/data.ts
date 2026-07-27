@@ -18,6 +18,16 @@ import { assertSecureFetchUrl } from "../net.js";
 import { readActivity, type ActivityEntry } from "../activity.js";
 import { readOrgNames } from "../org-names.js";
 import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
+import {
+  DEFAULT_CLAUDE_ROOT,
+  DEFAULT_CODEX_ROOT,
+  resolveDataRoots,
+  samePhysicalDir,
+  type DataRoot,
+  type ResolvedRoots,
+  type RootOrigin,
+} from "../roots.js";
+import { readSettings } from "../settings.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
 import { isDeletedSession, loadState, minOffset, resetStateCache, type FileState } from "../state.js";
 import { HX_VERSION } from "../version.js";
@@ -115,6 +125,19 @@ export interface RecentUploadVM {
   sizeBytes: number;
 }
 
+/** One watched data root, as shown in the UI's "Watched locations" card. */
+export interface DataRootVM {
+  family: "claude" | "codex";
+  /** Absolute config-dir root — the identity used for settings add/remove. */
+  configDir: string;
+  /** ~-collapsed variant for display. */
+  display: string;
+  origin: RootOrigin;
+  exists: boolean;
+  /** Discovered transcript files under this root (parent sessions only). */
+  files: number;
+}
+
 export interface UiSnapshot {
   generatedAt: number;
   device: {
@@ -132,12 +155,24 @@ export interface UiSnapshot {
     totalBytes: number;
     behind: number;
     waiting: number;
+    /** Partially-synced sessions under no current root (removed root). */
+    unwatched: number;
     lastUploadAtMs: number;
   };
   folders: FolderVM[];
   destinations: DestinationVM[];
   recent: RecentUploadVM[];
   doctor: SyncDoctorReport;
+  /** The watched data roots (see uiEffectiveRoots for whose truth this is). */
+  dataRoots: DataRootVM[];
+  /** Where dataRoots came from: the daemon's stamp, or this process's own
+   *  resolution (daemon not yet upgraded / never ran). */
+  dataRootsFrom: "daemon" | "local";
+  /** CLAUDE_CONFIG_DIR / CODEX_HOME values visible to THIS UI-server process
+   *  that the effective root set does not cover — surfaced as an "add this?"
+   *  suggestion. The classic shape: var exported in .bashrc, `hx ui` launched
+   *  from that shell, daemon under systemd/launchd never saw it. */
+  shellDetected: { claude?: string; codex?: string };
 }
 
 // readHead is cheap (≤64 lines) but folders hold hundreds of files; cache
@@ -298,23 +333,91 @@ export function groupDestinations(
     .sort((a, b) => (a.personal ? 1 : 0) - (b.personal ? 1 : 0) || b.bytes - a.bytes);
 }
 
-async function collectFacts(): Promise<FileFacts[]> {
-  const files = await discoverAll();
+/**
+ * The root set this UI process should discover with. Device truth is what the
+ * LONG-RUNNING daemon stamped into state.json — this server may run under a
+ * different environment (launched from a shell that exports CLAUDE_CONFIG_DIR
+ * while the systemd/launchd daemon never saw it, or vice versa), and every
+ * number we show must describe what the background service actually mirrors.
+ * Our own resolution is only the fallback for a daemon that predates the
+ * stamp or has never run.
+ */
+async function uiEffectiveRoots(): Promise<{ roots: ResolvedRoots; from: "daemon" | "local" }> {
+  resetStateCache();
+  const state = await loadState();
+  if (state.effectiveRoots) {
+    return {
+      roots: { claude: state.effectiveRoots.claude, codex: state.effectiveRoots.codex },
+      from: "daemon",
+    };
+  }
+  return { roots: resolveDataRoots(await readSettings()), from: "local" };
+}
+
+async function collectFacts(): Promise<{ facts: FileFacts[]; roots: ResolvedRoots; rootsFrom: "daemon" | "local" }> {
+  const { roots, from } = await uiEffectiveRoots();
+  const files = await discoverAll(roots);
   const heads = await headsFor(files);
   const state = await loadState();
-  return files.map((file) => ({
-    file,
-    head: heads.get(file.path) as HeadMeta,
-    state: state.files[file.path] ?? null,
-  }));
+  return {
+    facts: files.map((file) => ({
+      file,
+      head: heads.get(file.path) as HeadMeta,
+      state: state.files[file.path] ?? null,
+    })),
+    roots,
+    rootsFrom: from,
+  };
+}
+
+/** Pure fold: per-root VM rows from the resolved roots + discovered files. */
+export function buildDataRootVMs(roots: ResolvedRoots, files: DiscoveredFile[]): DataRootVM[] {
+  const countByRoot = new Map<string, number>();
+  for (const f of files) {
+    countByRoot.set(f.rootDir, (countByRoot.get(f.rootDir) ?? 0) + 1);
+  }
+  const rows = (family: "claude" | "codex", list: DataRoot[]): DataRootVM[] =>
+    list.map((r) => ({
+      family,
+      configDir: r.configDir,
+      display: collapseHome(r.configDir),
+      origin: r.origin,
+      exists: r.exists,
+      files: countByRoot.get(r.configDir) ?? 0,
+    }));
+  return [...rows("claude", roots.claude), ...rows("codex", roots.codex)];
+}
+
+/** Env values THIS process sees that the effective set doesn't cover. Reuses
+ *  the resolver so realpath dedupe decides "covered", not string equality. */
+export function detectShellRoots(
+  selfResolved: ResolvedRoots,
+  effective: ResolvedRoots,
+): { claude?: string; codex?: string } {
+  const out: { claude?: string; codex?: string } = {};
+  for (const family of ["claude", "codex"] as const) {
+    const env = selfResolved[family].find((r) => r.origin === "env");
+    if (!env) continue; // no env var, or it deduped into an already-known root
+    if (effective[family].some((r) => samePhysicalDir(r.configDir, env.configDir))) continue;
+    // Never one-click-suggest a root that CONTAINS the family default (e.g.
+    // CLAUDE_CONFIG_DIR=$HOME): legal for the tool, but adding it would sweep
+    // <root>/projects — for $HOME that's ~/projects — into the upload surface
+    // on a single click. A deliberate manual add remains possible.
+    const def = family === "claude" ? DEFAULT_CLAUDE_ROOT : DEFAULT_CODEX_ROOT;
+    if (def === env.configDir || def.startsWith(env.configDir + path.sep)) continue;
+    out[family] = env.configDir;
+  }
+  return out;
 }
 
 export async function buildSnapshot(): Promise<UiSnapshot> {
   resetStateCache();
   const cfg = await readConfig();
-  const facts = await collectFacts();
-  const report = await computeSyncReport();
-  const doctor = buildSyncDoctorReport(report, cfg?.gatewayBaseUrl ?? "");
+  const { facts, roots, rootsFrom } = await collectFacts();
+  const report = await computeSyncReport(roots);
+  const doctor = buildSyncDoctorReport(report, cfg?.gatewayBaseUrl ?? "", Date.now(), roots);
+  const dataRoots = buildDataRootVMs(roots, facts.map((f) => f.file));
+  const shellDetected = detectShellRoots(resolveDataRoots(await readSettings()), roots);
 
   let daemon = { managerName: "none", loaded: false, pid: null as number | null };
   try {
@@ -355,6 +458,7 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
       totalBytes: report.snapshot.totalBytes,
       behind: report.behind.length,
       waiting: report.skipped.length,
+      unwatched: report.unwatched,
       lastUploadAtMs,
     },
     folders,
@@ -372,12 +476,15 @@ export async function buildSnapshot(): Promise<UiSnapshot> {
         sizeBytes: file.size,
       })),
     doctor,
+    dataRoots,
+    dataRootsFrom: rootsFrom,
+    shellDetected,
   };
 }
 
 export async function buildSessions(folderId: string): Promise<SessionVM[]> {
   resetStateCache();
-  const facts = await collectFacts();
+  const { facts } = await collectFacts();
   const fullState = await loadState();
   const out: SessionVM[] = [];
   for (const { file, head, state } of facts) {
@@ -404,9 +511,12 @@ export async function buildSessions(folderId: string): Promise<SessionVM[]> {
   return out.sort((a, b) => b.lastUploadAtMs - a.lastUploadAtMs);
 }
 
-/** Only paths the discovery scan yields may be previewed or sized. */
+/** Only paths the discovery scan yields may be previewed or sized. Scans with
+ *  the daemon's effective roots (stamp-first) — the preview surface must match
+ *  what the device actually mirrors, not this process's private env. */
 export async function isDiscoveredPath(p: string): Promise<boolean> {
-  const files = await discoverAll();
+  const { roots } = await uiEffectiveRoots();
+  const files = await discoverAll(roots);
   return files.some((f) => f.path === p);
 }
 

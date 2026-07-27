@@ -172,6 +172,31 @@ Watch mechanism is mtime-polling at ~1.5s (chokidar 4 drops fsevents, and a
 recursive watch on `~/.claude/projects/<encoded-path>/` would blow the FD
 limit).
 
+### Watched locations (custom data roots)
+
+The paths above are relative to a **data root** — `~/.claude` / `~/.codex` by
+default. Claude Code relocates its entire tree when `CLAUDE_CONFIG_DIR` is
+set; Codex does the same via `CODEX_HOME`. hx watches a configurable *set* of
+roots per family:
+
+- the default root, always;
+- every root added under **Privacy Controls → Watched Locations** in the web
+  UI (stored in `~/.let/hx/settings.json` as `dataDirs`, up to 8 per family;
+  a root that doesn't exist yet is fine — it arms for when the dir appears);
+- `CLAUDE_CONFIG_DIR` / `CODEX_HOME` when present in the hx process's **own**
+  environment. Note the background service (launchd / systemd) never reads
+  your shell profile, so an env var exported in `.bashrc` reaches `hx watch`
+  run from that shell but *not* the daemon — the UI shows such a value as
+  "set in your shell" with a one-click **Add**; adding it is the durable fix.
+
+Discovery keeps its 30-day window per root, so a newly added root backfills
+the last 30 days of sessions on the next tick. Switching `CLAUDE_CONFIG_DIR`
+never migrates old transcripts — they stay in the previous dir, which is why
+hx watches the whole set rather than one root. Prefer **adding** a root over
+copying the tree: copies create twin files for the same session (harmless —
+per-session uploader election shadows the stale copy — but the copy buys
+nothing). `hx status` and `hx doctor sync` print the effective root set.
+
 ## Upload pipeline
 
 For each change, the chunk between `state.offset` and EOF (trimmed at the last
