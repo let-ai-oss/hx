@@ -118,7 +118,11 @@ export function Privacy() {
               {rules.length ? rules.map((p) => (
                 <div className="rulerow" key={p}><span className="ico"><FolderIc /></span><span className="p">{p}</span><button className="btn ghost sm" onClick={() => removeRule(p)}>Remove</button></div>
               )) : (
-                <div className="rulerow"><span className="ico"><FolderIc /></span><span className="none">No future folders yet — add a path below.</span></div>
+                <div className="empty">
+                  <span className="ico"><FolderIc /></span>
+                  <b>No future folders yet</b>
+                  <p>Add a path below — the moment sessions appear there, they stay on this machine.</p>
+                </div>
               )}
               <div className="ruleadd">
                 <span className="ico"><FolderIc /></span>
@@ -205,7 +209,11 @@ export function Privacy() {
           <div className="txt"><b>Where sessions rest</b>
             <div className="rulebox" style={{ marginTop: 10 }}>
               {destinations.length === 0 ? (
-                <div className="rulerow"><span className="none">Nothing uploaded yet — destinations appear after the first sync pass.</span></div>
+                <div className="empty">
+                  <span className="ico"><CloudIc /></span>
+                  <b>Nothing uploaded yet</b>
+                  <p>Once the first sync pass runs, every place this device’s sessions rest shows up here.</p>
+                </div>
               ) : destinations.map((d) => (
                 <div className="rulerow" key={d.key}>
                   <span className="ico">{d.personal ? <CloudIc /> : <FortressIc />}</span>
