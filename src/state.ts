@@ -15,6 +15,7 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { HX_DIR } from "./hx-home.js";
+import type { ResolvedRoots } from "./roots.js";
 
 /** Which upload lane's state to read/write: "main" = the configured gateway,
  *  "local" = the additive `--local` tee against the local dev gateway. */
@@ -169,6 +170,11 @@ export function migrateFileState(s: LegacyFileState): FileState {
   };
 }
 
+/** The daemon's resolved watch roots + when it resolved them. */
+export interface EffectiveRootsStamp extends ResolvedRoots {
+  resolvedAtMs: number;
+}
+
 export interface HxState {
   files: Record<string, FileState>;
   /** Content-hash per uploaded sidecar artifact (key `<family>:<sessionId>:<kind>`)
@@ -185,6 +191,14 @@ export interface HxState {
    *  tombstone still refuses with 410 regardless). The local jsonl file is the
    *  user's own and is never touched. */
   deletedSessions?: Record<string, number>;
+  /** The data roots the LONG-RUNNING daemon actually watches, stamped by
+   *  startWatch only (main scope). One-shot runs (`hx tick`, `watch --once`)
+   *  carry the invoking shell's env — CLAUDE_CONFIG_DIR / CODEX_HOME the
+   *  background service may never see — so they must not overwrite this.
+   *  The UI server treats the stamp as device truth for ALL its discovery
+   *  and falls back to its own resolution when the stamp is absent (daemon
+   *  not yet upgraded / never ran). Additive; older binaries ignore it. */
+  effectiveRoots?: EffectiveRootsStamp;
 }
 
 const STATE_DIR = HX_DIR;
@@ -261,6 +275,20 @@ export async function upsertFileState(
 ): Promise<void> {
   const state = await loadState(scope);
   state.files[s.path] = s;
+  await schedulePersist(state, scope);
+}
+
+/** Persist the daemon's resolved watch roots (see HxState.effectiveRoots). */
+export async function stampEffectiveRoots(
+  roots: ResolvedRoots,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  state.effectiveRoots = {
+    claude: roots.claude,
+    codex: roots.codex,
+    resolvedAtMs: Date.now(),
+  };
   await schedulePersist(state, scope);
 }
 

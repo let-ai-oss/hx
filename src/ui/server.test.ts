@@ -241,6 +241,33 @@ describe("handleUiRequest — auth flow", () => {
       ctx,
     );
     assert.equal(badKey.status, 400);
+    // dataDirs: valid patch accepted and echoed back through writeSettings
+    const dirsOk = await handleUiRequest(
+      req("/api/settings", {
+        method: "POST",
+        token: t,
+        body: { dataDirs: { claude: ["/data/claude-work"], codex: [] } },
+      }),
+      ctx,
+    );
+    assert.equal(dirsOk.status, 200);
+    const dirsBody = (await dirsOk.json()) as { dataDirs?: { claude: string[] } };
+    assert.deepEqual(dirsBody.dataDirs?.claude, ["/data/claude-work"]);
+    // dataDirs: strict 400s — wrong shape, unknown family, relative path,
+    // non-string entries, over the per-family cap
+    for (const bad of [
+      { dataDirs: "nope" },
+      { dataDirs: { gemini: [] } },
+      { dataDirs: { claude: ["relative/path"] } },
+      { dataDirs: { claude: [42] } },
+      { dataDirs: { claude: Array.from({ length: 9 }, (_, i) => `/x/${i}`) } },
+    ]) {
+      const res = await handleUiRequest(
+        req("/api/settings", { method: "POST", token: t, body: bad }),
+        ctx,
+      );
+      assert.equal(res.status, 400, JSON.stringify(bad));
+    }
     // daemon action validation
     const badAction = await handleUiRequest(
       req("/api/daemon", { method: "POST", token: t, body: { action: "explode" } }),

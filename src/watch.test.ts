@@ -4,13 +4,16 @@ import {
   SessionUpstreamUnavailable,
   buildChildParentIndex,
   classifyUpstreamError,
+  collectBehind,
   collectSkipped,
+  electChildUploaders,
   reconcileChildParent,
   snapshotFrom,
 } from "./watch.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
-import type { DiscoveredFile } from "./sources.js";
+import type { DiscoveredChildFile, DiscoveredFile } from "./sources.js";
+import type { DataRoot } from "./roots.js";
 
 const vaultOffline = () =>
   new HxHttpError(503, 'append-url failed: 503 {"error":"vault_offline"}', {
@@ -88,6 +91,7 @@ describe("collectSkipped", () => {
     size: 10,
     mtimeMs: 1,
     source: "claude",
+    rootDir: "/home/u/.claude",
   });
   const fileState = (path: string, over: Partial<FileState>): FileState => ({
     path,
@@ -145,9 +149,88 @@ describe("collectSkipped", () => {
   });
 });
 
+describe("electChildUploaders", () => {
+  const child = (over: Partial<DiscoveredChildFile>): DiscoveredChildFile => ({
+    path: "/r/a/projects/-p/sid/subagents/agent-a1.jsonl",
+    size: 10,
+    mtimeMs: 100,
+    parentSessionId: "sid",
+    agentId: "a1",
+    runId: null,
+    metaPath: null,
+    rootDir: "/r/a",
+    ...over,
+  });
+
+  it("elects the newest-mtime twin per child identity and shadows the rest", () => {
+    const stale = child({ path: "/r/old/projects/-p/sid/subagents/agent-a1.jsonl", mtimeMs: 50, rootDir: "/r/old" });
+    const live = child({ mtimeMs: 200 });
+    const elected = electChildUploaders([stale, live]);
+    assert.deepEqual(elected.map((c) => c.path), [live.path]);
+  });
+
+  it("keys on parent + agent + run — distinct lanes never shadow each other", () => {
+    const a = child({});
+    const b = child({ path: "/r/a/x/agent-a2.jsonl", agentId: "a2" });
+    const wf = child({ path: "/r/a/x/wf/agent-a1.jsonl", runId: "wf_1" });
+    const otherParent = child({ path: "/r/a/y/agent-a1.jsonl", parentSessionId: "sid2" });
+    assert.equal(electChildUploaders([a, b, wf, otherParent]).length, 4);
+  });
+
+  it("breaks mtime ties by size (largest wins)", () => {
+    const small = child({ path: "/p/small.jsonl", size: 5 });
+    const big = child({ path: "/p/big.jsonl", size: 50 });
+    assert.deepEqual(electChildUploaders([small, big]).map((c) => c.path), [big.path]);
+  });
+});
+
+describe("collectBehind", () => {
+  const roots: DataRoot[] = [{ configDir: "/r/a", origin: "settings", exists: true }];
+  const entry = (p: string, sid: string): FileState => ({
+    path: p,
+    family: "claude-cli",
+    sessionId: sid,
+    offsets: { letai: 5 },
+    lastMtimeMs: 1,
+    lastUploadAtMs: 1,
+    lastKnownSize: 10,
+  });
+
+  it("splits never-finished entries into behind (under a root) vs unwatched", () => {
+    const st: HxState = {
+      files: {
+        "/r/a/projects/-p/s1.jsonl": entry("/r/a/projects/-p/s1.jsonl", "s1"),
+        "/r/removed/projects/-p/s2.jsonl": entry("/r/removed/projects/-p/s2.jsonl", "s2"),
+      },
+    };
+    const { behind, unwatched } = collectBehind(st, new Set(), new Set(), roots);
+    assert.deepEqual(behind.map((b) => b.sessionId), ["s1"]);
+    assert.equal(unwatched, 1);
+  });
+
+  it("skips discovered files, shadowed twins, finished and legacy entries", () => {
+    const st: HxState = {
+      files: {
+        "/r/a/discovered.jsonl": entry("/r/a/discovered.jsonl", "s1"),
+        "/r/a/twin.jsonl": entry("/r/a/twin.jsonl", "s2"),
+        "/r/a/done.jsonl": { ...entry("/r/a/done.jsonl", "s3"), offsets: { letai: 10 } },
+        "/r/a/legacy.jsonl": { ...entry("/r/a/legacy.jsonl", "s4"), lastKnownSize: undefined },
+      },
+    };
+    const { behind, unwatched } = collectBehind(
+      st,
+      new Set(["/r/a/discovered.jsonl"]),
+      new Set(["claude-cli:s2"]),
+      roots,
+    );
+    assert.deepEqual(behind, []);
+    assert.equal(unwatched, 0);
+  });
+});
+
 describe("snapshotFrom", () => {
   it("never counts a blocked session as done even when legacy offsets equal its size", () => {
-    const file: DiscoveredFile = { path: "/a", size: 10, mtimeMs: 1, source: "claude" };
+    const file: DiscoveredFile = { path: "/a", size: 10, mtimeMs: 1, source: "claude", rootDir: "/home/u/.claude" };
     const st: HxState = {
       files: {
         "/a": {

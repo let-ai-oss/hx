@@ -1,19 +1,18 @@
 // Reads the two local sidecar artifacts that live next to a Claude Code
 // session but NOT inside its jsonl:
-//   • tasks — ~/.claude/tasks/<sessionId>/<n>.json  (one file per task)
-//   • plan  — ~/.claude/plans/<slug>.md, referenced by a plan_mode /
-//             plan_mode_exit attachment event inside the session jsonl
+//   • tasks — <claudeRoot>/tasks/<sessionId>/<n>.json  (one file per task)
+//   • plan  — <claudeRoot>/plans/<slug>.md, referenced by a plan_mode /
+//             plan_mode_exit attachment event inside the session jsonl (the
+//             event carries the ABSOLUTE path, so plans need no root handling)
 //
 // Both are whole small files rewritten in place, so the watcher uploads them
 // wholesale (hash-gated) rather than via the transcript's append/compose path.
+// Tasks + teams are looked up across every watched Claude root (roots.ts);
+// callers pass the derived tasks/teams dirs.
 
 import { open, readdir, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import os from "node:os";
-
-const HOME = os.homedir();
-const TASKS_DIR = path.join(HOME, ".claude", "tasks");
 
 export interface RawTask {
   id: string;
@@ -36,20 +35,33 @@ export function hashContent(s: string): string {
 }
 
 /**
- * Read ~/.claude/tasks/<sessionId>/*.json into a normalized task list.
- * Returns null when the session has no tasks dir; [] when the dir exists but
- * is empty. Files are sorted by numeric id so they read in creation order.
+ * Read <tasksDir>/<sessionId>/*.json into a normalized task list, probing the
+ * given tasks dirs in root order — the first root that has a dir for this
+ * session wins (a session's sidecars live under the same root the session ran
+ * with; the same UUIDv4 session appearing under two roots is the copied-tree
+ * twin case, and first-in-order is the deliberate tiebreak). Returns null when
+ * no root has a tasks dir for the session; [] when a dir exists but is empty.
+ * Files are sorted by numeric id so they read in creation order.
  */
-export async function readTaskSet(sessionId: string): Promise<RawTask[] | null> {
-  const dir = path.join(TASKS_DIR, sessionId);
-  let entries: string[];
-  try {
-    const dstat = await stat(dir);
-    if (!dstat.isDirectory()) return null;
-    entries = await readdir(dir);
-  } catch {
-    return null;
+export async function readTaskSet(
+  sessionId: string,
+  tasksDirs: string[],
+): Promise<RawTask[] | null> {
+  let dir: string | null = null;
+  let entries: string[] = [];
+  for (const tasksDir of tasksDirs) {
+    const candidate = path.join(tasksDir, sessionId);
+    try {
+      const dstat = await stat(candidate);
+      if (!dstat.isDirectory()) continue;
+      entries = await readdir(candidate);
+      dir = candidate;
+      break;
+    } catch {
+      continue;
+    }
   }
+  if (dir === null) return null;
   const jsonFiles = entries
     .filter((f) => f.endsWith(".json"))
     .sort((a, b) => {
@@ -137,14 +149,21 @@ export async function readPlanForJsonl(jsonlPath: string): Promise<PlanArtifact 
   return readPlanFile(planFilePath);
 }
 
-/** All session ids that have a ~/.claude/tasks/<id>/ dir — drives backfill. */
-export async function listTaskSessionIds(): Promise<string[]> {
-  try {
-    const entries = await readdir(TASKS_DIR, { withFileTypes: true });
-    return entries.filter((e) => e.isDirectory()).map((e) => e.name);
-  } catch {
-    return [];
+/** All session ids that have a <tasksDir>/<id>/ dir under any watched root —
+ *  drives backfill. Union across roots, deduped. */
+export async function listTaskSessionIds(tasksDirs: string[]): Promise<string[]> {
+  const ids = new Set<string>();
+  for (const tasksDir of tasksDirs) {
+    try {
+      const entries = await readdir(tasksDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isDirectory()) ids.add(e.name);
+      }
+    } catch {
+      continue;
+    }
   }
+  return [...ids];
 }
 
 // ── Child-lane meta sidecars + agent-team configs ───────────────────────────
@@ -199,32 +218,47 @@ export async function readTextFile(p: string | null, maxBytes = 500_000): Promis
   }
 }
 
-const TEAMS_DIR = path.join(HOME, ".claude", "teams");
-
 export interface TeamConfig {
   name: string;
   config: unknown;
 }
 
-/** ~/.claude/teams/<name>/config.json for every active team (the dir exists
- *  only while a team runs — empty result is the steady state). */
-export async function readTeamConfigs(): Promise<TeamConfig[]> {
-  let entries: string[];
-  try {
-    entries = await readdir(TEAMS_DIR);
-  } catch {
-    return [];
-  }
-  const out: TeamConfig[] = [];
-  for (const name of entries) {
-    if (name.startsWith(".")) continue;
-    const raw = await readTextFile(path.join(TEAMS_DIR, name, "config.json"));
-    if (!raw) continue;
+/** <teamsDir>/<name>/config.json for every active team, unioned across the
+ *  watched Claude roots (the dir exists only while a team runs — empty result
+ *  is the steady state). A team name present under several roots keeps the
+ *  newest config (by config.json mtime). Sorted by name so the mirror hash in
+ *  watch.ts is deterministic regardless of readdir/root order. */
+export async function readTeamConfigs(teamsDirs: string[]): Promise<TeamConfig[]> {
+  const best = new Map<string, { config: unknown; mtimeMs: number }>();
+  for (const teamsDir of teamsDirs) {
+    let entries: string[];
     try {
-      out.push({ name, config: JSON.parse(raw) });
+      entries = await readdir(teamsDir);
     } catch {
-      /* unreadable config — skip the team */
+      continue;
+    }
+    for (const name of entries) {
+      if (name.startsWith(".")) continue;
+      const cfgPath = path.join(teamsDir, name, "config.json");
+      const raw = await readTextFile(cfgPath);
+      if (!raw) continue;
+      let config: unknown;
+      try {
+        config = JSON.parse(raw);
+      } catch {
+        continue; /* unreadable config — skip the team */
+      }
+      let mtimeMs = 0;
+      try {
+        mtimeMs = (await stat(cfgPath)).mtimeMs;
+      } catch {
+        /* stat raced the team teardown — keep 0, any twin wins */
+      }
+      const prev = best.get(name);
+      if (!prev || mtimeMs > prev.mtimeMs) best.set(name, { config, mtimeMs });
     }
   }
-  return out;
+  return [...best.entries()]
+    .map(([name, v]) => ({ name, config: v.config }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }

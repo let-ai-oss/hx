@@ -18,16 +18,23 @@ function pauseLabel(untilMs: number | null): string {
   return `Paused — resumes at ${fmtClock(untilMs)}`;
 }
 
+const ROOT_FAMILIES: { key: "claude" | "codex"; label: string }[] = [
+  { key: "claude", label: "Claude Code" },
+  { key: "codex", label: "Codex" },
+];
+
 export function Privacy() {
   const {
     view, goto, openInspector, destinations, allFolders, isExcluded,
     settings, setPersonal, pickPause, resumeAll,
     addRule, removeRule, askConfirm, disconnectAct,
+    dataRoots, dataRootsFrom, shellDetected, addDataDir, removeDataDir,
   } = useApp();
   const [pauseMenuOpen, setPauseMenuOpen] = useState(false);
   const [ruleVal, setRuleVal] = useState("");
   const [cmdCopied, setCmdCopied] = useState(false);
   const ruleRef = useRef<HTMLInputElement>(null);
+  const [dirVals, setDirVals] = useState<{ claude: string; codex: string }>({ claude: "", codex: "" });
 
   const paused = settings?.pause != null;
   const personalOn = settings?.personalSync !== false;
@@ -41,6 +48,13 @@ export function Privacy() {
       setRuleVal("");
       ruleRef.current?.focus();
     }
+  };
+
+  const doAddDir = (family: "claude" | "codex") => {
+    const v = dirVals[family].trim();
+    if (!v) return;
+    addDataDir(family, v);
+    setDirVals((prev) => ({ ...prev, [family]: "" }));
   };
 
   return (
@@ -93,6 +107,59 @@ export function Privacy() {
                 <button className="btn sm" id="ruleAddBtn" disabled={!settings} onClick={doAddRule}>Add</button>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <h2>Watched Locations</h2>
+        <div className="setrow">
+          <div className="txt">
+            <b>Where session logs are read from</b>
+            <p>
+              <code className="hx">hx</code> mirrors sessions from these data folders. The defaults are always watched.
+              If a tool writes somewhere else (a relocated <span className="mono">CLAUDE_CONFIG_DIR</span> or <span className="mono">CODEX_HOME</span>), add that folder here — new sessions in it start syncing within seconds{dataRootsFrom === "local" ? ". Shown from this app’s own view — the background service hasn’t reported its watch list yet" : ""}.
+            </p>
+            {ROOT_FAMILIES.map(({ key, label }) => {
+              const roots = dataRoots.filter((r) => r.family === key);
+              const suggestion = shellDetected[key];
+              return (
+                <div className="rulebox" style={{ marginTop: 10 }} key={key}>
+                  <div className="rulerow"><span className="none">{label}</span></div>
+                  {roots.map((r) => (
+                    <div className="rulerow" key={r.configDir}>
+                      <span className="ico"><FolderIc /></span>
+                      <span className="p">{r.display}</span>
+                      <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>
+                        {r.origin === "default" ? "default" : r.origin === "env" ? "from environment" : plural(r.files, "session")}
+                        {r.exists ? "" : " · not created yet"}
+                      </span>
+                      {r.origin === "settings" && (
+                        <button className="btn ghost sm" onClick={() => removeDataDir(key, r.configDir)}>Remove</button>
+                      )}
+                    </div>
+                  ))}
+                  {suggestion && (
+                    <div className="rulerow">
+                      <span className="ico"><FolderIc /></span>
+                      <span className="p">{suggestion}</span>
+                      <span style={{ color: "var(--text-subtle)", fontSize: 13 }}>set in your shell — not watched by the background service</span>
+                      <button className="btn sm" onClick={() => addDataDir(key, suggestion)}>Add</button>
+                    </div>
+                  )}
+                  <div className="ruleadd">
+                    <span className="ico"><FolderIc /></span>
+                    <input
+                      placeholder={key === "claude" ? "/path/to/claude-data-dir" : "/path/to/codex-home"}
+                      value={dirVals[key]}
+                      onChange={(e) => setDirVals((prev) => ({ ...prev, [key]: e.target.value }))}
+                      onKeyDown={(e) => { if (e.key === "Enter") doAddDir(key); }}
+                    />
+                    <button className="btn sm" disabled={!settings} onClick={() => doAddDir(key)}>Add</button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>

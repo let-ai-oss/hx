@@ -85,6 +85,19 @@ export interface DoctorInfo {
   blockers: DoctorBlockerInfo[];
 }
 
+/** One watched data root (config dir), as reported by the server. */
+export interface DataRootInfo {
+  family: "claude" | "codex";
+  /** Absolute config-dir root — the identity used for settings add/remove. */
+  configDir: string;
+  /** ~-collapsed variant for display. */
+  display: string;
+  origin: "default" | "settings" | "env";
+  exists: boolean;
+  /** Discovered transcript files under this root. */
+  files: number;
+}
+
 export interface Snapshot {
   generatedAt: number;
   device: DeviceInfo;
@@ -93,6 +106,13 @@ export interface Snapshot {
   destinations: DestinationInfo[];
   recent: RecentUpload[];
   doctor: DoctorInfo;
+  dataRoots?: DataRootInfo[];
+  /** "daemon" = the background service reported its watch list;
+   *  "local" = server-side fallback (daemon not yet upgraded / never ran). */
+  dataRootsFrom?: "daemon" | "local";
+  /** Env-var roots visible to the UI server but not watched by the daemon —
+   *  the "set in your shell, add it?" suggestion. */
+  shellDetected?: { claude?: string; codex?: string };
 }
 
 export interface SessionInfo {
@@ -139,6 +159,8 @@ export interface Settings {
   personalSync: boolean;
   excludedFolders: ExcludedFolder[];
   excludeRules: string[];
+  /** Extra data-dir roots to watch (CLAUDE_CONFIG_DIR / CODEX_HOME values). */
+  dataDirs?: { claude: string[]; codex: string[] };
 }
 
 export interface DaemonActionResult {

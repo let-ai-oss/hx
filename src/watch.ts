@@ -16,9 +16,6 @@ import { existsSync } from "node:fs";
 import { stat, open } from "node:fs/promises";
 import path from "node:path";
 import {
-  CLAUDE_PROJECTS_DIR,
-  CODEX_ARCHIVED_DIR,
-  CODEX_SESSIONS_DIR,
   type DiscoveredChildFile,
   type DiscoveredFile,
   type DiscoveredWorkflowRun,
@@ -27,6 +24,15 @@ import {
   discoverCodexFiles,
   readHead,
 } from "./sources.js";
+import {
+  type DataRoot,
+  type ResolvedRoots,
+  claudeTasksDir,
+  claudeTeamsDir,
+  isUnderRoots,
+  resolveDataRoots,
+  rootsSignature,
+} from "./roots.js";
 import {
   type FileSkipReason,
   type FileState,
@@ -48,6 +54,7 @@ import {
   reconcileDestinations,
   setArtifactHash,
   setOffsetFor,
+  stampEffectiveRoots,
   touchMtime,
   upsertFileState,
 } from "./state.js";
@@ -888,14 +895,17 @@ async function syncWorkflowRun(
   log(`  [workflow] ${sessionId.slice(0, 8)}…/${run.runId}`);
 }
 
-// Mirror the device's active agent teams (~/.claude/teams/*). The dirs exist
-// only while a team runs; an upload happens only when the set changes, and the
-// transition back to "no teams" uploads once (clearing the server mirror).
+// Mirror the device's active agent teams (<claudeRoot>/teams/* across every
+// watched root). The dirs exist only while a team runs; an upload happens only
+// when the set changes, and the transition back to "no teams" uploads once
+// (clearing the server mirror).
 async function syncTeamMirror(cfg: HxConfig, log: (msg: string) => void): Promise<void> {
   const scope = scopeOf(cfg);
   let teams;
   try {
-    teams = await readTeamConfigs();
+    const settings = await readSettings();
+    const teamsDirs = resolveDataRoots(settings).claude.map((r) => claudeTeamsDir(r.configDir));
+    teams = await readTeamConfigs(teamsDirs);
   } catch {
     return;
   }
@@ -924,7 +934,9 @@ async function syncArtifacts(
   log: (msg: string) => void,
 ): Promise<void> {
   const scope = scopeOf(cfg);
-  const tasks = await readTaskSet(fState.sessionId);
+  const settings = await readSettings();
+  const tasksDirs = resolveDataRoots(settings).claude.map((r) => claudeTasksDir(r.configDir));
+  const tasks = await readTaskSet(fState.sessionId, tasksDirs);
   if (tasks && tasks.length > 0) {
     const key = `${fState.family}:${fState.sessionId}:tasks`;
     const hash = hashContent(JSON.stringify(tasks));
@@ -969,14 +981,17 @@ export async function backfillArtifacts(
   cfg: HxConfig,
   log: (msg: string) => void,
 ): Promise<{ tasks: number; plans: number; failed: number }> {
-  const sessionIds = await listTaskSessionIds();
+  const settings = await readSettings();
+  const roots = resolveDataRoots(settings);
+  const tasksDirs = roots.claude.map((r) => claudeTasksDir(r.configDir));
+  const sessionIds = await listTaskSessionIds(tasksDirs);
   if (sessionIds.length === 0) {
-    log("[hx] no ~/.claude/tasks dirs to backfill");
+    log("[hx] no tasks dirs to backfill under the watched roots");
     return { tasks: 0, plans: 0, failed: 0 };
   }
   // Map sessionId → { family, jsonl path } from discovered Claude logs so we
   // stamp the right family and can find each session's plan attachment.
-  const claude = await discoverClaudeFiles();
+  const claude = await discoverClaudeFiles(roots.claude);
   const byId = new Map<string, { family: string; path: string }>();
   for (const f of claude) {
     const head = await readHead(f.path, f.source);
@@ -990,7 +1005,7 @@ export async function backfillArtifacts(
     const info = byId.get(sid);
     const family = (info?.family ?? "claude-cli") as never;
     try {
-      const tasks = await readTaskSet(sid);
+      const tasks = await readTaskSet(sid, tasksDirs);
       if (tasks && tasks.length > 0) {
         await uploadTasks(cfg, { family, sessionId: sid, tasks });
         await setArtifactHash(`${info?.family ?? "claude-cli"}:${sid}:tasks`, hashContent(JSON.stringify(tasks)), scopeOf(cfg));
@@ -1067,7 +1082,11 @@ async function auditCanonicals(
 ): Promise<void> {
   const scope = scopeOf(cfg);
   if (SELF_HEAL.get(scope) === false) return;
-  const [claude, codex] = await Promise.all([discoverClaudeFiles(), discoverCodexFiles()]);
+  const roots = resolveDataRoots(await readSettings());
+  const [claude, codex] = await Promise.all([
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
+  ]);
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
   const state = await loadState(scope);
@@ -1191,6 +1210,41 @@ function electUploaders(
 }
 
 /**
+ * Child-lane election — the same twin problem as electUploaders, keyed by the
+ * child's UPLOAD identity instead. A copied data root (the no-migration
+ * CLAUDE_CONFIG_DIR world makes copies routine) leaves the same
+ * (parentSessionId, agentId, runId) child at two paths; both would upload
+ * from-zero REPLACEs into one child canonical and ping-pong it forever —
+ * child lanes have no offsets audit to even notice. Same rule as parents:
+ * newest mtime wins (tie: largest), losers are shadowed. Needs no state —
+ * the child's identity is fully encoded in its discovered shape.
+ */
+export function electChildUploaders(
+  children: DiscoveredChildFile[],
+  log?: (msg: string) => void,
+): DiscoveredChildFile[] {
+  const byKey = new Map<string, DiscoveredChildFile[]>();
+  for (const c of children) {
+    const key = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    const list = byKey.get(key) ?? [];
+    list.push(c);
+    byKey.set(key, list);
+  }
+  const active: DiscoveredChildFile[] = [];
+  for (const list of byKey.values()) {
+    list.sort((a, b) => b.mtimeMs - a.mtimeMs || b.size - a.size);
+    active.push(list[0]!);
+    for (const twin of list.slice(1)) {
+      if (log && !loggedShadowed.has(twin.path)) {
+        loggedShadowed.add(twin.path);
+        log(`[hx] ${twin.path} shadows ${list[0]!.path} (same child lane); not uploading the twin`);
+      }
+    }
+  }
+  return active;
+}
+
+/**
  * Catch-up snapshot from the discovered files + the persisted upload offsets:
  * a file is "done" once we've uploaded up to its (discovery-time) size, and
  * every file short of that contributes its remaining bytes to the backlog.
@@ -1219,15 +1273,22 @@ const SYNC_PROGRESS_EVERY = 20;
 /** One-shot catch-up snapshot (no upload) — backs `hx status` and the daemon
  *  restart decision. Main lane only: the `--local` tee tracks its own catch-up
  *  through its own tick's onProgress reports. */
-export async function computeSyncSnapshot(only?: string): Promise<SyncSnapshot> {
+export async function computeSyncSnapshot(
+  only?: string,
+  rootsOverride?: ResolvedRoots,
+): Promise<SyncSnapshot> {
+  const settings = await readSettings();
+  // The UI server passes the daemon's stamped roots so its numbers describe
+  // what the background service actually watches; without an override we
+  // resolve for THIS process (daemon and CLI one-shots).
+  const roots = rootsOverride ?? resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   let files = [...claude, ...codex];
   if (only) files = files.filter((f) => f.path === only);
   const state = await loadState();
-  const settings = await readSettings();
   return snapshotFrom(filterWatched(electUploaders(files, state), state, settings), state);
 }
 
@@ -1260,6 +1321,11 @@ export interface SyncReport {
   snapshot: SyncSnapshot;
   behind: SyncBehindEntry[];
   skipped: SyncSkippedEntry[];
+  /** Partially-uploaded state entries that sit under NO current data root —
+   *  a root was removed (or the daemon hasn't adopted one yet). They are not
+   *  "behind" (nothing will ever pick them up under the current config), so
+   *  they get their own count instead of nagging the behind list forever. */
+  unwatched: number;
 }
 
 /** The still-on-disk sessions currently waiting on a temporarily-unavailable
@@ -1289,10 +1355,12 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
  *  sessions currently skipped on a temporarily-unavailable store. Backs the
  *  honest `hx status` output — without these the bar reads 100% while the
  *  server holds partial transcripts or a store is down. */
-export async function computeSyncReport(): Promise<SyncReport> {
+export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<SyncReport> {
+  const settings = await readSettings();
+  const roots = rootsOverride ?? resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   const all = [...claude, ...codex];
   const state = await loadState();
@@ -1306,13 +1374,47 @@ export async function computeSyncReport(): Promise<SyncReport> {
     const fs = state.files[f.path];
     if (fs) liveSessions.add(`${fs.family}:${fs.sessionId}`);
   }
+  const { behind, unwatched } = collectBehind(
+    state,
+    discovered,
+    liveSessions,
+    [...roots.claude, ...roots.codex],
+  );
+  // Settings filtering applies to the ELECTED set only: `discovered` and
+  // `liveSessions` above stay unfiltered so an excluded-but-present file can
+  // never masquerade as a vanished-source gap.
+  const elected = filterWatched(electUploaders(all, state), state, settings);
+  return {
+    snapshot: snapshotFrom(elected, state),
+    behind,
+    skipped: collectSkipped(elected, state),
+    unwatched,
+  };
+}
+
+/** Pure fold of state entries into behind/unwatched buckets — unit-tested.
+ *  behind = never-finished uploads whose file left discovery but still sits
+ *  under a watched root (deleted or aged out); unwatched = the same shape
+ *  under NO current root (a removed data root) — nothing will ever pick those
+ *  up under the current config, so they must not nag the behind list. */
+export function collectBehind(
+  state: HxState,
+  discovered: Set<string>,
+  liveSessions: Set<string>,
+  roots: DataRoot[],
+): { behind: SyncBehindEntry[]; unwatched: number } {
   const behind: SyncBehindEntry[] = [];
+  let unwatched = 0;
   for (const [p, fs] of Object.entries(state.files)) {
     if (discovered.has(p)) continue;
     if (liveSessions.has(`${fs.family}:${fs.sessionId}`)) continue; // shadowed twin
     if (fs.lastKnownSize === undefined) continue; // legacy entry — size unknown
     const uploaded = minOffset(fs);
     if (uploaded >= fs.lastKnownSize) continue;
+    if (!isUnderRoots(p, roots)) {
+      unwatched += 1;
+      continue;
+    }
     behind.push({
       path: p,
       sessionId: fs.sessionId,
@@ -1321,12 +1423,7 @@ export async function computeSyncReport(): Promise<SyncReport> {
       sourceGone: !existsSync(p),
     });
   }
-  // Settings filtering applies to the ELECTED set only: `discovered` and
-  // `liveSessions` above stay unfiltered so an excluded-but-present file can
-  // never masquerade as a vanished-source gap.
-  const settings = await readSettings();
-  const elected = filterWatched(electUploaders(all, state), state, settings);
-  return { snapshot: snapshotFrom(elected, state), behind, skipped: collectSkipped(elected, state) };
+  return { behind, unwatched };
 }
 
 export async function tickOnce(
@@ -1335,9 +1432,14 @@ export async function tickOnce(
   log: (msg: string) => void,
   onProgress?: (snap: SyncSnapshot) => void,
 ): Promise<{ uploaded: number; failed: number; snapshot: SyncSnapshot }> {
+  // Settings first: they carry the extra data roots, so discovery has to see
+  // them. Each tick re-resolves — a root added through the UI is swept within
+  // one poll interval, no restart.
+  const settings = await readSettings();
+  const roots = resolveDataRoots(settings);
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(),
-    discoverCodexFiles(),
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
   ]);
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
@@ -1346,7 +1448,6 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
-  const settings = await readSettings();
   files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
@@ -1455,8 +1556,8 @@ export async function tickOnce(
   if (!opts.only && Date.now() >= (childEndpointsMissingUntilMs.get(scope) ?? 0)) {
     const parentByArtifactSession = buildChildParentIndex(state);
     try {
-      const { children, runs } = await discoverClaudeChildren();
-      for (const c of children) {
+      const { children, runs } = await discoverClaudeChildren(roots.claude);
+      for (const c of electChildUploaders(children, log)) {
         let pendingChild = state.files[c.path];
         if (pendingChild) {
           const reconciled = reconcileChildParent(
@@ -1540,11 +1641,29 @@ export async function startWatch(
   opts: WatchOptions,
   log: (msg: string) => void,
 ): Promise<{ stop: () => void }> {
-  log(
-    `[hx] watching ${CLAUDE_PROJECTS_DIR}, ${CODEX_SESSIONS_DIR}, ${CODEX_ARCHIVED_DIR}`,
-  );
+  const describeRoots = (r: ResolvedRoots): string =>
+    [...r.claude, ...r.codex]
+      .map((d) => `${collapseHome(d.configDir)}${d.origin === "default" ? "" : ` [${d.origin}]`}`)
+      .join(", ");
+  log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+
+  // Publish the resolved roots as device truth (state.effectiveRoots) so the
+  // UI server and doctor describe what THIS long-running loop watches. Gated
+  // to the main lane's persistent daemon: `hx tick` / `watch --once` / the
+  // --local tee run with an arbitrary shell env and must not overwrite it.
+  let lastRootsSig = "";
+  const publishRoots = async (settings: HxSettings): Promise<void> => {
+    if (opts.oneShot || scopeOf(cfg) !== "main") return;
+    const roots = resolveDataRoots(settings);
+    const sig = rootsSignature(roots);
+    if (sig === lastRootsSig) return;
+    const changed = lastRootsSig !== "";
+    lastRootsSig = sig;
+    await stampEffectiveRoots(roots);
+    if (changed) log(`[hx] watch roots updated: ${describeRoots(roots)}`);
+  };
 
   // Last time anything reached the gateway (upload or beat). Uploads count as
   // contact, so a busy daemon never sends a redundant heartbeat.
@@ -1609,6 +1728,7 @@ export async function startWatch(
     }
     passBusy = true;
     try {
+      await publishRoots(settings);
       const { uploaded, failed } = await tickOnce(cfg, opts, log, reportSync);
       if (uploaded || failed) {
         if (uploaded) lastContactMs = Date.now();

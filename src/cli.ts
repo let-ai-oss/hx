@@ -26,7 +26,9 @@ import {
   formatStatusBlocker,
   formatSyncDoctorText,
 } from "./diagnostics.js";
-import { isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
+import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
+import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
+import { loadState, resetStateCache } from "./state.js";
 import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
 import { checkForUpdate } from "./update.js";
 import { watch as watchDir } from "node:fs";
@@ -551,9 +553,15 @@ async function cmdStatus(): Promise<void> {
     ]);
   }
 
+  // Which data roots the mirror watches — the daemon's stamped truth when
+  // present, else resolved for this process. The report below is computed
+  // over the SAME set, so the numbers describe the locations this row names.
+  const { roots: watchRoots } = await effectiveRootsForCli(settings);
+  rows.push(["Watching", formatRootsRow(watchRoots)]);
+
   // Local sync state remains useful even when the network probe is down: a
   // persisted destination hold should still name the affected org/repo.
-  const report = await computeSyncReport().catch(() => null);
+  const report = await computeSyncReport(watchRoots).catch(() => null);
   const probe = await probeConnection(cfg);
   if (!probe.up) {
     rows.push(["Connection", `down — ${probe.reason}`]);
@@ -606,6 +614,15 @@ async function cmdStatus(): Promise<void> {
     }
     if (parts.length > 0) rows.push(["Sync gaps", parts.join("; ")]);
   }
+  // Partially-synced sessions under locations no longer watched (a data root
+  // was removed). Nothing will pick these up under the current config, so
+  // they get one informational row instead of nagging "Sync gaps" forever.
+  if (report && report.unwatched > 0) {
+    rows.push([
+      "Unwatched",
+      `${report.unwatched} partially-synced session${report.unwatched === 1 ? "" : "s"} under locations no longer watched`,
+    ]);
+  }
   // Sessions paused on a temporarily-unavailable store. Transient (they resume
   // on their own), so this is a distinct, softer signal from the "Sync gaps"
   // above — the upload isn't lost, it's waiting and retrying.
@@ -616,6 +633,32 @@ async function cmdStatus(): Promise<void> {
   printStatusTable(rows);
 }
 
+/** The roots to DESCRIBE from the CLI: the daemon's stamp when present
+ *  (device truth), else this process's own resolution — a daemon that
+ *  predates the stamp or has never run. */
+async function effectiveRootsForCli(
+  settings: HxSettings,
+): Promise<{ roots: ResolvedRoots; from: "daemon" | "local" }> {
+  resetStateCache();
+  const st = await loadState();
+  if (st.effectiveRoots) {
+    return {
+      roots: { claude: st.effectiveRoots.claude, codex: st.effectiveRoots.codex },
+      from: "daemon",
+    };
+  }
+  return { roots: resolveDataRoots(settings), from: "local" };
+}
+
+function formatRootsRow(roots: ResolvedRoots): string {
+  return [...roots.claude, ...roots.codex]
+    .map(
+      (r) =>
+        `${collapseHome(r.configDir)}${r.origin === "default" ? "" : ` [${r.origin}]`}${r.exists ? "" : " (missing)"}`,
+    )
+    .join(" · ");
+}
+
 async function cmdDoctor(): Promise<void> {
   if (process.argv[3] !== "sync") {
     log("usage: hx doctor sync [--json]");
@@ -623,8 +666,10 @@ async function cmdDoctor(): Promise<void> {
     return;
   }
   const cfg = await ensureConfig();
-  const report = await computeSyncReport();
-  const doctor = buildSyncDoctorReport(report, cfg.gatewayBaseUrl);
+  const settings = await readSettings();
+  const { roots } = await effectiveRootsForCli(settings);
+  const report = await computeSyncReport(roots);
+  const doctor = buildSyncDoctorReport(report, cfg.gatewayBaseUrl, Date.now(), roots);
   if (hasFlag("json")) log(JSON.stringify(doctor, null, 2));
   else log(formatSyncDoctorText(doctor));
   if (!doctor.ok) process.exitCode = 1;

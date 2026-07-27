@@ -1,11 +1,15 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_SETTINGS,
+  MAX_DATA_DIRS_PER_FAMILY,
+  dataDirsPatchError,
   isPaused,
+  normalizeDataDir,
+  parseDataDirs,
   readSettings,
   shouldSkipFile,
   writeSettings,
@@ -37,6 +41,74 @@ describe("settings file", () => {
     const s = await readSettings(p);
     assert.deepEqual(s.excludedFolders, [{ family: "claude-cli", cwd: "~/x" }]);
     assert.deepEqual(s.excludeRules, ["~/ok"]);
+  });
+});
+
+describe("normalizeDataDir", () => {
+  it("expands ~, requires absolute, strips trailing separators, collapses dots", () => {
+    assert.equal(normalizeDataDir("~/data"), join(homedir(), "data"));
+    assert.equal(normalizeDataDir("~"), homedir());
+    assert.equal(normalizeDataDir("/a/b/"), "/a/b");
+    assert.equal(normalizeDataDir("/a/./b/../c"), "/a/c");
+    assert.equal(normalizeDataDir("  /a/b  "), "/a/b");
+  });
+
+  it("rejects relative paths, empties, and control characters - not spaces", () => {
+    assert.equal(normalizeDataDir("relative/path"), null);
+    assert.equal(normalizeDataDir(""), null);
+    assert.equal(normalizeDataDir("   "), null);
+    assert.equal(normalizeDataDir("/Users/John Doe/claude-data"), "/Users/John Doe/claude-data");
+    assert.equal(normalizeDataDir("/a\0b"), null);
+    assert.equal(normalizeDataDir("/a\nb"), null);
+  });
+});
+
+describe("parseDataDirs", () => {
+  it("normalizes, dedupes, drops non-strings, caps per family", () => {
+    const parsed = parseDataDirs({
+      claude: ["/a/", "/a", "~/x", 42, "relative", ...Array.from({ length: 12 }, (_, i) => `/cap/${i}`)],
+      codex: "not-an-array",
+    });
+    assert.equal(parsed.claude[0], "/a");
+    assert.equal(parsed.claude[1], join(homedir(), "x"));
+    assert.ok(parsed.claude.length <= MAX_DATA_DIRS_PER_FAMILY);
+    assert.deepEqual(parsed.codex, []);
+  });
+
+  it("survives a legacy settings file with no dataDirs field", async () => {
+    const p = join(mkdtempSync(join(tmpdir(), "hx-settings-")), "settings.json");
+    writeFileSync(p, JSON.stringify({ personalSync: false, excludeRules: ["~/x"] }));
+    const s = await readSettings(p);
+    assert.deepEqual(s.dataDirs, { claude: [], codex: [] });
+    assert.equal(s.personalSync, false);
+  });
+
+  it("round-trips through writeSettings with write-time normalization", async () => {
+    const p = tmpPath();
+    await writeSettings({ dataDirs: { claude: ["~/data-root/", "not-absolute"], codex: [] } }, p);
+    const s = await readSettings(p);
+    assert.deepEqual(s.dataDirs, { claude: [join(homedir(), "data-root")], codex: [] });
+  });
+});
+
+describe("dataDirsPatchError", () => {
+  it("accepts valid shapes, including partial families", () => {
+    assert.equal(dataDirsPatchError({ claude: ["/a"], codex: [] }), null);
+    assert.equal(dataDirsPatchError({ claude: ["~/x"] }), null);
+    assert.equal(dataDirsPatchError({}), null);
+  });
+
+  it("rejects loudly what the disk parser would drop silently", () => {
+    assert.match(dataDirsPatchError(null) ?? "", /must be an object/);
+    assert.match(dataDirsPatchError([]) ?? "", /must be an object/);
+    assert.match(dataDirsPatchError({ gemini: [] }) ?? "", /unknown dataDirs family/);
+    assert.match(dataDirsPatchError({ claude: "nope" }) ?? "", /must be an array/);
+    assert.match(dataDirsPatchError({ claude: [42] }) ?? "", /entries must be strings/);
+    assert.match(dataDirsPatchError({ claude: ["relative"] }) ?? "", /absolute/);
+    assert.match(
+      dataDirsPatchError({ claude: Array.from({ length: 9 }, (_, i) => `/x/${i}`) }) ?? "",
+      /at most/,
+    );
   });
 });
 

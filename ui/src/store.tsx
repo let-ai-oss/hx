@@ -6,6 +6,7 @@ import {
   subscribeEvents,
   type ActivityEntry,
   type AuthErrorKind,
+  type DataRootInfo,
   type DestinationInfo,
   type FolderInfo,
   type LogLine,
@@ -96,6 +97,11 @@ interface AppState {
   includeFolder: (f: FolderInfo) => void;
   addRule: (v: string) => void;
   removeRule: (v: string) => void;
+  dataRoots: DataRootInfo[];
+  dataRootsFrom: "daemon" | "local";
+  shellDetected: { claude?: string; codex?: string };
+  addDataDir: (family: "claude" | "codex", dir: string) => void;
+  removeDataDir: (family: "claude" | "codex", dir: string) => void;
   daemonAct: (action: "start" | "stop" | "restart") => Promise<string>;
   retryBlockedAct: () => Promise<string>;
   disconnectAct: () => Promise<void>;
@@ -383,6 +389,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const removeRule = (v: string) => {
     patch({ excludeRules: (settings?.excludeRules ?? []).filter((r) => r !== v) });
   };
+  // Watched-locations settings. The full dataDirs object is sent each time
+  // (same replace semantics as excludedFolders); the server validates and the
+  // daemon adopts the new root within one tick.
+  const addDataDir = (family: "claude" | "codex", dir: string) => {
+    const cur = settings?.dataDirs ?? { claude: [], codex: [] };
+    if (cur[family].includes(dir)) return;
+    patch({ dataDirs: { ...cur, [family]: [...cur[family], dir] } });
+  };
+  const removeDataDir = (family: "claude" | "codex", dir: string) => {
+    const cur = settings?.dataDirs ?? { claude: [], codex: [] };
+    patch({ dataDirs: { ...cur, [family]: cur[family].filter((d) => d !== dir) } });
+  };
 
   const daemonAct = async (action: "start" | "stop" | "restart"): Promise<string> => {
     try {
@@ -526,6 +544,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     settings, isExcluded, isPersonalGated,
     setPersonal, pickPause, resumeAll,
     excludeFolder, includeFolder, addRule, removeRule,
+    dataRoots: snap?.dataRoots ?? [],
+    dataRootsFrom: snap?.dataRootsFrom ?? "local",
+    shellDetected: snap?.shellDetected ?? {},
+    addDataDir, removeDataDir,
     daemonAct, retryBlockedAct, disconnectAct,
     update, checkUpdate, runUpdateAct,
     confirm, askConfirm, answerConfirm,

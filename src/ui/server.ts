@@ -21,6 +21,7 @@ import { contentTypeFor, type UiAssets } from "./assets.js";
 import { instanceIdentity } from "./instance.js";
 import type { SessionVM, UiSnapshot, LogLevel } from "./data.js";
 import type { PreviewLine } from "./preview.js";
+import { dataDirsPatchError } from "../settings.js";
 
 /** Read-only data the API serves; injected so the handler tests with fakes. */
 export interface UiProviders {
@@ -223,9 +224,16 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
         } catch {
           return apiError(400, "invalid body");
         }
-        const allowed = new Set(["pause", "personalSync", "excludedFolders", "excludeRules"]);
+        const allowed = new Set(["pause", "personalSync", "excludedFolders", "excludeRules", "dataDirs"]);
         for (const key of Object.keys(patch)) {
           if (!allowed.has(key)) return apiError(400, `unknown setting: ${key}`);
+        }
+        // dataDirs gets strict validation: the disk parser silently drops
+        // garbage, but an API write should fail loudly instead of appearing
+        // to accept a location it actually threw away.
+        if ("dataDirs" in patch) {
+          const err = dataDirsPatchError(patch.dataDirs);
+          if (err) return apiError(400, err);
         }
         return json(await ctx.actions.writeSettings(patch));
       }

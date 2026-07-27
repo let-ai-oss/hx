@@ -37,7 +37,7 @@ const fstate = (over: Partial<FileState>): FileState => ({
 });
 
 const fact = (p: string, h: Partial<HeadMeta>, s: Partial<FileState> | null): FileFacts => ({
-  file: { path: p, size: 100, mtimeMs: 1, source: "claude" },
+  file: { path: p, size: 100, mtimeMs: 1, source: "claude", rootDir: "/home/u/.claude" },
   head: head(h),
   state: s === null ? null : fstate(s),
 });
