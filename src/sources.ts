@@ -1,30 +1,34 @@
 // Source-path discovery + family classification.
 //
-// A deliberately fixed watch surface — the exact set of paths hx mirrors:
+// A fixed watch SHAPE over a configurable set of data roots (see roots.ts —
+// default ~/.claude / ~/.codex plus any CLAUDE_CONFIG_DIR / CODEX_HOME style
+// roots from settings or this process's env). Per root, the exact paths hx
+// mirrors:
 //
-//   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
+//   <claudeRoot>/projects/<encoded-cwd>/<session-id>.jsonl
 //     → Claude Code Desktop OR Claude Code CLI; family is decided by the
 //       `entrypoint` field on the first event we can read.
 //
-//   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<iso>-<uuid>.jsonl
+//   <codexRoot>/sessions/<YYYY>/<MM>/<DD>/rollout-<iso>-<uuid>.jsonl
 //     → Codex Desktop OR Codex CLI; family decided by the `originator`
 //       field on the `session_meta` event at the head of the file.
 //
-//   ~/.codex/archived_sessions/...   (same shape, included if recent)
+//   <codexRoot>/archived_sessions/...   (same shape, included if recent)
 //
-// We intentionally do not scrape `~/.claude/sessions/*.json` (the live PID
+// We intentionally do not scrape `<claudeRoot>/sessions/*.json` (the live PID
 // tracker) — it's transient liveness state, not the transcript itself.
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import path from "node:path";
-import os from "node:os";
-
-const HOME = os.homedir();
-export const CLAUDE_PROJECTS_DIR = path.join(HOME, ".claude", "projects");
-export const CODEX_SESSIONS_DIR = path.join(HOME, ".codex", "sessions");
-export const CODEX_ARCHIVED_DIR = path.join(HOME, ".codex", "archived_sessions");
+import {
+  claudeProjectsDir,
+  codexArchivedDir,
+  codexSessionsDir,
+  type DataRoot,
+  type ResolvedRoots,
+} from "./roots.js";
 
 const RECENT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -70,38 +74,45 @@ export interface DiscoveredFile {
   size: number;
   mtimeMs: number;
   source: "claude" | "codex";
+  /** The config-dir root this file was discovered under (see roots.ts). */
+  rootDir: string;
 }
 
-/** All recent Claude-projects jsonls. */
-export async function discoverClaudeFiles(): Promise<DiscoveredFile[]> {
+/** All recent Claude-projects jsonls across the given roots. */
+export async function discoverClaudeFiles(roots: DataRoot[]): Promise<DiscoveredFile[]> {
   const out: DiscoveredFile[] = [];
   const now = Date.now();
-  let projects: string[];
-  try {
-    projects = await readdir(CLAUDE_PROJECTS_DIR);
-  } catch {
-    return [];
-  }
   // Gather candidate jsonl paths across all recent project dirs first (the
   // dir-level mtime prune skips >30-day dirs before we ever read their files),
   // then batch the per-file stats — that sequential stat loop was the daemon's
   // hot path. The project-dir reads are themselves pooled so a machine with
-  // thousands of project dirs doesn't serialize the readdirs either.
-  const candidates: string[] = [];
-  await mapPool(projects, STAT_CONCURRENCY, async (dir) => {
-    if (dir.startsWith(".") || dir === "memory") return;
-    const full = path.join(CLAUDE_PROJECTS_DIR, dir);
-    const dirStat = await statSafe(full);
-    if (!dirStat?.isDir || now - dirStat.mtimeMs > RECENT_WINDOW_MS) return;
-    for (const f of await readdirSafe(full)) {
-      if (f.endsWith(".jsonl")) candidates.push(path.join(full, f));
+  // thousands of project dirs doesn't serialize the readdirs either. One
+  // candidate pool spans every root, so extra roots share the same bound.
+  const candidates: Array<{ path: string; rootDir: string }> = [];
+  for (const root of roots) {
+    let projects: string[];
+    try {
+      projects = await readdir(claudeProjectsDir(root.configDir));
+    } catch {
+      continue; // no projects/ under this root (yet) — nothing to sweep
     }
-  });
-  await mapPool(candidates, STAT_CONCURRENCY, async (p) => {
-    const st = await statSafe(p);
+    await mapPool(projects, STAT_CONCURRENCY, async (dir) => {
+      if (dir.startsWith(".") || dir === "memory") return;
+      const full = path.join(claudeProjectsDir(root.configDir), dir);
+      const dirStat = await statSafe(full);
+      if (!dirStat?.isDir || now - dirStat.mtimeMs > RECENT_WINDOW_MS) return;
+      for (const f of await readdirSafe(full)) {
+        if (f.endsWith(".jsonl")) {
+          candidates.push({ path: path.join(full, f), rootDir: root.configDir });
+        }
+      }
+    });
+  }
+  await mapPool(candidates, STAT_CONCURRENCY, async (c) => {
+    const st = await statSafe(c.path);
     if (!st || st.isDir || st.size === 0) return;
     if (now - st.mtimeMs > RECENT_WINDOW_MS) return;
-    out.push({ path: p, size: st.size, mtimeMs: st.mtimeMs, source: "claude" });
+    out.push({ path: c.path, size: st.size, mtimeMs: st.mtimeMs, source: "claude", rootDir: c.rootDir });
   });
   return out;
 }
@@ -134,6 +145,8 @@ export interface DiscoveredChildFile {
   runId: string | null;
   /** Sibling agent-<agentId>.meta.json path, if present. */
   metaPath: string | null;
+  /** The config-dir root this child was discovered under. */
+  rootDir: string;
 }
 
 export interface DiscoveredWorkflowRun {
@@ -173,6 +186,7 @@ async function collectAgentFiles(
   parentSessionId: string,
   runId: string | null,
   now: number,
+  rootDir: string,
   out: DiscoveredChildFile[],
 ): Promise<void> {
   for (const f of await readdirSafe(dir)) {
@@ -191,6 +205,7 @@ async function collectAgentFiles(
       agentId: m[1]!,
       runId,
       metaPath: (await statSafe(metaPath)) ? metaPath : null,
+      rootDir,
     });
   }
 }
@@ -200,16 +215,17 @@ async function collectAgentFiles(
  * Scans only session-id SUBDIRECTORIES (rare next to the flat jsonl files), so
  * the added cost over discoverClaudeFiles is a few readdirs per active session.
  */
-export async function discoverClaudeChildren(): Promise<{
+export async function discoverClaudeChildren(roots: DataRoot[]): Promise<{
   children: DiscoveredChildFile[];
   runs: DiscoveredWorkflowRun[];
 }> {
   const children: DiscoveredChildFile[] = [];
   const runs: DiscoveredWorkflowRun[] = [];
   const now = Date.now();
-  for (const dir of await readdirSafe(CLAUDE_PROJECTS_DIR)) {
+  for (const root of roots) {
+  for (const dir of await readdirSafe(claudeProjectsDir(root.configDir))) {
     if (dir.startsWith(".") || dir === "memory") continue;
-    const projectDir = path.join(CLAUDE_PROJECTS_DIR, dir);
+    const projectDir = path.join(claudeProjectsDir(root.configDir), dir);
     const pst = await statSafe(projectDir);
     if (!pst?.isDir || now - pst.mtimeMs > RECENT_WINDOW_MS) continue;
     for (const entry of await readdirSafe(projectDir)) {
@@ -221,7 +237,7 @@ export async function discoverClaudeChildren(): Promise<{
 
       // Interactive subagents.
       const subagentsDir = path.join(sessionDir, "subagents");
-      await collectAgentFiles(subagentsDir, sessionId, null, now, children);
+      await collectAgentFiles(subagentsDir, sessionId, null, now, root.configDir, children);
 
       // Workflow runs: per-run agent transcripts + journal.
       const wfRoot = path.join(subagentsDir, "workflows");
@@ -229,15 +245,17 @@ export async function discoverClaudeChildren(): Promise<{
         const runDir = path.join(wfRoot, runId);
         const rst = await statSafe(runDir);
         if (!rst?.isDir) continue;
-        await collectAgentFiles(runDir, sessionId, runId, now, children);
+        await collectAgentFiles(runDir, sessionId, runId, now, root.configDir, children);
         const journalPath = path.join(runDir, "journal.jsonl");
         const jst = await statSafe(journalPath);
         // One session can appear under SEVERAL project dirs (the cwd changed
-        // mid-session — e.g. into a worktree), splitting a run's artifacts:
-        // journal under one project dir, script under another. Merge into any
-        // entry the script scan already created instead of pushing a twin —
-        // two entries share the upload key (sessionId+runId) and alternating
-        // content hashes re-upload the sidecar every pass, forever.
+        // mid-session — e.g. into a worktree) — and, with multiple data roots,
+        // under several ROOTS — splitting a run's artifacts: journal under one
+        // project dir, script under another. Merge into any entry the script
+        // scan already created instead of pushing a twin — two entries share
+        // the upload key (sessionId+runId) and alternating content hashes
+        // re-upload the sidecar every pass, forever. `runs` spans all roots,
+        // so the merge covers the cross-root split for free.
         const existing = runs.find(
           (r) => r.parentSessionId === sessionId && r.runId === runId,
         );
@@ -290,28 +308,30 @@ export async function discoverClaudeChildren(): Promise<{
       }
     }
   }
+  }
   return { children, runs };
 }
 
-/** All recent Codex rollout jsonls (sessions + archived). */
-export async function discoverCodexFiles({
-  includeArchived = true,
-} = {}): Promise<DiscoveredFile[]> {
+/** All recent Codex rollout jsonls (sessions + archived) across the roots. */
+export async function discoverCodexFiles(
+  roots: DataRoot[],
+  { includeArchived = true } = {},
+): Promise<DiscoveredFile[]> {
   const out: DiscoveredFile[] = [];
   const now = Date.now();
   // Collect candidate rollout paths during the walk, then batch the per-file
   // stats once (same hot-loop fix as the Claude sweep).
-  const candidates: string[] = [];
-  async function walk(root: string): Promise<void> {
+  const candidates: Array<{ path: string; rootDir: string }> = [];
+  async function walk(dir: string, rootDir: string): Promise<void> {
     let entries;
     try {
-      entries = await readdir(root, { withFileTypes: true });
+      entries = await readdir(dir, { withFileTypes: true });
     } catch {
       return;
     }
     const subdirs: string[] = [];
     for (const e of entries) {
-      const full = path.join(root, e.name);
+      const full = path.join(dir, e.name);
       if (e.isDirectory()) {
         subdirs.push(full);
       } else if (
@@ -319,7 +339,7 @@ export async function discoverCodexFiles({
         e.name.startsWith("rollout-") &&
         e.name.endsWith(".jsonl")
       ) {
-        candidates.push(full);
+        candidates.push({ path: full, rootDir });
       }
     }
     // Dir-level mtime prune: the Codex tree is sessions/<YYYY>/<MM>/<DD>/, and a
@@ -329,22 +349,27 @@ export async function discoverCodexFiles({
     await mapPool(subdirs, STAT_CONCURRENCY, async (d) => {
       const st = await statSafe(d);
       if (!st?.isDir || now - st.mtimeMs > RECENT_WINDOW_MS) return;
-      await walk(d);
+      await walk(d, rootDir);
     });
   }
-  await walk(CODEX_SESSIONS_DIR);
-  if (includeArchived) await walk(CODEX_ARCHIVED_DIR);
-  await mapPool(candidates, STAT_CONCURRENCY, async (full) => {
-    const st = await statSafe(full);
+  for (const root of roots) {
+    await walk(codexSessionsDir(root.configDir), root.configDir);
+    if (includeArchived) await walk(codexArchivedDir(root.configDir), root.configDir);
+  }
+  await mapPool(candidates, STAT_CONCURRENCY, async (c) => {
+    const st = await statSafe(c.path);
     if (!st || st.isDir || st.size === 0) return;
     if (now - st.mtimeMs > RECENT_WINDOW_MS) return;
-    out.push({ path: full, size: st.size, mtimeMs: st.mtimeMs, source: "codex" });
+    out.push({ path: c.path, size: st.size, mtimeMs: st.mtimeMs, source: "codex", rootDir: c.rootDir });
   });
   return out;
 }
 
-export async function discoverAll(): Promise<DiscoveredFile[]> {
-  const [a, b] = await Promise.all([discoverClaudeFiles(), discoverCodexFiles()]);
+export async function discoverAll(roots: ResolvedRoots): Promise<DiscoveredFile[]> {
+  const [a, b] = await Promise.all([
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
+  ]);
   return [...a, ...b];
 }
 

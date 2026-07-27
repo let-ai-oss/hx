@@ -26,7 +26,9 @@ import {
   formatStatusBlocker,
   formatSyncDoctorText,
 } from "./diagnostics.js";
-import { isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
+import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
+import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
+import { loadState, resetStateCache } from "./state.js";
 import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
 import { checkForUpdate } from "./update.js";
 import { watch as watchDir } from "node:fs";
@@ -224,7 +226,12 @@ async function autoStartDaemon(
     // the revoked one) or there's still a backlog to push. A user-paused device
     // is deliberately behind — restarting wouldn't (and shouldn't) change that.
     const settings = await readSettings();
-    const snap = await computeSyncSnapshot().catch(() => null);
+    // Stamp-first roots: measure the backlog over what the DAEMON watches. A
+    // CLAUDE_CONFIG_DIR visible only to this shell would otherwise count
+    // sessions the daemon (correctly) never syncs — a permanently "behind"
+    // reading that restarts a healthy daemon on every invocation.
+    const { roots: snapRoots } = await effectiveRootsForCli(settings);
+    const snap = await computeSyncSnapshot(undefined, snapRoots).catch(() => null);
     const behind = !isPaused(settings) && (snap ? snap.done < snap.total : false);
     const remaining = snap ? Math.max(0, snap.total - snap.done) : 0;
     if (opts.tokenRefreshed || behind) {
@@ -405,6 +412,19 @@ async function cmdTick(): Promise<void> {
   const cfg = await ensureConfig();
   const localCfg = hasFlag("local") ? await ensureLocalConfig() : null;
   const only = flag("only");
+  // A one-shot tick beside the running service is two writers on one state
+  // file — and with per-process env honor their root sets (and elections)
+  // can systematically diverge. Warn instead of refusing: power users tick
+  // deliberately, but they should know the daemon will fight back.
+  {
+    const ops = getDaemonOps();
+    const ds = ops.managerName !== "none" ? await ops.state().catch(() => null) : null;
+    if (ds?.pid) {
+      log(
+        "[hx] warning: the background service is running — a one-shot tick shares its upload state and can fight its elections. Prefer letting the service sync, or `hx stop` first.",
+      );
+    }
+  }
   const r = await tickOnce(cfg, { only, oneShot: true }, log);
   log(`done. uploaded=${r.uploaded} failed=${r.failed}`);
   if (localCfg) {
@@ -526,18 +546,19 @@ async function cmdStatus(): Promise<void> {
   // `hx status` looked identical to before the stop). Placed above the probe
   // so it still shows when the gateway is unreachable.
   const ops = getDaemonOps();
-  if (ops.managerName !== "none") {
-    const ds = await ops.state().catch(() => null);
-    if (ds) {
-      rows.push([
-        "Daemon",
-        ds.pid
-          ? `running (${ops.managerName}, pid ${ds.pid})`
-          : ds.loaded
-            ? `loaded, not running (${ops.managerName})`
-            : "stopped — run `hx start` to resume",
-      ]);
-    }
+  // One probe, two consumers: the Daemon row and the Watching row's
+  // last-known suffix must describe the SAME reading (a start/stop between
+  // two probes would print "running" beside "daemon stopped").
+  const daemonState = ops.managerName !== "none" ? await ops.state().catch(() => null) : null;
+  if (daemonState) {
+    rows.push([
+      "Daemon",
+      daemonState.pid
+        ? `running (${ops.managerName}, pid ${daemonState.pid})`
+        : daemonState.loaded
+          ? `loaded, not running (${ops.managerName})`
+          : "stopped — run `hx start` to resume",
+    ]);
   }
 
   // User-driven pause (settings.json — set from the HX Client UI). Shown
@@ -551,9 +572,21 @@ async function cmdStatus(): Promise<void> {
     ]);
   }
 
+  // Which data roots the mirror watches — the daemon's stamped truth when
+  // present, else resolved for this process. The report below is computed
+  // over the SAME set, so the numbers describe the locations this row names.
+  // A stamp from a daemon that is NOT currently running is last-known state,
+  // and the row says so rather than presenting it as present-tense truth.
+  const { roots: watchRoots, from: rootsFrom } = await effectiveRootsForCli(settings);
+  const daemonDown = ops.managerName !== "none" && !daemonState?.pid;
+  rows.push([
+    "Watching",
+    `${formatRootsRow(watchRoots)}${rootsFrom === "daemon" && daemonDown ? " (last known — daemon stopped)" : ""}`,
+  ]);
+
   // Local sync state remains useful even when the network probe is down: a
   // persisted destination hold should still name the affected org/repo.
-  const report = await computeSyncReport().catch(() => null);
+  const report = await computeSyncReport(watchRoots).catch(() => null);
   const probe = await probeConnection(cfg);
   if (!probe.up) {
     rows.push(["Connection", `down — ${probe.reason}`]);
@@ -606,6 +639,15 @@ async function cmdStatus(): Promise<void> {
     }
     if (parts.length > 0) rows.push(["Sync gaps", parts.join("; ")]);
   }
+  // Partially-synced sessions under locations no longer watched (a data root
+  // was removed). Nothing will pick these up under the current config, so
+  // they get one informational row instead of nagging "Sync gaps" forever.
+  if (report && report.unwatched > 0) {
+    rows.push([
+      "Unwatched",
+      `${report.unwatched} partially-synced session${report.unwatched === 1 ? "" : "s"} under locations no longer watched`,
+    ]);
+  }
   // Sessions paused on a temporarily-unavailable store. Transient (they resume
   // on their own), so this is a distinct, softer signal from the "Sync gaps"
   // above — the upload isn't lost, it's waiting and retrying.
@@ -616,6 +658,32 @@ async function cmdStatus(): Promise<void> {
   printStatusTable(rows);
 }
 
+/** The roots to DESCRIBE from the CLI: the daemon's stamp when present
+ *  (device truth), else this process's own resolution — a daemon that
+ *  predates the stamp or has never run. */
+async function effectiveRootsForCli(
+  settings: HxSettings,
+): Promise<{ roots: ResolvedRoots; from: "daemon" | "local" }> {
+  resetStateCache();
+  const st = await loadState();
+  if (st.effectiveRoots) {
+    return {
+      roots: { claude: st.effectiveRoots.claude, codex: st.effectiveRoots.codex },
+      from: "daemon",
+    };
+  }
+  return { roots: resolveDataRoots(settings), from: "local" };
+}
+
+function formatRootsRow(roots: ResolvedRoots): string {
+  return [...roots.claude, ...roots.codex]
+    .map(
+      (r) =>
+        `${collapseHome(r.configDir)}${r.origin === "default" ? "" : ` [${r.origin}]`}${r.exists ? "" : " (missing)"}`,
+    )
+    .join(" · ");
+}
+
 async function cmdDoctor(): Promise<void> {
   if (process.argv[3] !== "sync") {
     log("usage: hx doctor sync [--json]");
@@ -623,8 +691,10 @@ async function cmdDoctor(): Promise<void> {
     return;
   }
   const cfg = await ensureConfig();
-  const report = await computeSyncReport();
-  const doctor = buildSyncDoctorReport(report, cfg.gatewayBaseUrl);
+  const settings = await readSettings();
+  const { roots } = await effectiveRootsForCli(settings);
+  const report = await computeSyncReport(roots);
+  const doctor = buildSyncDoctorReport(report, cfg.gatewayBaseUrl, Date.now(), roots);
   if (hasFlag("json")) log(JSON.stringify(doctor, null, 2));
   else log(formatSyncDoctorText(doctor));
   if (!doctor.ok) process.exitCode = 1;
@@ -637,7 +707,12 @@ async function cmdRetry(): Promise<void> {
     return;
   }
   const cfg = await ensureConfig();
-  const report = await computeSyncReport();
+  // Stamp-first roots: the blocked set must be computed over what the DAEMON
+  // watches, not this shell's env (a container daemon inherits shell env the
+  // cron/ssh shell running retry may lack — self-resolution would early-exit
+  // "no blocked sessions" and never release the daemon's holds).
+  const { roots: retryRoots } = await effectiveRootsForCli(await readSettings());
+  const report = await computeSyncReport(retryRoots);
   if (report.skipped.length === 0) {
     log("No blocked sessions to retry.");
     return;

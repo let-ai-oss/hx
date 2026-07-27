@@ -1,5 +1,7 @@
 import type { SyncReport, SyncSkippedEntry } from "./watch.js";
 import type { FileSkipReason, SyncBlockerDestination } from "./state.js";
+import type { ResolvedRoots, RootOrigin } from "./roots.js";
+import { collapseHome } from "./settings.js";
 
 export interface DoctorSession {
   family: string;
@@ -24,6 +26,13 @@ export interface DoctorBlocker {
   remediation: DoctorRemediation;
 }
 
+export interface DoctorRoot {
+  family: "claude" | "codex";
+  configDir: string;
+  origin: RootOrigin;
+  exists: boolean;
+}
+
 export interface SyncDoctorReport {
   ok: boolean;
   generatedAt: string;
@@ -40,6 +49,11 @@ export interface SyncDoctorReport {
     outsideScanWindow: number;
   };
   blockers: DoctorBlocker[];
+  /** The data roots the report was computed over (empty on legacy callers). */
+  roots: DoctorRoot[];
+  /** Partially-synced sessions under no current root (a removed data root) —
+   *  informational, not an error: nothing will pick them up as configured. */
+  unwatchedSessions: number;
 }
 
 interface MutableBlocker {
@@ -143,6 +157,7 @@ export function buildSyncDoctorReport(
   report: SyncReport,
   gatewayBaseUrl: string,
   nowMs = Date.now(),
+  roots: ResolvedRoots | null = null,
 ): SyncDoctorReport {
   const groups = groupSyncBlockers(report.skipped);
   const blockedSessionKeys = new Set(
@@ -190,6 +205,13 @@ export function buildSyncDoctorReport(
       outsideScanWindow: aged.size,
     },
     blockers,
+    roots: roots
+      ? [
+          ...roots.claude.map((r): DoctorRoot => ({ family: "claude", configDir: r.configDir, origin: r.origin, exists: r.exists })),
+          ...roots.codex.map((r): DoctorRoot => ({ family: "codex", configDir: r.configDir, origin: r.origin, exists: r.exists })),
+        ]
+      : [],
+    unwatchedSessions: report.unwatched,
   };
 }
 
@@ -227,6 +249,16 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     "HX sync doctor",
     `Sync: ${report.sync.percent}% — ${report.sync.done} / ${report.sync.total} sessions`,
   ];
+  if (report.roots.length > 0) {
+    lines.push(
+      `Watching: ${report.roots
+        .map(
+          (r) =>
+            `${collapseHome(r.configDir)}${r.origin === "default" ? "" : ` [${r.origin}]`}${r.exists ? "" : " (missing)"}`,
+        )
+        .join(" · ")}`,
+    );
+  }
   if (report.blockedSessions === 0) {
     lines.push("Blocked: none");
   } else {
@@ -260,6 +292,12 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     lines.push("");
     lines.push(
       `Sync gaps: ${report.gaps.sessions} session${report.gaps.sessions === 1 ? "" : "s"} (${report.gaps.localFileDeleted} deleted locally, ${report.gaps.outsideScanWindow} outside the scan window)`,
+    );
+  }
+  if (report.unwatchedSessions > 0) {
+    lines.push("");
+    lines.push(
+      `Unwatched: ${report.unwatchedSessions} partially-synced session${report.unwatchedSessions === 1 ? "" : "s"} under locations no longer watched (removed data root)`,
     );
   }
   if (report.ok) lines.push("Result: healthy — 100% uploaded");

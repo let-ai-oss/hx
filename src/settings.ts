@@ -16,11 +16,23 @@
 //   • excludedFolders / excludeRules — never upload matching folders. Rules
 //                  are ~-collapsed path prefixes and also cover folders that
 //                  don't exist yet.
+//   • dataDirs   — extra data-dir ROOTS to watch besides ~/.claude / ~/.codex
+//                  (the CLAUDE_CONFIG_DIR / CODEX_HOME value itself, never the
+//                  projects/ or sessions/ subdir). Entries may not exist yet —
+//                  like excludeRules, they arm for when the dir appears.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { HX_DIR } from "./hx-home.js";
+import { normalizeDataDir } from "./pathnorm.js";
+import {
+  DEFAULT_CLAUDE_ROOT,
+  DEFAULT_CODEX_ROOT,
+  samePhysicalDir,
+} from "./roots.js";
+
+export { normalizeDataDir } from "./pathnorm.js";
 
 export const SETTINGS_PATH = join(HX_DIR, "settings.json");
 
@@ -30,12 +42,19 @@ export interface ExcludedFolder {
   cwd: string;
 }
 
+/** Extra watch roots per family, normalized absolute paths. */
+export interface DataDirs {
+  claude: string[];
+  codex: string[];
+}
+
 export interface HxSettings {
   /** null = not paused; untilMs null = paused until manually resumed. */
   pause: { untilMs: number | null } | null;
   personalSync: boolean;
   excludedFolders: ExcludedFolder[];
   excludeRules: string[];
+  dataDirs: DataDirs;
 }
 
 export const DEFAULT_SETTINGS: HxSettings = {
@@ -43,7 +62,71 @@ export const DEFAULT_SETTINGS: HxSettings = {
   personalSync: true,
   excludedFolders: [],
   excludeRules: [],
+  dataDirs: { claude: [], codex: [] },
 };
+
+/** Hard cap per family — bounds the discovery fan-out a config can demand. */
+export const MAX_DATA_DIRS_PER_FAMILY = 8;
+
+function parseDataDirList(v: unknown, defaultRoot: string): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item !== "string") continue;
+    const dir = normalizeDataDir(item);
+    if (!dir || out.includes(dir)) continue;
+    // Self-heal PHYSICAL aliases — of the family default, or of an entry
+    // already kept from this list (same dir via a symlinked spelling, or a
+    // dir that BECAME a symlink after it was added). The resolver would
+    // dedupe them at watch time anyway, but a lingering alias renders no
+    // Remove row (ghost), eats one of the 8 slots, and — for default
+    // aliases — used to trip full-array re-validation on every later
+    // mutation. Dropped on read AND persisted-dropped on the next write;
+    // first spelling wins.
+    if (samePhysicalDir(dir, defaultRoot)) continue;
+    if (out.some((kept) => samePhysicalDir(kept, dir))) continue;
+    out.push(dir);
+    if (out.length >= MAX_DATA_DIRS_PER_FAMILY) break;
+  }
+  return out;
+}
+
+/** Parse + normalize a dataDirs value from disk or a settings patch. */
+export function parseDataDirs(v: unknown): DataDirs {
+  const o = (v && typeof v === "object" && !Array.isArray(v) ? v : {}) as Record<string, unknown>;
+  return {
+    claude: parseDataDirList(o.claude, DEFAULT_CLAUDE_ROOT),
+    codex: parseDataDirList(o.codex, DEFAULT_CODEX_ROOT),
+  };
+}
+
+/**
+ * Strict validation for a dataDirs PATCH from the UI server. Where the disk
+ * parser silently drops garbage (a hand-edited file shouldn't brick the
+ * daemon), an API write must reject it loudly. Returns an error message, or
+ * null when the value is acceptable.
+ */
+export function dataDirsPatchError(v: unknown): string | null {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return "dataDirs must be an object";
+  for (const key of Object.keys(v)) {
+    if (key !== "claude" && key !== "codex") return `unknown dataDirs family: ${key}`;
+  }
+  for (const family of ["claude", "codex"] as const) {
+    const list = (v as Record<string, unknown>)[family];
+    if (list === undefined) continue;
+    if (!Array.isArray(list)) return `dataDirs.${family} must be an array`;
+    if (list.length > MAX_DATA_DIRS_PER_FAMILY) {
+      return `dataDirs.${family}: at most ${MAX_DATA_DIRS_PER_FAMILY} locations`;
+    }
+    for (const item of list) {
+      if (typeof item !== "string") return `dataDirs.${family}: entries must be strings`;
+      if (!normalizeDataDir(item)) {
+        return `dataDirs.${family}: not an absolute (or ~-prefixed) path`;
+      }
+    }
+  }
+  return null;
+}
 
 export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSettings> {
   try {
@@ -66,19 +149,68 @@ export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSett
       excludeRules: Array.isArray(parsed.excludeRules)
         ? parsed.excludeRules.filter((r): r is string => typeof r === "string")
         : [],
+      dataDirs: parseDataDirs(parsed.dataDirs),
     };
   } catch {
-    return { ...DEFAULT_SETTINGS, excludedFolders: [], excludeRules: [] };
+    return {
+      ...DEFAULT_SETTINGS,
+      excludedFolders: [],
+      excludeRules: [],
+      dataDirs: { claude: [], codex: [] },
+    };
   }
 }
 
-export async function writeSettings(
+// Writes are read-merge-write; two concurrent PATCHes (the UI's async add
+// racing a fire-and-forget toggle, or two tabs) would silently drop one
+// caller's fields. Chain per path — the same single-writer discipline
+// state.json gets from schedulePersist — and give every write its own tmp
+// name so racing processes can't rename each other's half-written files.
+let writeSeq = 0;
+const writeChains = new Map<string, Promise<HxSettings>>();
+
+export function writeSettings(
   patch: Partial<HxSettings>,
   path: string = SETTINGS_PATH,
 ): Promise<HxSettings> {
+  const prev = writeChains.get(path) ?? Promise.resolve(null as unknown as HxSettings);
+  const next = prev.then(
+    () => applySettingsPatch(patch, path),
+    () => applySettingsPatch(patch, path),
+  );
+  writeChains.set(path, next);
+  return next;
+}
+
+async function applySettingsPatch(
+  patch: Partial<HxSettings>,
+  path: string,
+): Promise<HxSettings> {
   const current = await readSettings(path);
   const next: HxSettings = { ...current, ...patch };
-  const tmp = `${path}.tmp`;
+  // dataDirs merges PER FAMILY: the validator accepts a patch that names only
+  // one family, so an omitted family must mean "unchanged" — a whole-object
+  // replace would silently erase the other family's roots on a 200. Also
+  // normalize on write as well as read, so a patch that arrived un-normalized
+  // (older UI, hand-edited file) never persists a non-canonical root.
+  const patchDirs = (patch as { dataDirs?: unknown }).dataDirs;
+  if (patchDirs !== undefined && patchDirs !== null && typeof patchDirs === "object" && !Array.isArray(patchDirs)) {
+    const pd = patchDirs as Record<string, unknown>;
+    // Non-array per-family values (a direct caller's garbage — the API
+    // validator 400s them first) also mean "unchanged", same as omission:
+    // parseDataDirList would turn them into a silent one-family wipe.
+    next.dataDirs = parseDataDirs({
+      claude: Array.isArray(pd.claude) ? pd.claude : current.dataDirs.claude,
+      codex: Array.isArray(pd.codex) ? pd.codex : current.dataDirs.codex,
+    });
+  } else {
+    // No dataDirs in the patch — or garbage (null/array) a direct caller
+    // slipped past the API validator. Either way: keep the current roots;
+    // parse re-normalizes legacy on-disk values, never wipes.
+    next.dataDirs = parseDataDirs(current.dataDirs);
+  }
+  writeSeq += 1;
+  const tmp = `${path}.${process.pid}.${writeSeq}.tmp`;
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- see readSettings.
   await writeFile(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
   await rename(tmp, path);

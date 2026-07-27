@@ -4,13 +4,18 @@ import {
   SessionUpstreamUnavailable,
   buildChildParentIndex,
   classifyUpstreamError,
+  collectBehind,
   collectSkipped,
+  contestedChildLanes,
+  electChildUploaders,
+  planChildLaneResets,
   reconcileChildParent,
   snapshotFrom,
 } from "./watch.js";
 import { HxHttpError } from "./uploader.js";
 import type { FileState, HxState } from "./state.js";
-import type { DiscoveredFile } from "./sources.js";
+import type { DiscoveredChildFile, DiscoveredFile } from "./sources.js";
+import type { DataRoot } from "./roots.js";
 
 const vaultOffline = () =>
   new HxHttpError(503, 'append-url failed: 503 {"error":"vault_offline"}', {
@@ -88,6 +93,7 @@ describe("collectSkipped", () => {
     size: 10,
     mtimeMs: 1,
     source: "claude",
+    rootDir: "/home/u/.claude",
   });
   const fileState = (path: string, over: Partial<FileState>): FileState => ({
     path,
@@ -145,9 +151,166 @@ describe("collectSkipped", () => {
   });
 });
 
+describe("electChildUploaders", () => {
+  const child = (over: Partial<DiscoveredChildFile>): DiscoveredChildFile => ({
+    path: "/r/a/projects/-p/sid/subagents/agent-a1.jsonl",
+    size: 10,
+    mtimeMs: 100,
+    parentSessionId: "sid",
+    agentId: "a1",
+    runId: null,
+    metaPath: null,
+    rootDir: "/r/a",
+    ...over,
+  });
+
+  it("elects the newest-mtime twin per child identity and shadows the rest", () => {
+    const stale = child({ path: "/r/old/projects/-p/sid/subagents/agent-a1.jsonl", mtimeMs: 50, rootDir: "/r/old" });
+    const live = child({ mtimeMs: 200 });
+    const elected = electChildUploaders([stale, live]);
+    assert.deepEqual(elected.map((c) => c.path), [live.path]);
+  });
+
+  it("keys on parent + agent + run — distinct lanes never shadow each other", () => {
+    const a = child({});
+    const b = child({ path: "/r/a/x/agent-a2.jsonl", agentId: "a2" });
+    const wf = child({ path: "/r/a/x/wf/agent-a1.jsonl", runId: "wf_1" });
+    const otherParent = child({ path: "/r/a/y/agent-a1.jsonl", parentSessionId: "sid2" });
+    assert.equal(electChildUploaders([a, b, wf, otherParent]).length, 4);
+  });
+
+  it("breaks mtime ties by size (largest wins)", () => {
+    const small = child({ path: "/p/small.jsonl", size: 5 });
+    const big = child({ path: "/p/big.jsonl", size: 50 });
+    assert.deepEqual(electChildUploaders([small, big]).map((c) => c.path), [big.path]);
+  });
+
+  it("full ties (cp -a twins: equal mtime AND size) resolve deterministically by path", () => {
+    const a = child({ path: "/r/a/agent-a1.jsonl" });
+    const b = child({ path: "/r/b/agent-a1.jsonl" });
+    // Same winner regardless of discovery order — a readdir-order flip must
+    // not swap uploaders (each swap would cost a replace-from-zero).
+    assert.deepEqual(electChildUploaders([a, b]).map((c) => c.path), ["/r/a/agent-a1.jsonl"]);
+    assert.deepEqual(electChildUploaders([b, a]).map((c) => c.path), ["/r/a/agent-a1.jsonl"]);
+  });
+});
+
+describe("planChildLaneResets", () => {
+  const child = (p: string, over: Partial<DiscoveredChildFile> = {}): DiscoveredChildFile => ({
+    path: p,
+    size: 10,
+    mtimeMs: 100,
+    parentSessionId: "sid",
+    agentId: "a1",
+    runId: null,
+    metaPath: null,
+    rootDir: "/r/a",
+    ...over,
+  });
+
+  it("first sighting of a lane records the winner without a reset", () => {
+    const plan = planChildLaneResets([child("/r/a/agent-a1.jsonl")], {});
+    assert.deepEqual(plan.resetPaths, []);
+    assert.equal(plan.changed, true);
+    assert.deepEqual(plan.nextMap, { "sid:a1:": "/r/a/agent-a1.jsonl" });
+  });
+
+  it("a flipped winner is reset; a stable one is untouched", () => {
+    const prev = { "sid:a1:": "/r/a/agent-a1.jsonl", "sid:a2:": "/r/a/agent-a2.jsonl" };
+    const plan = planChildLaneResets(
+      [child("/r/copy/agent-a1.jsonl"), child("/r/a/agent-a2.jsonl", { agentId: "a2" })],
+      prev,
+    );
+    assert.deepEqual(plan.resetPaths, ["/r/copy/agent-a1.jsonl"]);
+    assert.equal(plan.nextMap["sid:a1:"], "/r/copy/agent-a1.jsonl");
+    assert.equal(plan.nextMap["sid:a2:"], "/r/a/agent-a2.jsonl");
+  });
+
+  it("no changes → changed:false, map preserved by reference semantics", () => {
+    const prev = { "sid:a1:": "/r/a/agent-a1.jsonl" };
+    const plan = planChildLaneResets([child("/r/a/agent-a1.jsonl")], prev);
+    assert.equal(plan.changed, false);
+    assert.deepEqual(plan.resetPaths, []);
+  });
+
+  it("CONTESTED first sighting resets — the upgrade heal for pre-map twins", () => {
+    // Two candidates, no memory: both may carry offsets from the old
+    // both-upload world; the winner must replace-from-zero exactly once.
+    const live = child("/r/copy/agent-a1.jsonl", { mtimeMs: 200 });
+    const contested = contestedChildLanes([child("/r/a/agent-a1.jsonl"), live]);
+    const plan = planChildLaneResets([live], {}, contested);
+    assert.deepEqual(plan.resetPaths, [live.path]);
+    // …and once latched, the same winner never resets again.
+    const next = planChildLaneResets([live], plan.nextMap, contested);
+    assert.deepEqual(next.resetPaths, []);
+    assert.equal(next.changed, false);
+  });
+});
+
+describe("collectBehind", () => {
+  const roots: DataRoot[] = [{ configDir: "/r/a", origin: "settings", exists: true }];
+  const entry = (p: string, sid: string): FileState => ({
+    path: p,
+    family: "claude-cli",
+    sessionId: sid,
+    offsets: { letai: 5 },
+    lastMtimeMs: 1,
+    lastUploadAtMs: 1,
+    lastKnownSize: 10,
+  });
+
+  it("splits never-finished entries into behind (under a root) vs unwatched", () => {
+    const st: HxState = {
+      files: {
+        "/r/a/projects/-p/s1.jsonl": entry("/r/a/projects/-p/s1.jsonl", "s1"),
+        "/r/removed/projects/-p/s2.jsonl": entry("/r/removed/projects/-p/s2.jsonl", "s2"),
+      },
+    };
+    const { behind, unwatched } = collectBehind(st, new Set(), new Set(), roots);
+    assert.deepEqual(behind.map((b) => b.sessionId), ["s1"]);
+    assert.equal(unwatched, 1);
+  });
+
+  it("counts unwatched as DISTINCT sessions, and never double-bills a behind session", () => {
+    const st: HxState = {
+      files: {
+        // Two entries, one session, both under a removed root → 1, not 2.
+        "/r/removed/projects/-p/s5.jsonl": entry("/r/removed/projects/-p/s5.jsonl", "s5"),
+        "/r/removed/projects/-q/s5-twin.jsonl": entry("/r/removed/projects/-q/s5-twin.jsonl", "s5"),
+        // Session with a behind entry under a watched root AND an unwatched
+        // twin → behind row only.
+        "/r/a/projects/-p/s6.jsonl": entry("/r/a/projects/-p/s6.jsonl", "s6"),
+        "/r/removed/projects/-p/s6-twin.jsonl": entry("/r/removed/projects/-p/s6-twin.jsonl", "s6"),
+      },
+    };
+    const { behind, unwatched } = collectBehind(st, new Set(), new Set(), roots);
+    assert.deepEqual(behind.map((b) => b.sessionId), ["s6"]);
+    assert.equal(unwatched, 1);
+  });
+
+  it("skips discovered files, shadowed twins, finished and legacy entries", () => {
+    const st: HxState = {
+      files: {
+        "/r/a/discovered.jsonl": entry("/r/a/discovered.jsonl", "s1"),
+        "/r/a/twin.jsonl": entry("/r/a/twin.jsonl", "s2"),
+        "/r/a/done.jsonl": { ...entry("/r/a/done.jsonl", "s3"), offsets: { letai: 10 } },
+        "/r/a/legacy.jsonl": { ...entry("/r/a/legacy.jsonl", "s4"), lastKnownSize: undefined },
+      },
+    };
+    const { behind, unwatched } = collectBehind(
+      st,
+      new Set(["/r/a/discovered.jsonl"]),
+      new Set(["claude-cli:s2"]),
+      roots,
+    );
+    assert.deepEqual(behind, []);
+    assert.equal(unwatched, 0);
+  });
+});
+
 describe("snapshotFrom", () => {
   it("never counts a blocked session as done even when legacy offsets equal its size", () => {
-    const file: DiscoveredFile = { path: "/a", size: 10, mtimeMs: 1, source: "claude" };
+    const file: DiscoveredFile = { path: "/a", size: 10, mtimeMs: 1, source: "claude", rootDir: "/home/u/.claude" };
     const st: HxState = {
       files: {
         "/a": {

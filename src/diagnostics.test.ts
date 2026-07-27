@@ -10,6 +10,7 @@ import type { SyncReport } from "./watch.js";
 const blockedReport = (): SyncReport => ({
   snapshot: { total: 777, done: 775, totalBytes: 10 },
   behind: [],
+  unwatched: 0,
   skipped: ["s1", "s2"].map((sessionId, index) => ({
     path: `/private/${sessionId}.jsonl`,
     family: "claude-cli",
@@ -79,7 +80,7 @@ describe("sync diagnostics", () => {
 
   it("reports a fully caught-up client as healthy", () => {
     const out = buildSyncDoctorReport(
-      { snapshot: { total: 12, done: 12, totalBytes: 50 }, behind: [], skipped: [] },
+      { snapshot: { total: 12, done: 12, totalBytes: 50 }, behind: [], skipped: [], unwatched: 0 },
       "https://beta.let.ai/_api/hx-gateway",
       0,
     );
