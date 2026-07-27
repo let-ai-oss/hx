@@ -7,6 +7,7 @@ import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import {
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
+  duplicateOfDefaultError,
   isUnderRoots,
   resolveDataRoots,
   rootsSignature,
@@ -115,6 +116,21 @@ describe("isUnderRoots", () => {
     assert.equal(isUnderRoots("/data/hx-a/projects/x/s.jsonl", roots), true);
     assert.equal(isUnderRoots("/data/hx-ab/projects/x/s.jsonl", roots), false);
     assert.equal(isUnderRoots("/elsewhere", roots), false);
+  });
+
+  it("handles the filesystem root without doubling the separator", () => {
+    const slash: DataRoot[] = [{ configDir: "/", origin: "settings", exists: true }];
+    assert.equal(isUnderRoots("/", slash), true);
+    assert.equal(isUnderRoots("/anything/at/all.jsonl", slash), true);
+  });
+});
+
+describe("duplicateOfDefaultError", () => {
+  it("rejects the family default (any spelling) and passes real extras", () => {
+    assert.match(duplicateOfDefaultError({ claude: [DEFAULT_CLAUDE_ROOT] }) ?? "", /already watched/);
+    assert.match(duplicateOfDefaultError({ codex: [`${DEFAULT_CODEX_ROOT}/`] }) ?? "", /already watched/);
+    assert.equal(duplicateOfDefaultError({ claude: ["/data/elsewhere"], codex: [] }), null);
+    assert.equal(duplicateOfDefaultError({}), null);
   });
 });
 

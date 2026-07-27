@@ -109,9 +109,40 @@ export function samePhysicalDir(a: string, b: string): boolean {
 /** True when `p` is (or sits under) one of the roots' config dirs. */
 export function isUnderRoots(p: string, roots: DataRoot[]): boolean {
   for (const r of roots) {
-    if (p === r.configDir || p.startsWith(r.configDir + path.sep)) return true;
+    // A root that already ends with the separator (the filesystem root "/")
+    // must not double it — "//" matches no real path.
+    const base = r.configDir.endsWith(path.sep) ? r.configDir : r.configDir + path.sep;
+    if (p === r.configDir || p.startsWith(base)) return true;
   }
   return false;
+}
+
+/**
+ * Reject dataDirs entries that are just the family default in disguise (same
+ * string or a symlinked spelling). The resolver would dedupe them into the
+ * default-origin entry anyway, leaving a ghost settings row that renders no
+ * Remove button, looks like a no-op add, and permanently eats one of the 8
+ * slots. Returns an error message, or null when clean.
+ */
+export function duplicateOfDefaultError(v: {
+  claude?: unknown;
+  codex?: unknown;
+}): string | null {
+  const check = (list: unknown, def: string, label: string): string | null => {
+    if (!Array.isArray(list)) return null;
+    for (const item of list) {
+      if (typeof item !== "string") continue;
+      const dir = normalizeDataDir(item);
+      if (dir && samePhysicalDir(dir, def)) {
+        return `${label}: that location is already watched by default`;
+      }
+    }
+    return null;
+  };
+  return (
+    check(v.claude, DEFAULT_CLAUDE_ROOT, "dataDirs.claude") ??
+    check(v.codex, DEFAULT_CODEX_ROOT, "dataDirs.codex")
+  );
 }
 
 /** Identity of a resolved set — drives the daemon's stamp-on-change. */

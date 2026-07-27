@@ -6,6 +6,7 @@ import {
   classifyUpstreamError,
   collectBehind,
   collectSkipped,
+  contestedChildLanes,
   electChildUploaders,
   planChildLaneResets,
   reconcileChildParent,
@@ -230,6 +231,19 @@ describe("planChildLaneResets", () => {
     const plan = planChildLaneResets([child("/r/a/agent-a1.jsonl")], prev);
     assert.equal(plan.changed, false);
     assert.deepEqual(plan.resetPaths, []);
+  });
+
+  it("CONTESTED first sighting resets — the upgrade heal for pre-map twins", () => {
+    // Two candidates, no memory: both may carry offsets from the old
+    // both-upload world; the winner must replace-from-zero exactly once.
+    const live = child("/r/copy/agent-a1.jsonl", { mtimeMs: 200 });
+    const contested = contestedChildLanes([child("/r/a/agent-a1.jsonl"), live]);
+    const plan = planChildLaneResets([live], {}, contested);
+    assert.deepEqual(plan.resetPaths, [live.path]);
+    // …and once latched, the same winner never resets again.
+    const next = planChildLaneResets([live], plan.nextMap, contested);
+    assert.deepEqual(next.resetPaths, []);
+    assert.equal(next.changed, false);
   });
 });
 

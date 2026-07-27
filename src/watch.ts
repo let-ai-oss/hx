@@ -1249,12 +1249,18 @@ function electUploaders(
  * interleave two files' bytes, and child lanes have no offsets audit to heal
  * that. The plan: remember each lane's winner; on a flip, zero the new
  * winner's offsets so its next upload is a clean replace-from-zero (children
- * are small — one re-upload per flip is the whole cost). First sighting of a
- * lane is NOT a flip: existing offsets belong to that same path.
+ * are small — one re-upload per flip is the whole cost). An UNCONTESTED first
+ * sighting is not a flip: existing offsets belong to that same path. A
+ * CONTESTED first sighting (≥2 candidates, no memory of a winner) resets too:
+ * that's the upgrade path for machines whose twins predate the map — both
+ * files hold offsets from the old both-upload world, the canonical is already
+ * an interleaving, and this one replace-from-zero is the only heal child
+ * lanes will ever get (they have no offsets audit).
  */
 export function planChildLaneResets(
   elected: DiscoveredChildFile[],
   prev: Record<string, string>,
+  contestedLanes: ReadonlySet<string> = new Set(),
 ): { nextMap: Record<string, string>; resetPaths: string[]; changed: boolean } {
   const nextMap = { ...prev };
   const resetPaths: string[] = [];
@@ -1263,11 +1269,21 @@ export function planChildLaneResets(
     const lane = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
     const before = nextMap[lane];
     if (before === c.path) continue;
-    if (before !== undefined) resetPaths.push(c.path);
+    if (before !== undefined || contestedLanes.has(lane)) resetPaths.push(c.path);
     nextMap[lane] = c.path;
     changed = true;
   }
   return { nextMap, resetPaths, changed };
+}
+
+/** Lanes with more than one discovered candidate this tick. */
+export function contestedChildLanes(children: DiscoveredChildFile[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const c of children) {
+    const lane = `${c.parentSessionId}:${c.agentId}:${c.runId ?? ""}`;
+    counts.set(lane, (counts.get(lane) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([lane]) => lane));
 }
 
 export function electChildUploaders(
@@ -1612,13 +1628,25 @@ export async function tickOnce(
     try {
       const { children, runs } = await discoverClaudeChildren(roots.claude);
       const electedChildren = electChildUploaders(children, log);
-      const lanePlan = planChildLaneResets(electedChildren, state.childUploaders ?? {});
+      const lanePlan = planChildLaneResets(
+        electedChildren,
+        state.childUploaders ?? {},
+        contestedChildLanes(children),
+      );
       if (lanePlan.changed) {
         for (const p of lanePlan.resetPaths) {
           const fs = state.files[p];
-          if (fs && Object.keys(fs.offsets).length > 0) {
-            fs.offsets = {};
-            log(`[hx] child lane uploader switched — re-uploading ${path.basename(p)} from zero`);
+          if (fs) {
+            if (Object.keys(fs.offsets).length > 0) {
+              fs.offsets = {};
+              log(`[hx] child lane uploader switched — re-uploading ${path.basename(p)} from zero`);
+            }
+            // A takeover starts clean: inherited backoff belonged to the
+            // lane's previous stint and would bench the live file for up to
+            // 30 minutes (same rationale as reconcileChildParent's repair).
+            delete fs.consecutiveFailures;
+            delete fs.nextAttemptAtMs;
+            delete fs.skipReason;
           }
         }
         state.childUploaders = lanePlan.nextMap;

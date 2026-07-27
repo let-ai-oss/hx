@@ -18,7 +18,15 @@ import { assertSecureFetchUrl } from "../net.js";
 import { readActivity, type ActivityEntry } from "../activity.js";
 import { readOrgNames } from "../org-names.js";
 import { discoverAll, readHead, type DiscoveredFile, type HeadMeta } from "../sources.js";
-import { resolveDataRoots, samePhysicalDir, type DataRoot, type ResolvedRoots, type RootOrigin } from "../roots.js";
+import {
+  DEFAULT_CLAUDE_ROOT,
+  DEFAULT_CODEX_ROOT,
+  resolveDataRoots,
+  samePhysicalDir,
+  type DataRoot,
+  type ResolvedRoots,
+  type RootOrigin,
+} from "../roots.js";
 import { readSettings } from "../settings.js";
 import { extractTitleFallback, readHeadLines } from "./preview.js";
 import { isDeletedSession, loadState, minOffset, resetStateCache, type FileState } from "../state.js";
@@ -391,6 +399,12 @@ export function detectShellRoots(
     const env = selfResolved[family].find((r) => r.origin === "env");
     if (!env) continue; // no env var, or it deduped into an already-known root
     if (effective[family].some((r) => samePhysicalDir(r.configDir, env.configDir))) continue;
+    // Never one-click-suggest a root that CONTAINS the family default (e.g.
+    // CLAUDE_CONFIG_DIR=$HOME): legal for the tool, but adding it would sweep
+    // <root>/projects — for $HOME that's ~/projects — into the upload surface
+    // on a single click. A deliberate manual add remains possible.
+    const def = family === "claude" ? DEFAULT_CLAUDE_ROOT : DEFAULT_CODEX_ROOT;
+    if (def === env.configDir || def.startsWith(env.configDir + path.sep)) continue;
     out[family] = env.configDir;
   }
   return out;

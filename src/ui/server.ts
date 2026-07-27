@@ -22,6 +22,7 @@ import { instanceIdentity } from "./instance.js";
 import type { SessionVM, UiSnapshot, LogLevel } from "./data.js";
 import type { PreviewLine } from "./preview.js";
 import { dataDirsPatchError } from "../settings.js";
+import { duplicateOfDefaultError } from "../roots.js";
 
 /** Read-only data the API serves; injected so the handler tests with fakes. */
 export interface UiProviders {
@@ -232,7 +233,9 @@ async function handleApi(req: Request, path: string, ctx: UiServerCtx): Promise<
         // garbage, but an API write should fail loudly instead of appearing
         // to accept a location it actually threw away.
         if ("dataDirs" in patch) {
-          const err = dataDirsPatchError(patch.dataDirs);
+          const err =
+            dataDirsPatchError(patch.dataDirs) ??
+            duplicateOfDefaultError(patch.dataDirs as { claude?: unknown; codex?: unknown });
           if (err) return apiError(400, err);
         }
         return json(await ctx.actions.writeSettings(patch));

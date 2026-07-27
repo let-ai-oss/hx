@@ -412,6 +412,19 @@ async function cmdTick(): Promise<void> {
   const cfg = await ensureConfig();
   const localCfg = hasFlag("local") ? await ensureLocalConfig() : null;
   const only = flag("only");
+  // A one-shot tick beside the running service is two writers on one state
+  // file — and with per-process env honor their root sets (and elections)
+  // can systematically diverge. Warn instead of refusing: power users tick
+  // deliberately, but they should know the daemon will fight back.
+  {
+    const ops = getDaemonOps();
+    const ds = ops.managerName !== "none" ? await ops.state().catch(() => null) : null;
+    if (ds?.pid) {
+      log(
+        "[hx] warning: the background service is running — a one-shot tick shares its upload state and can fight its elections. Prefer letting the service sync, or `hx stop` first.",
+      );
+    }
+  }
   const r = await tickOnce(cfg, { only, oneShot: true }, log);
   log(`done. uploaded=${r.uploaded} failed=${r.failed}`);
   if (localCfg) {

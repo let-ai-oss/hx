@@ -11,6 +11,7 @@ import {
   type UiAuth,
 } from "./auth.js";
 import { createEventHub, handleUiRequest, type UiServerCtx } from "./server.js";
+import { DEFAULT_CLAUDE_ROOT } from "../roots.js";
 import type { UiAssets } from "./assets.js";
 
 const PORT = 8000;
@@ -261,6 +262,7 @@ describe("handleUiRequest — auth flow", () => {
       { dataDirs: { claude: ["relative/path"] } },
       { dataDirs: { claude: [42] } },
       { dataDirs: { claude: Array.from({ length: 9 }, (_, i) => `/x/${i}`) } },
+      { dataDirs: { claude: [DEFAULT_CLAUDE_ROOT] } }, // already watched by default
     ]) {
       const res = await handleUiRequest(
         req("/api/settings", { method: "POST", token: t, body: bad }),

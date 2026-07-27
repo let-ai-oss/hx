@@ -29,6 +29,19 @@ describe("settings file", () => {
     assert.deepEqual(s.pause, { untilMs: 123 });
   });
 
+  it("serializes concurrent writers — no lost updates, no shared tmp", async () => {
+    const p = tmpPath();
+    await Promise.all([
+      writeSettings({ personalSync: false }, p),
+      writeSettings({ excludeRules: ["~/kept"] }, p),
+      writeSettings({ dataDirs: { claude: ["/data/kept"], codex: [] } }, p),
+    ]);
+    const s = await readSettings(p);
+    assert.equal(s.personalSync, false);
+    assert.deepEqual(s.excludeRules, ["~/kept"]);
+    assert.deepEqual(s.dataDirs.claude, ["/data/kept"]);
+  });
+
   it("sanitizes malformed fields instead of trusting them", async () => {
     const p = tmpPath();
     await writeSettings(
@@ -60,6 +73,11 @@ describe("normalizeDataDir", () => {
     assert.equal(normalizeDataDir("/Users/John Doe/claude-data"), "/Users/John Doe/claude-data");
     assert.equal(normalizeDataDir("/a\0b"), null);
     assert.equal(normalizeDataDir("/a\nb"), null);
+  });
+
+  it("keeps trailing backslashes on POSIX — a legal filename character there", () => {
+    if (process.platform === "win32") return;
+    assert.equal(normalizeDataDir("/data/foo\\"), "/data/foo\\");
   });
 });
 

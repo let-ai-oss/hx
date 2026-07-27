@@ -77,7 +77,14 @@ export function normalizeDataDir(raw: string): string | null {
   if (!isAbsolute(p)) return null;
   p = normalize(p);
   // normalize() preserves a trailing separator — strip it (never the root).
-  while (p.length > 1 && (p.endsWith("/") || p.endsWith("\\"))) p = p.slice(0, -1);
+  // Platform-aware: `\` is a legal filename character on POSIX, so stripping
+  // it there would silently watch the wrong directory.
+  while (
+    p.length > 1 &&
+    (p.endsWith("/") || (process.platform === "win32" && p.endsWith("\\")))
+  ) {
+    p = p.slice(0, -1);
+  }
   return p;
 }
 
@@ -161,9 +168,30 @@ export async function readSettings(path: string = SETTINGS_PATH): Promise<HxSett
   }
 }
 
-export async function writeSettings(
+// Writes are read-merge-write; two concurrent PATCHes (the UI's async add
+// racing a fire-and-forget toggle, or two tabs) would silently drop one
+// caller's fields. Chain per path — the same single-writer discipline
+// state.json gets from schedulePersist — and give every write its own tmp
+// name so racing processes can't rename each other's half-written files.
+let writeSeq = 0;
+const writeChains = new Map<string, Promise<HxSettings>>();
+
+export function writeSettings(
   patch: Partial<HxSettings>,
   path: string = SETTINGS_PATH,
+): Promise<HxSettings> {
+  const prev = writeChains.get(path) ?? Promise.resolve(null as unknown as HxSettings);
+  const next = prev.then(
+    () => applySettingsPatch(patch, path),
+    () => applySettingsPatch(patch, path),
+  );
+  writeChains.set(path, next);
+  return next;
+}
+
+async function applySettingsPatch(
+  patch: Partial<HxSettings>,
+  path: string,
 ): Promise<HxSettings> {
   const current = await readSettings(path);
   const next: HxSettings = { ...current, ...patch };
@@ -188,7 +216,8 @@ export async function writeSettings(
     // parse re-normalizes legacy on-disk values, never wipes.
     next.dataDirs = parseDataDirs(current.dataDirs);
   }
-  const tmp = `${path}.tmp`;
+  writeSeq += 1;
+  const tmp = `${path}.${process.pid}.${writeSeq}.tmp`;
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- see readSettings.
   await writeFile(tmp, JSON.stringify(next, null, 2), { mode: 0o600 });
   await rename(tmp, path);

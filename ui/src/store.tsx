@@ -100,9 +100,12 @@ interface AppState {
   dataRoots: DataRootInfo[];
   dataRootsFrom: "daemon" | "local";
   shellDetected: { claude?: string; codex?: string };
-  /** Resolves to null on success, or the server's error text to show inline. */
+  /** Resolve to null on success, or error text to show inline. Both refetch
+   *  settings first so the mutation never rides a stale (or never-loaded)
+   *  baseline — a null-settings baseline would PATCH empty arrays over every
+   *  configured root. */
   addDataDir: (family: "claude" | "codex", dir: string) => Promise<string | null>;
-  removeDataDir: (family: "claude" | "codex", dir: string) => void;
+  removeDataDir: (family: "claude" | "codex", dir: string) => Promise<string | null>;
   daemonAct: (action: "start" | "stop" | "restart") => Promise<string>;
   retryBlockedAct: () => Promise<string>;
   disconnectAct: () => Promise<void>;
@@ -390,26 +393,40 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const removeRule = (v: string) => {
     patch({ excludeRules: (settings?.excludeRules ?? []).filter((r) => r !== v) });
   };
-  // Watched-locations settings. The full dataDirs object is sent each time;
-  // the server validates strictly (400 + message) and the daemon adopts the
-  // new root within one tick. Unlike the generic patch(), add surfaces the
-  // server's rejection text so a refused location never LOOKS accepted.
-  const addDataDir = async (family: "claude" | "codex", dir: string): Promise<string | null> => {
-    const cur = settings?.dataDirs ?? { claude: [], codex: [] };
-    if (cur[family].includes(dir)) return null;
+  // Watched-locations settings. Both mutations re-GET settings first: the
+  // boot fetch is one-shot and PATCHes carry full per-family arrays, so a
+  // stale (or failed-to-load) baseline would silently erase other roots —
+  // fresh-read-then-write shrinks that window to milliseconds and makes the
+  // null-settings state safe. The server validates strictly (400 + message)
+  // and the daemon adopts changes within one tick. Errors are returned, not
+  // swallowed, so a refused location never LOOKS accepted.
+  const mutateDataDirs = async (
+    family: "claude" | "codex",
+    change: (cur: string[]) => string[],
+  ): Promise<string | null> => {
     try {
-      const s = await api.patchSettings({ dataDirs: { ...cur, [family]: [...cur[family], dir] } });
+      const fresh = await api.settings();
+      setSettings(fresh);
+      const cur = fresh.dataDirs ?? { claude: [], codex: [] };
+      const nextList = change(cur[family]);
+      if (
+        nextList.length === cur[family].length &&
+        nextList.every((d, i) => d === cur[family][i])
+      ) {
+        return null; // no-op (already present / already gone)
+      }
+      const s = await api.patchSettings({ dataDirs: { ...cur, [family]: nextList } });
       setSettings(s);
       setTimeout(() => refetchSnap.current(), 2_000);
       return null;
     } catch (err) {
-      return err instanceof Error && err.message ? err.message : "couldn't save this location";
+      return err instanceof Error && err.message ? err.message : "couldn't save this change";
     }
   };
-  const removeDataDir = (family: "claude" | "codex", dir: string) => {
-    const cur = settings?.dataDirs ?? { claude: [], codex: [] };
-    patch({ dataDirs: { ...cur, [family]: cur[family].filter((d) => d !== dir) } });
-  };
+  const addDataDir = (family: "claude" | "codex", dir: string) =>
+    mutateDataDirs(family, (cur) => (cur.includes(dir) ? cur : [...cur, dir]));
+  const removeDataDir = (family: "claude" | "codex", dir: string) =>
+    mutateDataDirs(family, (cur) => cur.filter((d) => d !== dir));
 
   const daemonAct = async (action: "start" | "stop" | "restart"): Promise<string> => {
     try {

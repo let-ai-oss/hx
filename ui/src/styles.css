@@ -476,6 +476,12 @@
   .rulerow .meta { color: var(--text-subtle); font-size: 13px; flex-shrink: 0; white-space: nowrap; }
   .rulerow .meta.trunc { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .rulerow button, .ruleadd button { flex-shrink: 0; }
+  /* Inline validation message row — same warn voice as the status pills. */
+  .rulerow .err { color: var(--warn); font-size: 13.5px; font-weight: 600; flex: 1; }
+  /* A rulerow as the box's LAST child (the error row) must not stack its
+     border on the box's own bottom edge. Boxes ending in .ruleadd are
+     unaffected — the last child there isn't a .rulerow. */
+  .rulebox > .rulerow:last-child { border-bottom: none; }
 
   .rowdiv { display: flex; align-items: center; gap: 12px; font-size: 13px; font-weight: 600; color: var(--text-subtle); padding: 14px 4px 4px; }
   .rowdiv::after { content: ""; flex: 1; height: 1px; background: var(--border); }

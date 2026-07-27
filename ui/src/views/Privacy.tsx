@@ -155,7 +155,12 @@ export function Privacy() {
                           {r.exists ? "" : " · not created yet"}
                         </span>
                         {r.origin === "settings" && (
-                          <button className="btn ghost sm" onClick={() => removeDataDir(key, r.configDir)}>Remove</button>
+                          <button
+                            className="btn ghost sm"
+                            onClick={() => void (async () => setDirErr(key, (await removeDataDir(key, r.configDir)) ?? ""))()}
+                          >
+                            Remove
+                          </button>
                         )}
                       </div>
                     ))}
@@ -180,7 +185,7 @@ export function Privacy() {
                       <button className="btn sm" disabled={!settings} onClick={() => void doAddDir(key)}>Add</button>
                     </div>
                     {dirErrs[key] && (
-                      <div className="rulerow"><span className="st warny">{dirErrs[key]}</span></div>
+                      <div className="rulerow"><span className="err">{dirErrs[key]}</span></div>
                     )}
                   </div>
                 </div>
