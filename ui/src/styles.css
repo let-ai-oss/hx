@@ -478,12 +478,13 @@
   .rulerow button, .ruleadd button { flex-shrink: 0; }
   /* Inline validation message row — same warn voice as the status pills. */
   .rulerow .err { color: var(--warn); font-size: 13.5px; font-weight: 600; flex: 1; }
-  /* Empty state inside a rulebox — a real block, not a fake row: centered
-     icon + one-line title + hint, so an empty list reads as calm, not broken. */
-  .rulebox .empty { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 26px 16px; text-align: center; }
-  .rulebox .empty .ico { color: var(--text-subtle); opacity: .75; display: flex; }
-  .rulebox .empty b { font-size: 14px; font-weight: 600; color: var(--text-muted); }
-  .rulebox .empty p { margin: 0; font-size: 13.5px; color: var(--text-subtle); max-width: 420px; }
+  /* Empty state inside a rulebox or rowlist — a real block, not a fake row:
+     centered icon + one-line title + hint, so an empty list reads as calm,
+     not broken. */
+  .rulebox .empty, .rowlist .empty { display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 26px 16px; text-align: center; }
+  .rulebox .empty .ico, .rowlist .empty .ico { color: var(--text-subtle); opacity: .75; display: flex; }
+  .rulebox .empty b, .rowlist .empty b { font-size: 14px; font-weight: 600; color: var(--text-muted); }
+  .rulebox .empty p, .rowlist .empty p { margin: 0; font-size: 13.5px; color: var(--text-subtle); max-width: 420px; }
   /* A rulerow as the box's LAST child (the error row) must not stack its
      border on the box's own bottom edge. Boxes ending in .ruleadd are
      unaffected — the last child there isn't a .rulerow. */

@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { useApp } from "../store";
 import { plural } from "../data";
 import { fmtBytes, fmtClock, fmtRelative, type ActivityEntry } from "../api";
+import { CloudIc } from "../icons";
 
 /** 24 hourly MB/session buckets ending at the current hour. */
 function hourlyBuckets(entries: ActivityEntry[], nowMs: number) {
@@ -138,7 +139,11 @@ export function SyncStatus() {
         <div className="h2sub">Newest first — the most recent sessions this device uploaded.</div>
         <div className="rowlist" id="syncNow">
           {recent.length === 0 && (
-            <div className="row"><div className="who"><b>Nothing uploaded yet</b><div className="sub">sessions appear here as the mirror sends them</div></div></div>
+            <div className="empty">
+              <span className="ico"><CloudIc /></span>
+              <b>Nothing uploaded yet</b>
+              <p>Sessions appear here as the mirror sends them.</p>
+            </div>
           )}
           {recent.map((r) => (
             <div className="row" key={`${r.atMs}-${r.title}`}>

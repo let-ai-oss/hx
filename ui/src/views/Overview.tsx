@@ -123,7 +123,11 @@ export function Overview() {
       <div className="panel" id="fortressPanel" style={{ paddingTop: 8, paddingBottom: 8 }}>
         <div className="rowlist" id="fortressList">
           {destinations.length === 0 && (
-            <div className="row"><div className="who"><b>Nothing uploaded yet</b><div className="sub">destinations appear after the first sync pass</div></div></div>
+            <div className="empty">
+              <span className="ico"><FortressIc /></span>
+              <b>Nothing uploaded yet</b>
+              <p>Once the first sync pass runs, every place this device’s sessions rest shows up here.</p>
+            </div>
           )}
           {destinations.map((d) => (
             <div key={d.key} className="row fortrow" data-fortress={d.key} onClick={() => openDest(d.key)}>
