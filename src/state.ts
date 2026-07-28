@@ -15,10 +15,45 @@ import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { HX_DIR } from "./hx-home.js";
+import type { ResolvedRoots } from "./roots.js";
 
 /** Which upload lane's state to read/write: "main" = the configured gateway,
  *  "local" = the additive `--local` tee against the local dev gateway. */
 export type StateScope = "main" | "local";
+
+/** Why a file is being skipped this pass. Both mean "the destination store is
+ *  temporarily unavailable, not this file's fault": `vault_offline` = the
+ *  gateway reported the session's vault down (503 vault_offline); `store_unreachable`
+ *  = a store this session routes to directly answered with a 5xx or couldn't be
+ *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
+export type FileSkipReason = "vault_offline" | "store_unreachable";
+
+/** Non-sensitive routing context returned by the gateway for a held upload. */
+export interface SyncBlockerDestination {
+  vaultOrgId: string;
+  reason: "vault_offline";
+  /** Optional for compatibility with gateways that predate rich blockers. */
+  orgName?: string | null;
+  orgSlug?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectSlug?: string | null;
+  repoSlug?: string | null;
+  /** Gateway-observed Fortress heartbeat, not transcript activity. */
+  lastSeenAt?: string | null;
+}
+
+/** Structured explanation attached to an unavailable-session error. */
+export interface SyncBlockerDetails {
+  reason: FileSkipReason;
+  destinations: SyncBlockerDestination[];
+}
+
+/** The blocker persisted beside an upload offset for offline diagnostics. */
+export interface PersistedSyncBlocker extends SyncBlockerDetails {
+  firstSeenAtMs: number;
+  lastSeenAtMs: number;
+}
 
 export interface FileState {
   /** Absolute jsonl path on disk. */
@@ -32,25 +67,58 @@ export interface FileState {
    *  attached to several orgs fans out to several stores, each advancing
    *  independently. */
   offsets: Record<string, number>;
+  /** ~-collapsed working directory of the session, from its head. Undefined on
+   *  legacy entries until the watch loop re-seeds them; the settings filters
+   *  (folder exclusions, personal gate) treat unknown as "keep uploading". */
+  cwd?: string;
+  /** Canonical owner/name repo slug from the session head; null = the folder
+   *  has no (GitHub) repo; undefined = not yet recorded (legacy entry). */
+  repoSlug?: string | null;
+  /** Whether the repo auto-attributes to any org workspace, per the gateway's
+   *  route discovery. undefined = unknown (no repo, never resolved, or an
+   *  older gateway that doesn't echo it) — treated as work by the personal
+   *  gate, never silently skipped. */
+  attributed?: boolean;
   /** Last mtime we observed (ms). Skip the file if mtime hasn't moved. */
   lastMtimeMs: number;
   /** Last upload attempt timestamp (ms). For logging/inspection. */
   lastUploadAtMs: number;
-  /** FIRST-SIGHT repo capture: the slug detected when the file was first
-   *  discovered (the 1.5 s tick usually sees a session while its workdir — and
-   *  its .git — still exists). Uploads prefer a fresh detection but fall back
-   *  to this, so an ephemeral workdir GC'd before its backlog uploaded no
-   *  longer loses the repo. Absent on entries seeded by older builds. */
-  repoSlug?: string | null;
-  /** The session's cwd as read from the transcript head at first sight —
-   *  attribution EVIDENCE for the sweep (server-side org rules match on it). */
-  cwd?: string | null;
+  /** Size (bytes) the file had when we last saw it on disk. Lets `hx status`
+   *  report sessions whose source vanished (or aged out of the scan window)
+   *  before their upload finished — the server copy stays partial forever, and
+   *  without this record the status would silently claim 100%. */
+  lastKnownSize?: number;
+  /** Consecutive canonical self-heals (from-zero re-uploads) without a clean
+   *  commit in between. A mismatch that heals and immediately re-diverges is
+   *  ping-ponging (e.g. two writers on one canonical) — after a few rounds the
+   *  heal pauses instead of re-uploading the whole file forever. */
+  healCount?: number;
+  /** Self-heal is paused for this file until this timestamp (ms). */
+  healPausedUntilMs?: number;
+  /** Consecutive failed upload attempts (cleared by any clean pass). Drives a
+   *  per-file retry backoff so one permanently-broken file can't burn a
+   *  gateway round trip every poll while everything else is healthy. */
+  consecutiveFailures?: number;
+  /** Do not retry this file before this timestamp (ms since epoch). */
+  nextAttemptAtMs?: number;
+  /** Set while the file is being skipped because its destination store is
+   *  temporarily unavailable (a transient outage, not a fault of this file).
+   *  Drives the `hx status` "waiting" row; cleared by any clean pass. */
+  skipReason?: FileSkipReason;
+  /** Compact operational context only: no transcript content, paths, tokens,
+   *  signed URLs, or credentials are ever stored here. */
+  blocker?: PersistedSyncBlocker;
   /** DETECTION_VERSION stamp of the last attribution sweep that covered this
-   *  file (reattribute.ts). Absent/lower ⇒ the next sweep re-reports it. */
+   *  file (reattribute.ts). Absent/lower ⇒ the next sweep re-reports it. The
+   *  cwd/repoSlug fields above double as the sweep's FIRST-SIGHT cache: they
+   *  were captured while the workdir still existed, so they always win over a
+   *  later re-walk (a REUSED scratch path can resolve to the wrong repo). */
   attributionVersion?: number;
 }
 
-/** On-disk shape before per-destination fan-out carried a single `offset`. */
+/** On-disk shape before per-destination fan-out carried a single `offset`. The
+ *  optional recovery/skip fields may already be present on a non-legacy entry
+ *  being re-normalised; they carry through {@link migrateFileState} untouched. */
 export interface LegacyFileState {
   path: string;
   family: string;
@@ -60,8 +128,15 @@ export interface LegacyFileState {
   lastMtimeMs: number;
   lastUploadAtMs: number;
   repoSlug?: string | null;
-  cwd?: string | null;
+  cwd?: string;
   attributionVersion?: number;
+  lastKnownSize?: number;
+  consecutiveFailures?: number;
+  nextAttemptAtMs?: number;
+  skipReason?: FileSkipReason;
+  blocker?: PersistedSyncBlocker;
+  healCount?: number;
+  healPausedUntilMs?: number;
 }
 
 /** Stable per-destination state key. null (let.ai shared bucket) → "letai". */
@@ -95,12 +170,24 @@ export function migrateFileState(s: LegacyFileState): FileState {
     lastMtimeMs: s.lastMtimeMs,
     lastUploadAtMs: s.lastUploadAtMs,
     // Attribution capture fields ride through untouched — this migration runs
-    // over EVERY entry at load, so dropping them here would erase the
-    // first-sight cache and re-trigger the sweep on every restart.
+    // over EVERY entry at load, so dropping them would erase the first-sight
+    // cache and re-trigger the sweep on every restart.
     ...(s.repoSlug !== undefined ? { repoSlug: s.repoSlug } : {}),
     ...(s.cwd !== undefined ? { cwd: s.cwd } : {}),
     ...(s.attributionVersion !== undefined ? { attributionVersion: s.attributionVersion } : {}),
+    lastKnownSize: s.lastKnownSize,
+    consecutiveFailures: s.consecutiveFailures,
+    nextAttemptAtMs: s.nextAttemptAtMs,
+    skipReason: s.skipReason,
+    blocker: s.blocker,
+    healCount: s.healCount,
+    healPausedUntilMs: s.healPausedUntilMs,
   };
+}
+
+/** The daemon's resolved watch roots + when it resolved them. */
+export interface EffectiveRootsStamp extends ResolvedRoots {
+  resolvedAtMs: number;
 }
 
 export interface HxState {
@@ -108,6 +195,34 @@ export interface HxState {
   /** Content-hash per uploaded sidecar artifact (key `<family>:<sessionId>:<kind>`)
    *  so tasks/plans only re-upload when their content actually changes. */
   artifacts?: Record<string, string>;
+  /** Sessions the SERVER permanently deleted (410 session_deleted / verify
+   *  status "deleted"), keyed `<family>:<sessionId>` → epoch-ms recorded.
+   *  Session-keyed (not per-file) on purpose: one session can have twin files,
+   *  and file entries are re-seeded on discovery — a per-file flag would miss
+   *  both. A tombstoned session never uploads again from this device: chunks,
+   *  child lanes, sidecars and the verify audit all consult this map. Entries
+   *  are pruned after DELETED_SESSION_RETENTION_MS (past the 30-day discovery
+   *  window, so a pruned entry can't resurrect anything — and the server-side
+   *  tombstone still refuses with 410 regardless). The local jsonl file is the
+   *  user's own and is never touched. */
+  deletedSessions?: Record<string, number>;
+  /** The data roots the LONG-RUNNING daemon actually watches, stamped by
+   *  startWatch only (main scope). One-shot runs (`hx tick`, `watch --once`)
+   *  carry the invoking shell's env — CLAUDE_CONFIG_DIR / CODEX_HOME the
+   *  background service may never see — so they must not overwrite this.
+   *  The UI server treats the stamp as device truth for ALL its discovery
+   *  and falls back to its own resolution when the stamp is absent (daemon
+   *  not yet upgraded / never ran). Additive; older binaries ignore it. */
+  effectiveRoots?: EffectiveRootsStamp;
+  /** Last elected uploader path per child lane (`parent:agent:runId`). Child
+   *  election is stateless (newest mtime wins); when a lane's winner FLIPS
+   *  (a copied tree raced the live file), the new winner must re-upload from
+   *  zero or its stale offsets would append onto a canonical another file
+   *  last wrote — and child lanes have no offsets audit to ever notice (see
+   *  planChildLaneResets in watch.ts). Not pruned — entries are two short
+   *  strings per lane and lanes are bounded by real agent activity, same
+   *  growth class as `files`. Additive; older binaries ignore it. */
+  childUploaders?: Record<string, string>;
 }
 
 const STATE_DIR = HX_DIR;
@@ -118,6 +233,12 @@ const STATE_FILE: Record<StateScope, string> = {
 
 const inMemory = new Map<StateScope, HxState>();
 const writeChains = new Map<StateScope, Promise<void>>();
+
+/** Forget a cached snapshot so a maintenance command can re-read state after
+ *  stopping the daemon that owned the file. */
+export function resetStateCache(scope: StateScope = "main"): void {
+  inMemory.delete(scope);
+}
 
 function statePath(scope: StateScope): string {
   return path.join(STATE_DIR, STATE_FILE[scope]);
@@ -181,6 +302,28 @@ export async function upsertFileState(
   await schedulePersist(state, scope);
 }
 
+/** Persist the daemon's resolved watch roots (see HxState.effectiveRoots). */
+export async function stampEffectiveRoots(
+  roots: ResolvedRoots,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  state.effectiveRoots = {
+    claude: roots.claude,
+    codex: roots.codex,
+    resolvedAtMs: Date.now(),
+  };
+  await schedulePersist(state, scope);
+}
+
+/** Persist the cached state after in-place mutations (childUploaders map,
+ *  offset zeroing on a lane flip). Same single-writer discipline as every
+ *  other writer here — only the process that owns the lane calls this. */
+export async function persistState(scope: StateScope = "main"): Promise<void> {
+  const state = await loadState(scope);
+  await schedulePersist(state, scope);
+}
+
 /** Record the bytes committed to ONE destination for a file. Other destinations'
  *  offsets are untouched, so an offline vault never rolls back a healthy one. */
 export async function setOffsetFor(
@@ -199,6 +342,51 @@ export async function setOffsetFor(
   await schedulePersist(state, scope);
 }
 
+/**
+ * Reconcile a file's per-destination offsets against the gateway's CURRENT
+ * fan-out set for its session (both ready and held destinations — a held
+ * vault is expected back and must keep its offset). A destination that left
+ * the set (org detached, vault decommissioned) would otherwise pin
+ * minOffset — and with it the sync percentage — below done forever, since
+ * nothing ever wrote to it again and no other code path removes offset keys.
+ */
+export async function reconcileDestinations(
+  filePath: string,
+  activeKeys: string[],
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return;
+  const changed = reconcileDestinationOffsets(existing.offsets, activeKeys);
+  if (changed) await schedulePersist(state, scope);
+}
+
+/** Apply a gateway's current destination set to an offset map. Exported as a
+ * pure mutation helper so the add-at-zero/prune contract is directly tested. */
+export function reconcileDestinationOffsets(
+  offsets: Record<string, number>,
+  activeKeys: string[],
+): boolean {
+  const keep = new Set(activeKeys);
+  let changed = false;
+  // A newly-attached destination starts at zero. Recording that zero is what
+  // keeps the sync percentage honest while the destination is held/offline;
+  // otherwise minOffset() would only see already-written stores and could
+  // incorrectly report 100%.
+  for (const k of keep) {
+    if (k in offsets) continue;
+    offsets[k] = 0;
+    changed = true;
+  }
+  for (const k of Object.keys(offsets)) {
+    if (keep.has(k)) continue;
+    delete offsets[k];
+    changed = true;
+  }
+  return changed;
+}
+
 /** Refresh a file's observed mtime without advancing any destination's offset
  *  (the file changed but produced no new committable bytes). */
 export async function touchMtime(
@@ -211,6 +399,179 @@ export async function touchMtime(
   if (!existing) return;
   existing.lastMtimeMs = mtimeMs;
   await schedulePersist(state, scope);
+}
+
+/** Per-file retry backoff cap — a broken file retries at most every 30 min. */
+const FILE_BACKOFF_CAP_MS = 30 * 60_000;
+
+/** Record a failed upload attempt for one file and schedule its next try with
+ *  exponential backoff from `baseMs`. Returns the chosen delay (ms).
+ *
+ *  `skipReason` distinguishes a transient store outage (the file is fine, its
+ *  destination is temporarily unavailable) from an ordinary per-file fault: when
+ *  set it is stamped for `hx status`; when omitted any stale reason is cleared,
+ *  so a file that fails for a new reason never keeps advertising the old one. */
+export async function recordFileFailure(
+  filePath: string,
+  baseMs: number,
+  scope: StateScope = "main",
+  skipReason?: FileSkipReason,
+  blocker?: SyncBlockerDetails,
+): Promise<number> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return 0;
+  const n = (existing.consecutiveFailures ?? 0) + 1;
+  existing.consecutiveFailures = n;
+  const delay = Math.min(FILE_BACKOFF_CAP_MS, baseMs * 2 ** (n - 1));
+  existing.nextAttemptAtMs = Date.now() + delay;
+  if (skipReason) existing.skipReason = skipReason;
+  else delete existing.skipReason;
+  if (blocker) {
+    const now = Date.now();
+    const sameReason = existing.blocker?.reason === blocker.reason;
+    existing.blocker = {
+      ...blocker,
+      firstSeenAtMs: sameReason ? existing.blocker!.firstSeenAtMs : now,
+      lastSeenAtMs: now,
+    };
+  } else {
+    delete existing.blocker;
+  }
+  await schedulePersist(state, scope);
+  return delay;
+}
+
+/** How many consecutive self-heals one file may burn before the heal pauses. */
+export const HEAL_MAX_CONSECUTIVE = 3;
+/** How long a ping-ponging file's self-heal stays paused. */
+export const HEAL_PAUSE_MS = 6 * 60 * 60_000;
+
+/** Count a canonical self-heal for one file; pauses healing once the streak
+ *  hits HEAL_MAX_CONSECUTIVE. Returns the streak length. */
+export async function recordHeal(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<number> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return 0;
+  const n = (existing.healCount ?? 0) + 1;
+  existing.healCount = n;
+  if (n >= HEAL_MAX_CONSECUTIVE) {
+    existing.healPausedUntilMs = Date.now() + HEAL_PAUSE_MS;
+  }
+  await schedulePersist(state, scope);
+  return n;
+}
+
+/** A clean, size-matching commit ends any heal streak. */
+export async function clearHeal(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing || (existing.healCount === undefined && existing.healPausedUntilMs === undefined)) {
+    return;
+  }
+  delete existing.healCount;
+  delete existing.healPausedUntilMs;
+  await schedulePersist(state, scope);
+}
+
+/** Clear a file's failure backoff (and any skip reason) after a clean pass. */
+export async function clearFileFailure(
+  filePath: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (
+    !existing ||
+    (existing.consecutiveFailures === undefined &&
+      existing.nextAttemptAtMs === undefined &&
+      existing.skipReason === undefined &&
+      existing.blocker === undefined)
+  ) {
+    return;
+  }
+  delete existing.consecutiveFailures;
+  delete existing.nextAttemptAtMs;
+  delete existing.skipReason;
+  delete existing.blocker;
+  await schedulePersist(state, scope);
+}
+
+/** Clear only transient destination holds so the next daemon pass retries them
+ *  immediately. The caller stops the daemon first, preserving state.json's
+ *  single-writer invariant. */
+export async function clearBlockedFailures(
+  scope: StateScope = "main",
+): Promise<{ files: number; sessions: number }> {
+  const state = await loadState(scope);
+  const cleared = clearBlockedFailuresFromState(state);
+  if (cleared.files > 0) await schedulePersist(state, scope);
+  return cleared;
+}
+
+export function clearBlockedFailuresFromState(
+  state: HxState,
+): { files: number; sessions: number } {
+  const sessions = new Set<string>();
+  let files = 0;
+  for (const entry of Object.values(state.files)) {
+    if (!entry.skipReason && !entry.blocker) continue;
+    files += 1;
+    sessions.add(`${entry.family}:${entry.sessionId}`);
+    delete entry.consecutiveFailures;
+    delete entry.nextAttemptAtMs;
+    delete entry.skipReason;
+    delete entry.blocker;
+  }
+  return { files, sessions: sessions.size };
+}
+
+/** Past the 30-day discovery window with margin — see HxState.deletedSessions. */
+const DELETED_SESSION_RETENTION_MS = 60 * 24 * 60 * 60 * 1000;
+
+/** The `deletedSessions` key for one session. */
+export function deletedSessionKey(family: string, sessionId: string): string {
+  return `${family}:${sessionId}`;
+}
+
+/** Record a server-side permanent delete; idempotent. Prunes expired entries
+ *  opportunistically so the map can't grow without bound. */
+export async function recordDeletedSession(
+  family: string,
+  sessionId: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (!state.deletedSessions) state.deletedSessions = {};
+  const key = deletedSessionKey(family, sessionId);
+  if (!state.deletedSessions[key]) state.deletedSessions[key] = Date.now();
+  const cutoff = Date.now() - DELETED_SESSION_RETENTION_MS;
+  for (const [k, at] of Object.entries(state.deletedSessions)) {
+    if (at < cutoff) delete state.deletedSessions[k];
+  }
+  await schedulePersist(state, scope);
+}
+
+/** True when the server permanently deleted this session (any family recorded —
+ *  the id is matched exactly per family first, then by bare sessionId so a
+ *  stale-family child/sidecar path can't slip past the local stop either). */
+export function isDeletedSession(
+  state: HxState,
+  family: string,
+  sessionId: string,
+): boolean {
+  const map = state.deletedSessions;
+  if (!map) return false;
+  if (map[deletedSessionKey(family, sessionId)]) return true;
+  const suffix = `:${sessionId}`;
+  for (const k of Object.keys(map)) if (k.endsWith(suffix)) return true;
+  return false;
 }
 
 export async function getArtifactHash(

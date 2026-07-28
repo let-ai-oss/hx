@@ -18,6 +18,13 @@
 // most likely to predate detection fixes. Files with no upload state are
 // skipped: they have no server row to repair (live ingest owns them).
 //
+// Slug precedence: the FIRST-SIGHT cache (state.json, captured while the
+// workdir still existed) wins over a sweep-time re-walk — a REUSED scratch
+// path can resolve to whatever repo lives there NOW. Evidence precedence is
+// the opposite: the head's RAW cwd wins over the cached one (which is
+// ~-collapsed, or a projects-dir fallback on legacy entries) so server-side
+// rules match real paths.
+//
 // Failure model: a batch that fails (network, or a gateway predating the
 // route) aborts the sweep WITHOUT stamping the remaining files' version, so
 // the next daemon start simply retries. Stamping is per-file and follows the
@@ -30,6 +37,8 @@ import {
   type ReattributeItem,
   type ReattributeResult,
 } from "./uploader.js";
+import { readSettings } from "./settings.js";
+import { resolveDataRoots } from "./roots.js";
 import type { HxConfig } from "./config.js";
 
 /** Bump when the detection chain learns a new trick (encoded workdir names,
@@ -53,9 +62,10 @@ export async function runReattributeSweep(
   opts: { force?: boolean } = {},
 ): Promise<SweepSummary> {
   const summary: SweepSummary = { scanned: 0, sent: 0, attributed: 0, unresolved: 0, skipped: 0 };
+  const roots = resolveDataRoots(await readSettings());
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles({ maxAgeMs: Infinity }),
-    discoverCodexFiles({ maxAgeMs: Infinity }),
+    discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
+    discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
   ]);
   const files = [...claude, ...codex];
 
@@ -88,15 +98,14 @@ export async function runReattributeSweep(
     }
     summary.scanned += 1;
     const head = await readHead(file.path, file.source);
-    // FIRST-SIGHT wins over the sweep-time walk: the cached slug was detected
-    // while the session actually ran; a re-walk months later can resolve a
-    // REUSED scratch path to whatever repo lives there NOW. The fresh walk
-    // only fills a cache that has nothing.
+    // FIRST-SIGHT slug wins (see module doc); the fresh walk only fills gaps.
     const repoSlug = fState.repoSlug ?? head.repoSlug ?? null;
-    const cwd = fState.cwd ?? head.cwd ?? null;
-    // Keep the local cache current regardless of what the server run yields.
-    fState.repoSlug = repoSlug;
-    fState.cwd = cwd;
+    // RAW cwd wins for evidence; the cached value is ~-collapsed (or a
+    // projects-dir fallback) and only stands in when the head carries none.
+    const cwd = head.cwd ?? fState.cwd ?? null;
+    if (fState.repoSlug == null && repoSlug != null) {
+      fState.repoSlug = repoSlug;
+    }
     // evidenceUpload:false doesn't just withhold — it RETRACTS: the server may
     // hold cwd from before the opt-out, and opting out should mean gone.
     const withholdCwd = cfg.evidenceUpload === false;

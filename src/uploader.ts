@@ -6,6 +6,8 @@
 import type { HxConfig } from "./config.js";
 import type { Family } from "./sources.js";
 import type { HxCcdGroupMirrorBlob } from "./mirror-types.js";
+import type { SyncBlockerDetails, SyncBlockerDestination } from "./state.js";
+import { assertSecureFetchUrl } from "./net.js";
 
 /** One fan-out target for a chunk. `ready` carries a signed staging URL; `held`
  *  means that org's vault is offline right now — skip it this pass and retry. */
@@ -18,7 +20,7 @@ export type AppendDestination =
       expiresAt: string;
       status: "ready";
     }
-  | { vaultOrgId: string; status: "held"; reason: "vault_offline"; orgName: string | null };
+  | (SyncBlockerDestination & { status: "held" });
 
 export interface AppendUrlResponse {
   chunkId: string;
@@ -65,6 +67,8 @@ export class HxHttpError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    /** Sanitized routing/liveness metadata for a per-session hold. */
+    public readonly blocker?: SyncBlockerDetails,
   ) {
     super(message);
     this.name = "HxHttpError";
@@ -77,14 +81,82 @@ export class HxHttpError extends Error {
   get serverUnavailable(): boolean {
     return this.status === 429 || this.status >= 500;
   }
+
+  /** A 503 whose body names vault_offline: THIS session's vault is down while
+   *  the gateway itself is healthy. Callers should skip just this file with a
+   *  long per-file backoff instead of pausing the whole pass — other sessions
+   *  (and other stores) keep uploading. */
+  get vaultOffline(): boolean {
+    return (
+      this.status === 503 &&
+      (this.blocker?.reason === "vault_offline" || this.message.includes("vault_offline"))
+    );
+  }
+
+  /** 410 session_deleted: the session was PERMANENTLY deleted server-side. The
+   *  one terminal per-session signal in the protocol — callers record it in
+   *  state (deletedSessions) and never upload any lane of the session again.
+   *  Retrying would only re-410 forever; re-uploading is exactly what the
+   *  server-side tombstone exists to refuse. Same body from the cloud gateway
+   *  and a fortress-direct gateway, so this is the single code path. */
+  get sessionDeleted(): boolean {
+    return this.status === 410 && this.message.includes("session_deleted");
+  }
+}
+
+/** Reduce an untrusted gateway destination list to the fixed, non-sensitive
+ * blocker allowlist used by state/status/doctor. */
+export function vaultBlockerFromDestinations(destinations: unknown): SyncBlockerDetails | undefined {
+  if (!Array.isArray(destinations)) return undefined;
+  const sanitized = destinations.flatMap((raw): SyncBlockerDestination[] => {
+    if (!raw || typeof raw !== "object") return [];
+    const d = raw as Record<string, unknown>;
+    if (typeof d.vaultOrgId !== "string" || d.reason !== "vault_offline") return [];
+    const nullableString = (value: unknown): string | null =>
+      typeof value === "string" ? value : null;
+    return [{
+      vaultOrgId: d.vaultOrgId,
+      reason: "vault_offline",
+      orgName: nullableString(d.orgName),
+      orgSlug: nullableString(d.orgSlug),
+      projectId: nullableString(d.projectId),
+      projectName: nullableString(d.projectName),
+      projectSlug: nullableString(d.projectSlug),
+      repoSlug: nullableString(d.repoSlug),
+      lastSeenAt: nullableString(d.lastSeenAt),
+    }];
+  });
+  return sanitized.length > 0
+    ? { reason: "vault_offline", destinations: sanitized }
+    : undefined;
 }
 
 async function throwHttp(res: Response, label: string): Promise<never> {
   const txt = await res.text().catch(() => "");
-  throw new HxHttpError(res.status, `${label} failed: ${res.status} ${txt.slice(0, 200)}`);
+  let blocker: SyncBlockerDetails | undefined;
+  try {
+    const body = JSON.parse(txt) as { error?: unknown; destinations?: unknown };
+    if (body.error === "vault_offline") {
+      blocker = vaultBlockerFromDestinations(body.destinations);
+    }
+  } catch {
+    // Old gateways and storage services may return text/HTML. Keep the bounded
+    // legacy message and simply omit structured diagnostics.
+  }
+  throw new HxHttpError(
+    res.status,
+    `${label} failed: ${res.status} ${txt.slice(0, 200)}`,
+    blocker,
+  );
 }
 
 function authHeaders(cfg: HxConfig): Record<string, string> {
+  // Chokepoint for every token-bearing gateway POST in this module: the device
+  // bearer token must never leave over cleartext. Assert the configured gateway
+  // is https (loopback http excepted) here so a downgraded/hand-edited
+  // `cfg.gatewayBaseUrl` fails closed before the token is put on the wire,
+  // matching the guard resolveRoute already applies to the same URL.
+  assertSecureFetchUrl(cfg.gatewayBaseUrl, "gateway request");
   return {
     authorization: `Bearer ${cfg.accessToken}`,
     "content-type": "application/json",
@@ -153,6 +225,11 @@ export async function requestAppendUrl(
 }
 
 export async function putChunk(uploadUrl: string, bytes: Buffer): Promise<void> {
+  // `uploadUrl` is a signed target the gateway just handed us (append-url
+  // response / a fan-out destination). It carries the session bytes, so refuse
+  // to PUT it over cleartext to a non-loopback host — an impersonated gateway
+  // could otherwise redirect an upload to http and exfiltrate transcripts.
+  assertSecureFetchUrl(uploadUrl, "PUT chunk");
   const res = await fetch(uploadUrl, {
     method: "PUT",
     headers: { "content-type": "application/x-ndjson" },
@@ -363,7 +440,11 @@ export interface VerifySessionsItem {
 export interface VerifySessionsResult {
   family: string;
   sessionId: string;
-  status: "ok" | "divergent" | "skipped";
+  // "deleted" = permanently deleted server-side (tombstoned) — terminal; the
+  // audit records it and stops ever uploading the session again. Older daemons
+  // ignore the unrecognized status (a silent no-op), which is what makes the
+  // widening backward-safe.
+  status: "ok" | "divergent" | "skipped" | "deleted";
   storeBytes: number | null;
 }
 

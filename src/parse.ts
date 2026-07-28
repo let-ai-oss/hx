@@ -35,6 +35,8 @@ export interface ChunkSummary {
   eventCount: number;
   userTextCount: number;
   assistantCount: number;
+  /** First user message seen in this chunk — a stable label source. */
+  firstUserText: string | null;
   lastUserText: string | null;
   lastAssistantText: string | null;
   lastActivityAt: string | null;
@@ -48,6 +50,7 @@ export function summariseChunk(text: string): ChunkSummary {
     eventCount: 0,
     userTextCount: 0,
     assistantCount: 0,
+    firstUserText: null,
     lastUserText: null,
     lastAssistantText: null,
     lastActivityAt: null,
@@ -89,7 +92,10 @@ export function summariseChunk(text: string): ChunkSummary {
       out.userTextCount += 1;
       const msg = (d.message ?? {}) as { content?: unknown };
       const txt = extractText(msg.content, ["text"]);
-      if (txt) out.lastUserText = bodyText(txt);
+      if (txt) {
+        out.lastUserText = bodyText(txt);
+        out.firstUserText ??= out.lastUserText;
+      }
     } else if (type === "assistant") {
       out.assistantCount += 1;
       const msg = (d.message ?? {}) as { content?: unknown };
@@ -100,6 +106,7 @@ export function summariseChunk(text: string): ChunkSummary {
       if (p.type === "user_message" && p.message) {
         out.userTextCount += 1;
         out.lastUserText = bodyText(p.message);
+        out.firstUserText ??= out.lastUserText;
       } else if (p.type === "agent_message" && p.message) {
         out.assistantCount += 1;
         out.lastAssistantText = bodyText(p.message);
@@ -111,6 +118,7 @@ export function summariseChunk(text: string): ChunkSummary {
         if (txt) {
           out.userTextCount += 1;
           out.lastUserText = bodyText(txt);
+          out.firstUserText ??= out.lastUserText;
         }
       } else if (p.type === "message" && p.role === "assistant") {
         const txt = extractText(p.content, ["output_text", "text"]);

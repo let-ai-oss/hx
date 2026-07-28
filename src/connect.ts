@@ -8,9 +8,10 @@
 // Surfaced on the CLI as `hx connect` (with `hx login` as a hidden alias
 // for binaries / installers that pre-date the rename).
 
-import { spawn } from "node:child_process";
 import os from "node:os";
+import { openBrowser } from "./browser.js";
 import { writeConfig, ensureDeviceId, type HxConfig } from "./config.js";
+import { assertSecureFetchUrl } from "./net.js";
 
 interface CodeResponse {
   deviceCode: string;
@@ -34,31 +35,6 @@ interface PollApproved {
   deviceName?: string | null;
 }
 type PollResponse = PollPending | PollApproved;
-
-function openBrowser(url: string): void {
-  // Best-effort, fail silently — the URL is printed to the terminal regardless.
-  //
-  // `url` is verificationUriComplete straight off the gateway response, so it
-  // is untrusted: never hand it to a shell (a value like "https://x/$(...)"
-  // would execute), and only ever open http(s). Validate the scheme, then
-  // spawn with an argv array so the URL is a single non-shell argument.
-  try {
-    const scheme = new URL(url).protocol;
-    if (scheme !== "http:" && scheme !== "https:") return;
-  } catch {
-    return;
-  }
-  const platform = os.platform();
-  const [cmd, args]: [string, string[]] =
-    platform === "darwin"
-      ? ["open", [url]]
-      : platform === "win32"
-        ? ["explorer", [url]]
-        : ["xdg-open", [url]];
-  const child = spawn(cmd, args, { stdio: "ignore", detached: true });
-  child.on("error", () => {});
-  child.unref();
-}
 
 // ── pairing-code card ───────────────────────────────────────────────────
 // The browser approve page says "Check this matches your terminal", so the
@@ -145,6 +121,9 @@ export async function connect(opts: ConnectOptions): Promise<void> {
   // Reuse this machine's stable id so the server can re-link sessions hidden
   // by a prior removal/disconnect to the token it's about to issue.
   const deviceId = await ensureDeviceId();
+  // The poll step receives the device access token from the gateway, so refuse
+  // to run the pairing handshake over cleartext to a non-loopback host.
+  assertSecureFetchUrl(opts.gatewayBaseUrl, "hx connect");
   // Report this machine's REAL platform so the workbench Devices page shows the
   // actual OS rather than sniffing the approving browser's userAgent, which
   // mislabels e.g. a headless Linux VM approved from a Mac.
