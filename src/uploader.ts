@@ -198,6 +198,45 @@ export async function commitChunk(
   return (await res.json()) as { ok: true; totalBytes: number; componentCount: number };
 }
 
+/** One session in a reattribute batch: the re-detected slug when the client
+ *  resolved one, else the session's cwd as EVIDENCE for server-side org rules.
+ *  Omitted fields are omitted on the wire — the gateway's carry-forward means
+ *  an item can never erase what the server already knows. */
+export interface ReattributeItem {
+  family: Family;
+  sessionId: string;
+  repoSlug?: string;
+  cwd?: string;
+  /** Retract previously-uploaded cwd evidence (evidenceUpload:false devices). */
+  withholdCwd?: boolean;
+}
+
+export interface ReattributeResult {
+  family: string;
+  sessionId: string;
+  status: "attributed" | "unmatched" | "unresolved" | "sticky" | "not_found" | "deleted";
+  repoSlug?: string | null;
+  orgId?: string | null;
+  projectId?: string | null;
+}
+
+// The attribution sweep's transport (reattribute.ts): metadata-only repair of
+// already-uploaded sessions. PG-only on the gateway side — no bytes move, no
+// storage is re-routed. A gateway that predates the route 404s; the sweep
+// treats that as "not yet, retry next start" (the version stamp isn't written).
+export async function reattributeSessions(
+  cfg: HxConfig,
+  items: ReattributeItem[],
+): Promise<{ ok: true; results: ReattributeResult[] }> {
+  const res = await fetch(`${cfg.gatewayBaseUrl}/sessions/reattribute`, {
+    method: "POST",
+    headers: authHeaders(cfg),
+    body: JSON.stringify({ items }),
+  });
+  if (!res.ok) await throwHttp(res, "reattribute");
+  return (await res.json()) as { ok: true; results: ReattributeResult[] };
+}
+
 // ── Child execution lanes (subagents + workflow agents) ────────────────────
 // Same 3-step chunked contract as the parent transcript, against dedicated
 // endpoints (an old gateway 404s these — child bytes must never compose into

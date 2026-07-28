@@ -41,6 +41,7 @@ import {
   upsertFileState,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
+import { runReattributeSweep } from "./reattribute.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
 import {
@@ -239,6 +240,13 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
     offsets: {},
     lastMtimeMs: file.mtimeMs,
     lastUploadAtMs: 0,
+    // FIRST-SIGHT capture: discovery runs on the 1.5 s tick, so this head read
+    // almost always happens while the session's workdir — and its .git — still
+    // exists. Persisting the detection here is what keeps an ephemeral workdir
+    // (pool scratch dir, GC'd at job end) attributable when its bytes upload
+    // later, after the dir is gone.
+    repoSlug: head.repoSlug,
+    cwd: head.cwd,
   };
   await upsertFileState(seeded, scope);
   return seeded;
@@ -273,12 +281,26 @@ async function ingestOne(
   // and the commit metadata below reuses the same head.
   const head = await readHead(file.path, file.source);
 
+  // FIRST-SIGHT cache (ensureFileState) wins; the live walk only fills a cache
+  // that has nothing. A session's repo never legitimately changes after first
+  // sight (the transcript's cwd is fixed) — but a scratch path REUSED by a
+  // later job can make a re-walk resolve to the wrong repo, so an established
+  // cache value must not be overwritten. Upgrades (null → detected) persist so
+  // a later restart keeps the best-known value.
+  const repoSlug = fState.repoSlug ?? head.repoSlug ?? null;
+  const cwd = fState.cwd ?? head.cwd ?? null;
+  if (repoSlug !== fState.repoSlug || cwd !== fState.cwd) {
+    fState.repoSlug = repoSlug;
+    fState.cwd = cwd;
+    await upsertFileState(fState, scope);
+  }
+
   // Discover where this repo's sessions upload. A fortress-direct route swaps the
   // base URL + bearer to the org's own Fortress gateway; everything else stays on
   // the cloud. Non-goal: NO cloud fallback — if the fortress upload below
   // throws, the chunk stays queued (offset unadvanced) and retries against the
   // Fortress next pass; it is never re-sent to the cloud.
-  const route = await uploadConfigFor(cfg, head.repoSlug);
+  const route = await uploadConfigFor(cfg, repoSlug);
   const uploadCfg = route.cfg;
 
   // Get signed staging URLs for EVERY store this repo fans out to. repoSlug lets
@@ -290,7 +312,7 @@ async function ingestOne(
     family: fState.family as never,
     sessionId: fState.sessionId,
     byteCount: st.size - baseOffset,
-    repoSlug: head.repoSlug,
+    repoSlug,
   });
   const steps = planFanout(append, fState);
 
@@ -336,9 +358,12 @@ async function ingestOne(
           title,
           titleSource,
           ccdSessionId: ccdMeta?.ccdSessionId ?? undefined,
-          cwd: head.cwd,
+          // cwd doubles as attribution EVIDENCE the gateway now persists (org
+          // rules match on it); evidenceUpload:false withholds it for orgs
+          // that consider local paths sensitive.
+          cwd: cfg.evidenceUpload === false ? undefined : cwd,
           gitBranch: head.gitBranch,
-          repoSlug: head.repoSlug,
+          repoSlug,
           entrypoint: head.entrypoint,
           originator: head.originator,
           modelProvider: head.modelProvider,
@@ -996,6 +1021,15 @@ export async function startWatch(
   await beat(); // announce liveness immediately so a fresh daemon reads "live"
   await syncGroupMirror(cfg, log); // push CCD's grouping on start
   await syncTeamMirror(cfg, log); // push active agent teams on start
+  // One-shot attribution sweep — no-ops when every known file already carries
+  // the current DETECTION_VERSION stamp, so a routine restart costs nothing.
+  // Best-effort: a gateway that predates /sessions/reattribute (or is down)
+  // just leaves the stamps unwritten and the next start retries.
+  try {
+    await runReattributeSweep(cfg, scopeOf(cfg), log);
+  } catch (err) {
+    log(`[hx] attribution sweep error: ${(err as Error).message}`);
+  }
   if (opts.oneShot) return { stop: () => {} };
   const timer = setInterval(() => void run(), FAST_POLL_MS);
   const hbTimer = setInterval(() => void beat(), HEARTBEAT_MS);

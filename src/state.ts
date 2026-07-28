@@ -36,6 +36,18 @@ export interface FileState {
   lastMtimeMs: number;
   /** Last upload attempt timestamp (ms). For logging/inspection. */
   lastUploadAtMs: number;
+  /** FIRST-SIGHT repo capture: the slug detected when the file was first
+   *  discovered (the 1.5 s tick usually sees a session while its workdir — and
+   *  its .git — still exists). Uploads prefer a fresh detection but fall back
+   *  to this, so an ephemeral workdir GC'd before its backlog uploaded no
+   *  longer loses the repo. Absent on entries seeded by older builds. */
+  repoSlug?: string | null;
+  /** The session's cwd as read from the transcript head at first sight —
+   *  attribution EVIDENCE for the sweep (server-side org rules match on it). */
+  cwd?: string | null;
+  /** DETECTION_VERSION stamp of the last attribution sweep that covered this
+   *  file (reattribute.ts). Absent/lower ⇒ the next sweep re-reports it. */
+  attributionVersion?: number;
 }
 
 /** On-disk shape before per-destination fan-out carried a single `offset`. */
@@ -47,6 +59,9 @@ export interface LegacyFileState {
   offsets?: Record<string, number>;
   lastMtimeMs: number;
   lastUploadAtMs: number;
+  repoSlug?: string | null;
+  cwd?: string | null;
+  attributionVersion?: number;
 }
 
 /** Stable per-destination state key. null (let.ai shared bucket) → "letai". */
@@ -79,6 +94,12 @@ export function migrateFileState(s: LegacyFileState): FileState {
     offsets,
     lastMtimeMs: s.lastMtimeMs,
     lastUploadAtMs: s.lastUploadAtMs,
+    // Attribution capture fields ride through untouched — this migration runs
+    // over EVERY entry at load, so dropping them here would erase the
+    // first-sight cache and re-trigger the sweep on every restart.
+    ...(s.repoSlug !== undefined ? { repoSlug: s.repoSlug } : {}),
+    ...(s.cwd !== undefined ? { cwd: s.cwd } : {}),
+    ...(s.attributionVersion !== undefined ? { attributionVersion: s.attributionVersion } : {}),
   };
 }
 

@@ -72,8 +72,13 @@ export interface DiscoveredFile {
   source: "claude" | "codex";
 }
 
-/** All recent Claude-projects jsonls. */
-export async function discoverClaudeFiles(): Promise<DiscoveredFile[]> {
+/** All recent Claude-projects jsonls. `maxAgeMs` overrides the 30-day window —
+ *  the attribution sweep passes Infinity so already-uploaded sessions older
+ *  than the live-ingest window (bounded only by on-disk retention, ~8 weeks)
+ *  can still be re-attributed; the watch loop's cadence keeps the default. */
+export async function discoverClaudeFiles(
+  { maxAgeMs = RECENT_WINDOW_MS }: { maxAgeMs?: number } = {},
+): Promise<DiscoveredFile[]> {
   const out: DiscoveredFile[] = [];
   const now = Date.now();
   let projects: string[];
@@ -92,7 +97,7 @@ export async function discoverClaudeFiles(): Promise<DiscoveredFile[]> {
     if (dir.startsWith(".") || dir === "memory") return;
     const full = path.join(CLAUDE_PROJECTS_DIR, dir);
     const dirStat = await statSafe(full);
-    if (!dirStat?.isDir || now - dirStat.mtimeMs > RECENT_WINDOW_MS) return;
+    if (!dirStat?.isDir || now - dirStat.mtimeMs > maxAgeMs) return;
     for (const f of await readdirSafe(full)) {
       if (f.endsWith(".jsonl")) candidates.push(path.join(full, f));
     }
@@ -100,7 +105,7 @@ export async function discoverClaudeFiles(): Promise<DiscoveredFile[]> {
   await mapPool(candidates, STAT_CONCURRENCY, async (p) => {
     const st = await statSafe(p);
     if (!st || st.isDir || st.size === 0) return;
-    if (now - st.mtimeMs > RECENT_WINDOW_MS) return;
+    if (now - st.mtimeMs > maxAgeMs) return;
     out.push({ path: p, size: st.size, mtimeMs: st.mtimeMs, source: "claude" });
   });
   return out;
@@ -274,10 +279,12 @@ export async function discoverClaudeChildren(): Promise<{
   return { children, runs };
 }
 
-/** All recent Codex rollout jsonls (sessions + archived). */
+/** All recent Codex rollout jsonls (sessions + archived). `maxAgeMs` overrides
+ *  the 30-day window (see {@link discoverClaudeFiles}). */
 export async function discoverCodexFiles({
   includeArchived = true,
-} = {}): Promise<DiscoveredFile[]> {
+  maxAgeMs = RECENT_WINDOW_MS,
+}: { includeArchived?: boolean; maxAgeMs?: number } = {}): Promise<DiscoveredFile[]> {
   const out: DiscoveredFile[] = [];
   const now = Date.now();
   // Collect candidate rollout paths during the walk, then batch the per-file
@@ -309,7 +316,7 @@ export async function discoverCodexFiles({
     // Mirrors the >30-day project-dir skip discoverClaudeFiles already does.
     await mapPool(subdirs, STAT_CONCURRENCY, async (d) => {
       const st = await statSafe(d);
-      if (!st?.isDir || now - st.mtimeMs > RECENT_WINDOW_MS) return;
+      if (!st?.isDir || now - st.mtimeMs > maxAgeMs) return;
       await walk(d);
     });
   }
@@ -318,7 +325,7 @@ export async function discoverCodexFiles({
   await mapPool(candidates, STAT_CONCURRENCY, async (full) => {
     const st = await statSafe(full);
     if (!st || st.isDir || st.size === 0) return;
-    if (now - st.mtimeMs > RECENT_WINDOW_MS) return;
+    if (now - st.mtimeMs > maxAgeMs) return;
     out.push({ path: full, size: st.size, mtimeMs: st.mtimeMs, source: "codex" });
   });
   return out;
@@ -425,8 +432,11 @@ export async function readHead(filePath: string, source: "claude" | "codex"): Pr
   }
 
   // Derive the GitHub repo from the session's cwd (best-effort, fully local).
+  // The filesystem walk is ground truth while the dir exists; the encoded-name
+  // parse is the fallback that still works after an ephemeral workdir (pool
+  // scratch dirs, GC'd at job end) is gone.
   if (out.cwd) {
-    out.repoSlug = await detectRepoSlug(out.cwd);
+    out.repoSlug = (await detectRepoSlug(out.cwd)) ?? repoSlugFromEncodedCwd(out.cwd);
   }
 
   return out;
@@ -454,19 +464,55 @@ async function readOriginSlug(configPath: string): Promise<string | null> {
   } catch {
     return null;
   }
-  // Walk the ini-ish git config for the [remote "origin"] url.
-  let inOrigin = false;
+  // Walk the ini-ish git config across EVERY [remote "…"] section. `origin`
+  // wins when it resolves to GitHub; otherwise the first GitHub remote does —
+  // a fork whose canonical remote is `upstream`, or a clone whose only remote
+  // has another name, still attributes (they used to fall out as null).
+  let currentRemote: string | null = null;
+  let originSlug: string | null = null;
+  let firstSlug: string | null = null;
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     const sec = /^\[(.+)\]$/.exec(line);
     if (sec) {
-      inOrigin = /^remote\s+"origin"$/i.test(sec[1].trim());
+      const m = /^remote\s+"(.+)"$/i.exec(sec[1].trim());
+      currentRemote = m ? m[1] : null;
       continue;
     }
-    if (inOrigin) {
+    if (currentRemote) {
       const u = /^url\s*=\s*(.+)$/i.exec(line);
-      if (u) return normalizeGithubSlug(u[1]);
+      if (u) {
+        const slug = normalizeGithubSlug(u[1]);
+        if (slug) {
+          if (/^origin$/i.test(currentRemote)) originSlug ??= slug;
+          firstSlug ??= slug;
+        }
+      }
     }
+  }
+  return originSlug ?? firstSlug;
+}
+
+/**
+ * Repo slug from an ENCODED path segment — the durable-attribution convention
+ * for ephemeral workdirs: a spawner that clones a repo into a throwaway dir
+ * names it `<prefix>@<owner>@<name>@<rand>` (the forge pool does, via
+ * mkdtemp), so the transcript's cwd itself carries the repo after the dir —
+ * and its .git — are long gone. `@` is not a legal character in GitHub
+ * owner/repo names, and the trailing part must be EXACTLY mkdtemp's 6 random
+ * alphanumerics — both constraints exist to keep an ordinary directory that
+ * happens to contain `@`s (an email-ish name, an npm-scope mirror) from
+ * parsing as a slug: a false positive doesn't just mislabel the session, it
+ * BLOCKS server-side rule repair (a stored slug wins over rules). Deepest
+ * matching segment wins (closest to the actual workdir).
+ */
+export function repoSlugFromEncodedCwd(cwd: string): string | null {
+  const segments = cwd.split(/[\\/]/);
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const m = /^[^@]+@([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)@[A-Za-z0-9]{6}$/.exec(
+      segments[i] ?? "",
+    );
+    if (m) return `${m[1].toLowerCase()}/${m[2].toLowerCase()}`;
   }
   return null;
 }
