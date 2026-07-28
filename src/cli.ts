@@ -12,6 +12,7 @@ import {
 } from "./config.js";
 import { connect } from "./connect.js";
 import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, startWatch, tickOnce } from "./watch.js";
+import { runReattributeSweep } from "./reattribute.js";
 import { getDaemonOps, tailLogs, type DaemonOps, type DaemonState } from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
@@ -440,6 +441,31 @@ async function cmdBackfill(): Promise<void> {
   log("[hx] backfilling tasks + plans for sessions already on disk…");
   const r = await backfillArtifacts(cfg, log);
   log(`done. tasks=${r.tasks} plans=${r.plans} failed=${r.failed}`);
+}
+
+// Manual trigger for the attribution sweep the daemon runs once per detection
+// version on start (reattribute.ts). `--force` re-reports every uploaded file
+// regardless of its version stamp — for re-running after the server side
+// gained a new org rule, without waiting for a version bump.
+//
+// REFUSES while the daemon is running: state.json is process-cached and
+// written whole (see state.ts), so a second process sweeping alongside the
+// daemon would clobber its in-flight upload offsets — a regressed offset means
+// re-uploaded bytes at best. The daemon already sweeps on every start, so the
+// restart path is both the safe and the natural trigger.
+async function cmdReattribute(force: boolean): Promise<void> {
+  const cfg = await ensureConfig();
+  const state = await getDaemonOps().state().catch(() => null);
+  if (state?.pid != null) {
+    log("[hx] the daemon is running — it sweeps attribution on every start.");
+    log("     run `hx restart` to sweep now (or `hx stop` first to sweep from this terminal).");
+    return;
+  }
+  const r = await runReattributeSweep(cfg, cfg.stateScope ?? "main", log, { force });
+  log(
+    `done. reported=${r.sent} attributed=${r.attributed} ` +
+      `unresolved=${r.unresolved} current=${r.skipped}`,
+  );
 }
 
 // How long to wait on the gateway's /whoami lookup before giving up — used by
@@ -1180,6 +1206,9 @@ async function main(): Promise<void> {
     case "backfill":
       await cmdBackfill();
       break;
+    case "reattribute":
+      await cmdReattribute(process.argv.includes("--force"));
+      break;
     case "status":
       await cmdStatus();
       break;
@@ -1232,6 +1261,7 @@ async function main(): Promise<void> {
       log("");
       log("Maintenance:");
       log("  backfill   Upload tasks + plans for sessions already on disk");
+      log("  reattribute  Re-detect + report repo attribution for uploaded sessions");
       log("  retry --blocked  Clear destination backoff and retry immediately");
       log("  update     Fetch the latest hx binary and restart the daemon");
       log("  disconnect Forget the device token");

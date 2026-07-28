@@ -108,6 +108,12 @@ export interface FileState {
   /** Compact operational context only: no transcript content, paths, tokens,
    *  signed URLs, or credentials are ever stored here. */
   blocker?: PersistedSyncBlocker;
+  /** DETECTION_VERSION stamp of the last attribution sweep that covered this
+   *  file (reattribute.ts). Absent/lower ⇒ the next sweep re-reports it. The
+   *  cwd/repoSlug fields above double as the sweep's FIRST-SIGHT cache: they
+   *  were captured while the workdir still existed, so they always win over a
+   *  later re-walk (a REUSED scratch path can resolve to the wrong repo). */
+  attributionVersion?: number;
 }
 
 /** On-disk shape before per-destination fan-out carried a single `offset`. The
@@ -121,6 +127,9 @@ export interface LegacyFileState {
   offsets?: Record<string, number>;
   lastMtimeMs: number;
   lastUploadAtMs: number;
+  repoSlug?: string | null;
+  cwd?: string;
+  attributionVersion?: number;
   lastKnownSize?: number;
   consecutiveFailures?: number;
   nextAttemptAtMs?: number;
@@ -160,6 +169,12 @@ export function migrateFileState(s: LegacyFileState): FileState {
     offsets,
     lastMtimeMs: s.lastMtimeMs,
     lastUploadAtMs: s.lastUploadAtMs,
+    // Attribution capture fields ride through untouched — this migration runs
+    // over EVERY entry at load, so dropping them would erase the first-sight
+    // cache and re-trigger the sweep on every restart.
+    ...(s.repoSlug !== undefined ? { repoSlug: s.repoSlug } : {}),
+    ...(s.cwd !== undefined ? { cwd: s.cwd } : {}),
+    ...(s.attributionVersion !== undefined ? { attributionVersion: s.attributionVersion } : {}),
     lastKnownSize: s.lastKnownSize,
     consecutiveFailures: s.consecutiveFailures,
     nextAttemptAtMs: s.nextAttemptAtMs,

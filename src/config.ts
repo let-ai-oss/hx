@@ -8,6 +8,11 @@ import path from "node:path";
 import { HX_DIR } from "./hx-home.js";
 
 export interface HxConfig {
+  /** Send the session's cwd to the gateway as attribution EVIDENCE (lets
+   *  server-side org rules repair sessions whose repo went undetected). Default
+   *  true; set false on devices whose org considers local paths sensitive —
+   *  detection then relies purely on client-side resolution. */
+  evidenceUpload?: boolean;
   /**
    * The gateway this device talks to — the single source of truth for every
    * command (no env var, no flag, no compile-time default). Seeded by the
