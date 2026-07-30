@@ -190,8 +190,107 @@ export interface EffectiveRootsStamp extends ResolvedRoots {
   resolvedAtMs: number;
 }
 
+/**
+ * What we durably know about ONE fan-out destination, keyed by {@link destKey}.
+ *
+ * A file's `skipReason` and `blocker` are latches — clearFileFailure drops both
+ * on any clean pass — so a destination that flaps (refused, cleared, refused)
+ * is invisible to anything sampling them at a single instant. Measured on a
+ * real device: 29 sessions were refused by offline Fortresses over one day
+ * while `hx status` could name 9, and one Fortress holding 165 MB across 16
+ * sessions appeared in no output at all.
+ *
+ * This record is NOT cleared by a clean pass. It carries the gateway's latest
+ * word on each destination so the per-destination offsets (which say a store
+ * is behind) can be paired with who that store is and whether it is reachable.
+ */
+export interface DestinationRecord {
+  /** null for the let.ai-hosted shared bucket (stored under key "letai"). */
+  vaultOrgId: string | null;
+  /** The gateway's most recent word on this destination. */
+  status: "ready" | "held";
+  /** Retained across status changes so a destination stays nameable after it
+   *  recovers and goes away again. */
+  orgName?: string | null;
+  orgSlug?: string | null;
+  /** Gateway-observed Fortress heartbeat, not transcript activity. */
+  lastSeenAt?: string | null;
+  /** When it first went held with no intervening ready — drives "offline 13d". */
+  heldSinceMs?: number;
+  /** When the gateway last told us anything about it. */
+  observedAtMs: number;
+}
+
+/** One destination as the gateway just described it, narrowed to what we keep. */
+export interface DestinationReport {
+  vaultOrgId: string | null;
+  status: "ready" | "held";
+  orgName?: string | null;
+  orgSlug?: string | null;
+  lastSeenAt?: string | null;
+}
+
+/** Fold the gateway's current destination set into the durable registry.
+ *  Pure so the ready→held→ready transitions are directly testable. */
+export function applyDestinationReports(
+  state: HxState,
+  reports: DestinationReport[],
+  nowMs: number,
+): boolean {
+  if (reports.length === 0) return false;
+  const registry = (state.destinations ??= {});
+  let changed = false;
+  for (const r of reports) {
+    const key = destKey(r.vaultOrgId);
+    const prev = registry[key];
+    const next: DestinationRecord = {
+      vaultOrgId: r.vaultOrgId,
+      status: r.status,
+      // Never overwrite a known label with a blank one: ready destinations
+      // arrive without names, and forgetting the name on recovery would leave
+      // the next outage showing a bare org id.
+      orgName: r.orgName ?? prev?.orgName ?? null,
+      orgSlug: r.orgSlug ?? prev?.orgSlug ?? null,
+      lastSeenAt: r.lastSeenAt ?? prev?.lastSeenAt ?? null,
+      // A ready observation ends the outage; a held one keeps the ORIGINAL
+      // start so "offline 22d" measures the whole outage, not the last retry.
+      heldSinceMs:
+        r.status === "held" ? (prev?.status === "held" ? prev.heldSinceMs : nowMs) : undefined,
+      observedAtMs: nowMs,
+    };
+    if (
+      prev?.status === next.status &&
+      prev.orgName === next.orgName &&
+      prev.orgSlug === next.orgSlug &&
+      prev.lastSeenAt === next.lastSeenAt &&
+      prev.heldSinceMs === next.heldSinceMs
+    ) {
+      // Same facts — refresh the observation stamp without a disk write.
+      prev.observedAtMs = nowMs;
+      continue;
+    }
+    registry[key] = next;
+    changed = true;
+  }
+  return changed;
+}
+
+/** Persist the gateway's current word on this session's fan-out destinations. */
+export async function recordDestinations(
+  reports: DestinationReport[],
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (applyDestinationReports(state, reports, Date.now())) {
+    await schedulePersist(state, scope);
+  }
+}
+
 export interface HxState {
   files: Record<string, FileState>;
+  /** Durable per-destination facts, keyed by {@link destKey}. See
+   *  {@link DestinationRecord} — this is what survives the skipReason latch. */
+  destinations?: Record<string, DestinationRecord>;
   /** Content-hash per uploaded sidecar artifact (key `<family>:<sessionId>:<kind>`)
    *  so tasks/plans only re-upload when their content actually changes. */
   artifacts?: Record<string, string>;
@@ -264,8 +363,47 @@ export async function loadState(scope: StateScope = "main"): Promise<HxState> {
   for (const [k, v] of Object.entries(state.files)) {
     state.files[k] = migrateFileState(v);
   }
+  seedDestinationsFromBlockers(state);
   inMemory.set(scope, state);
   return state;
+}
+
+/**
+ * First run after upgrading: build the destination registry from whatever
+ * persisted blockers happen to be latched right now.
+ *
+ * Without this the registry is empty until the daemon completes a pass, and
+ * until then every waiting session reads as an ordinary backlog — the status
+ * would briefly show a percentage below 100 for stores it already knows are
+ * offline. A latched blocker IS a gateway report that a destination is held,
+ * so it seeds the same fact the next pass would record.
+ *
+ * Seeding only, never maintenance: it runs once (when `destinations` is
+ * absent) and the daemon owns the registry from then on. Relying on these
+ * latches continuously is precisely the bug this registry exists to fix —
+ * any clean pass clears them.
+ */
+export function seedDestinationsFromBlockers(state: HxState): void {
+  if (state.destinations) return;
+  const reports = new Map<string, DestinationReport>();
+  let earliest = Date.now();
+  for (const fs of Object.values(state.files)) {
+    if (!fs.blocker) continue;
+    earliest = Math.min(earliest, fs.blocker.firstSeenAtMs);
+    for (const d of fs.blocker.destinations) {
+      reports.set(destKey(d.vaultOrgId), {
+        vaultOrgId: d.vaultOrgId,
+        status: "held",
+        orgName: d.orgName ?? null,
+        orgSlug: d.orgSlug ?? null,
+        lastSeenAt: d.lastSeenAt ?? null,
+      });
+    }
+  }
+  if (reports.size === 0) return;
+  // Date the seeded outage from the oldest blocker we hold, so an upgrade
+  // doesn't reset a three-week outage to "offline 0d".
+  applyDestinationReports(state, [...reports.values()], earliest);
 }
 
 async function persist(state: HxState, scope: StateScope): Promise<void> {

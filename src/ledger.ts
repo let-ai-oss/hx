@@ -1,0 +1,285 @@
+// The sync ledger: every tracked session sorted into exactly one bucket, and
+// the one percentage `hx status` prints.
+//
+// Why this exists — the old `Sync 97%` was `min(offsets) >= size` folded over
+// every file (see snapshotFrom). Two things made that number unreadable:
+//
+//   1. minOffset() collapses destinations. A session fully delivered to the
+//      primary store but 0% delivered to a second, OFFLINE Fortress scored 0
+//      and counted as "not done". One unreachable destination therefore held
+//      the whole device below 100% forever — the number could only reach 100%
+//      if every Fortress the device had ever fanned out to was simultaneously
+//      online.
+//   2. A live session always has a few unsent bytes between the write and the
+//      next ~1.5s tick, so an in-use machine never sat at 100% either.
+//
+// The percentage here answers "is anything wrong?", not "is every byte
+// everywhere?". Sessions the user cannot act on — a tail still being written,
+// a store that is offline — leave the denominator entirely, so a healthy
+// machine rests at 100%. Leaving 100% now means exactly one of two things: a
+// real backlog that is draining, or real data loss. Both are worth reading.
+
+import { destKey, minOffset, type FileState, type HxState } from "./state.js";
+
+/**
+ * How long after its last write a session still counts as "in progress".
+ *
+ * This is the knob that keeps the number steady. A live jsonl is appended
+ * continuously while the daemon ticks every ~1.5s, so at almost any instant it
+ * has an unsent tail; counting that tail as backlog makes the percentage
+ * twitch off 100% permanently on any machine in use. Generous on purpose — a
+ * session you are merely thinking in must not read as a stalled upload. When
+ * the window lapses the session is reclassified normally, so this delays
+ * classification, it never suppresses it.
+ */
+export const LIVE_WINDOW_MS = 15 * 60_000;
+
+/** Which bucket a session is in. Exactly one per session; they sum to `total`. */
+export type SessionState =
+  /** Reached every destination that is currently reachable. */
+  | "delivered"
+  /** Still being written (inside {@link LIVE_WINDOW_MS}) — excluded from the %. */
+  | "in_progress"
+  /** A REACHABLE destination is still owed bytes — a real backlog, counted. */
+  | "uploading"
+  /** Only OFFLINE destinations are owed bytes — excluded from the %. */
+  | "waiting"
+  /** Source file gone before a reachable destination got the bytes. Permanent. */
+  | "incomplete";
+
+/** A destination owing bytes to at least one waiting session. */
+export interface DestinationLag {
+  /** Stable state key ({@link destKey}) — "letai" for the shared bucket. */
+  key: string;
+  vaultOrgId: string | null;
+  /** Display name: remembered org name, else the raw id. */
+  label: string;
+  /** Distinct sessions in the `waiting` bucket this destination owes bytes to. */
+  sessions: number;
+  /** Sum of those sessions' undelivered bytes to THIS destination. */
+  bytes: number;
+  /** Gateway-observed Fortress heartbeat (ISO), when known. */
+  lastSeenAt: string | null;
+  /** How long it has been offline, in whole days, when known. */
+  offlineDays: number | null;
+}
+
+export interface SyncLedger {
+  total: number;
+  totalBytes: number;
+  delivered: number;
+  inProgress: number;
+  uploading: number;
+  waiting: number;
+  incomplete: number;
+  /** delivered / (delivered + uploading + incomplete), floored. 100 when idle. */
+  percent: number;
+  /** On-disk bytes of the sessions that have actually landed everywhere. */
+  deliveredBytes: number;
+  /** Undelivered bytes to reachable destinations — the real backlog. */
+  uploadingBytes: number;
+  /** Bytes still owed to offline stores, counted ONCE per session (its largest
+   *  single-destination debt). The per-destination totals in `lagging` do
+   *  double-count a fanned-out session, deliberately — each store really is
+   *  owed those bytes — but a headline "held" figure must not. */
+  waitingBytes: number;
+  /** Offline destinations holding waiting sessions, worst (oldest) first. */
+  lagging: DestinationLag[];
+}
+
+/** A discovered file, narrowed to what classification needs. */
+export interface LedgerFile {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+export interface LedgerInput {
+  /** The ELECTED, watched files — one per session (twins already shadowed). */
+  files: LedgerFile[];
+  state: HxState;
+  /** Distinct session ids whose source vanished mid-upload (permanently partial). */
+  incompleteSessions: number;
+  nowMs: number;
+  /** vaultOrgId → friendly name, from the org-names cache. */
+  orgNames?: Record<string, string>;
+}
+
+/**
+ * Is this destination known to be unreachable right now?
+ *
+ * Read from the DURABLE registry, never from a file's `skipReason`/`blocker`:
+ * both of those are latches that any clean pass clears, so a destination that
+ * flaps is invisible to whichever instant the status happens to sample. That
+ * is what hid an offline Fortress holding 165 MB across 16 sessions while
+ * `hx status` named only the few files whose latch was set at the time.
+ *
+ * The primary shared bucket is never treated as offline: a total gateway
+ * outage is reported by the connection probe, and excusing the primary would
+ * let the device claim 100% while nothing at all was being delivered.
+ */
+export function isDestinationOffline(state: HxState, key: string): boolean {
+  if (key === destKey(null)) return false;
+  return state.destinations?.[key]?.status === "held";
+}
+
+/** Per-destination undelivered bytes for one file, split by reachability. */
+function lagOf(
+  fs: FileState | undefined,
+  size: number,
+  state: HxState,
+): { reachable: number; offline: Map<string, number> } {
+  const offline = new Map<string, number>();
+  let reachable = 0;
+  // A file with no recorded offsets has never been sent anywhere; bill it to
+  // the primary destination so it reads as backlog rather than vanishing.
+  const offsets = fs?.offsets ?? {};
+  const keys = Object.keys(offsets);
+  if (keys.length === 0) return { reachable: size, offline };
+  for (const key of keys) {
+    const pending = size - (offsets[key] ?? 0);
+    if (pending <= 0) continue;
+    if (isDestinationOffline(state, key)) offline.set(key, pending);
+    else reachable += pending;
+  }
+  return { reachable, offline };
+}
+
+/** Classify one discovered file. `incomplete` is decided elsewhere (the source
+ *  is gone, so there is no file here to classify). */
+export function classifyFile(
+  file: LedgerFile,
+  state: HxState,
+  nowMs: number,
+): { state: Exclude<SessionState, "incomplete">; reachableBytes: number; offline: Map<string, number> } {
+  const fs = state.files[file.path];
+  const { reachable, offline } = lagOf(fs, file.size, state);
+  // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session being
+  // written is never a backlog and never a fault, whatever it still owes.
+  if (nowMs - file.mtimeMs < LIVE_WINDOW_MS) {
+    return { state: "in_progress", reachableBytes: reachable, offline };
+  }
+  if (reachable > 0) return { state: "uploading", reachableBytes: reachable, offline };
+  if (offline.size > 0) return { state: "waiting", reachableBytes: 0, offline };
+  return { state: "delivered", reachableBytes: 0, offline };
+}
+
+function offlineDaysOf(state: HxState, key: string, nowMs: number): number | null {
+  const since = state.destinations?.[key]?.heldSinceMs;
+  if (since === undefined) return null;
+  return Math.floor((nowMs - since) / 86_400_000);
+}
+
+/** Fold discovered files + persisted offsets into the ledger `hx status` prints. */
+export function buildLedger(input: LedgerInput): SyncLedger {
+  const { files, state, incompleteSessions, nowMs } = input;
+  const orgNames = input.orgNames ?? {};
+
+  let delivered = 0;
+  let inProgress = 0;
+  let uploading = 0;
+  let waiting = 0;
+  let totalBytes = 0;
+  let deliveredBytes = 0;
+  let uploadingBytes = 0;
+  let waitingBytes = 0;
+  const lag = new Map<string, { sessions: number; bytes: number }>();
+
+  for (const file of files) {
+    totalBytes += file.size;
+    const c = classifyFile(file, state, nowMs);
+    switch (c.state) {
+      case "delivered":
+        delivered += 1;
+        deliveredBytes += file.size;
+        break;
+      case "in_progress":
+        inProgress += 1;
+        break;
+      case "uploading":
+        uploading += 1;
+        uploadingBytes += c.reachableBytes;
+        break;
+      case "waiting": {
+        waiting += 1;
+        // Only `waiting` sessions are billed to a destination, so the per-
+        // destination counts and the Waiting total describe the same set. They
+        // still sum to MORE than `waiting` when a session fans out to several
+        // offline Fortresses — that overlap is real and is spelled out in the
+        // detailed view rather than hidden by picking one owner.
+        let largestDebt = 0;
+        for (const [key, pending] of c.offline) {
+          const entry = lag.get(key) ?? { sessions: 0, bytes: 0 };
+          entry.sessions += 1;
+          entry.bytes += pending;
+          lag.set(key, entry);
+          largestDebt = Math.max(largestDebt, pending);
+        }
+        // Once per session, not once per destination: a session owed to three
+        // offline Fortresses is still one session's worth of held bytes.
+        waitingBytes += largestDebt;
+        break;
+      }
+    }
+  }
+
+  const sendable = delivered + uploading + incompleteSessions;
+  const percent = sendable === 0 ? 100 : Math.floor((delivered / sendable) * 100);
+
+  const lagging: DestinationLag[] = [...lag.entries()]
+    .map(([key, v]) => {
+      const record = state.destinations?.[key];
+      const vaultOrgId = record?.vaultOrgId ?? (key === destKey(null) ? null : key);
+      const label = (vaultOrgId && orgNames[vaultOrgId]) || record?.orgName || vaultOrgId || key;
+      return {
+        key,
+        vaultOrgId,
+        label,
+        sessions: v.sessions,
+        bytes: v.bytes,
+        lastSeenAt: record?.lastSeenAt ?? null,
+        offlineDays: offlineDaysOf(state, key, nowMs),
+      };
+    })
+    // Longest outage first: the one most likely to need a decision leads.
+    .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
+
+  return {
+    total: files.length + incompleteSessions,
+    totalBytes,
+    delivered,
+    inProgress,
+    uploading,
+    waiting,
+    incomplete: incompleteSessions,
+    percent,
+    deliveredBytes,
+    uploadingBytes,
+    waitingBytes,
+    lagging,
+  };
+}
+
+/** "offline 13d" reads well; "offline 0d" reads like a bug. Below a day say so
+ *  in words, and say nothing definite when the outage start is unknown. */
+export function formatOutage(days: number | null): string {
+  if (days === null) return "offline";
+  if (days < 1) return "offline since today";
+  return `offline ${days}d`;
+}
+
+/** How long a destination must be offline before waiting stops being a plan
+ *  and the user is asked to make a call. */
+export const NEEDS_YOU_DAYS = 7;
+
+/** Destinations offline long enough that they will not fix themselves. */
+export function needsAttention(ledger: SyncLedger): DestinationLag[] {
+  return ledger.lagging.filter((d) => (d.offlineDays ?? 0) >= NEEDS_YOU_DAYS);
+}
+
+/** Legacy single-number view, kept for the gateway's sync-status wire format.
+ *  Uses minOffset deliberately: the server-side bar predates the ledger. */
+export function legacyDone(fs: FileState | undefined, size: number): boolean {
+  if (!fs) return false;
+  return minOffset(fs) >= size && !fs.skipReason;
+}
