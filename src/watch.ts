@@ -53,6 +53,7 @@ import {
   offsetFor,
   recordHeal,
   reconcileDestinations,
+  recordDestinations,
   persistState,
   setArtifactHash,
   setOffsetFor,
@@ -63,7 +64,8 @@ import {
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
-import { rememberOrgNames } from "./org-names.js";
+import { readOrgNames, rememberOrgNames } from "./org-names.js";
+import { buildLedger, type SyncLedger } from "./ledger.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
@@ -533,6 +535,20 @@ async function ingestOne(
       await reconcileDestinations(
         file.path,
         append.destinations.map((d) => destKey(d.vaultOrgId)),
+        scope,
+      );
+      // Remember WHO each destination is and whether it is reachable, durably.
+      // The per-file skipReason/blocker are cleared by any clean pass, so they
+      // cannot answer "which Fortress is this session waiting on?" a moment
+      // later; the registry can, and `hx status` reads it instead of the latch.
+      await recordDestinations(
+        append.destinations.map((d) => ({
+          vaultOrgId: d.vaultOrgId ?? null,
+          status: d.status === "held" ? ("held" as const) : ("ready" as const),
+          orgName: "orgName" in d ? d.orgName : null,
+          orgSlug: "orgSlug" in d ? d.orgSlug : null,
+          lastSeenAt: "lastSeenAt" in d ? d.lastSeenAt : null,
+        })),
         scope,
       );
     }
@@ -1416,6 +1432,10 @@ export interface SyncReport {
   snapshot: SyncSnapshot;
   behind: SyncBehindEntry[];
   skipped: SyncSkippedEntry[];
+  /** Every session in exactly one bucket, plus the health percentage `hx
+   *  status` prints. Derived from per-destination offsets + the durable
+   *  destination registry, so it sees holds the transient skipReason misses. */
+  ledger: SyncLedger;
   /** DISTINCT partially-uploaded sessions sitting under NO current data root
    *  — a root was removed (or the daemon hasn't adopted one yet). They are
    *  not "behind" (nothing will ever pick them up under the current config),
@@ -1486,6 +1506,17 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
     behind,
     skipped: collectSkipped(elected, state),
     unwatched,
+    ledger: buildLedger({
+      files: elected,
+      state,
+      // DISTINCT sessions whose source vanished mid-upload — the server copy
+      // stays partial forever. Deduped here because one session can leave two
+      // file entries behind (a cwd-change twin), and double-billing would put
+      // the ledger's parts above its own total.
+      incompleteSessions: new Set(behind.map((b) => b.sessionId)).size,
+      nowMs: Date.now(),
+      orgNames: await readOrgNames().catch(() => ({})),
+    }),
   };
 }
 

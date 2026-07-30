@@ -27,6 +27,7 @@ import {
   formatStatusBlocker,
   formatSyncDoctorText,
 } from "./diagnostics.js";
+import { formatOutage, needsAttention, type SyncLedger } from "./ledger.js";
 import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
 import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
 import { loadState, resetStateCache } from "./state.js";
@@ -534,6 +535,10 @@ async function resolveLoggedInEmail(cfg: HxConfig): Promise<string | null> {
 }
 
 async function cmdStatus(): Promise<void> {
+  // `hx status --detailed` is the full ledger + per-destination remediation.
+  // Same report `hx doctor sync` has always printed, reachable from the command
+  // people actually run — rather than a third surface over the same data.
+  if (hasFlag("detailed")) return cmdSyncDetail();
   const cfg = await readConfig();
   if (!cfg) {
     log("Connection: down — not connected (run `hx connect`)");
@@ -628,60 +633,112 @@ async function cmdStatus(): Promise<void> {
     `up — ${probe.quality} (${probe.latencyMs} ms, ${formatRate(probe.bytesPerSec)})`,
   ]);
 
-  // Catch-up progress: percentage first, then sessions, then the total size of
-  // all sessions on disk.
-  const snap = report?.snapshot ?? null;
-  if (snap && snap.total > 0) {
-    const size = formatSize(snap.totalBytes);
-    rows.push([
-      "Sync",
-      snap.done >= snap.total
-        ? `100% — ${snap.total} session${snap.total === 1 ? "" : "s"} · ${size}`
-        // Floor, never round: a 199/200 backlog must read 99%, not a lying
-        // "100%" next to an unfinished count.
-        : `${Math.floor((snap.done / snap.total) * 100)}% — ${snap.done} / ${snap.total} sessions · ${size}`,
-    ]);
-  }
-  // Sessions the bar can no longer see: their source file vanished (or left
-  // the scan window) before the upload finished, so the server copy is
-  // permanently partial. Without this row the status silently claims 100%.
-  if (report && report.behind.length > 0) {
-    // Classify each session ONCE: a session with both a deleted path and an
-    // aged-out path counts as "deleted" (the stronger signal), never in both
-    // buckets — otherwise the two counts could sum to more than the sessions.
-    const goneSessions = new Set(
-      report.behind.filter((b) => b.sourceGone).map((b) => b.sessionId),
-    );
-    const agedSessions = new Set<string>();
-    for (const b of report.behind) {
-      if (!b.sourceGone && !goneSessions.has(b.sessionId)) agedSessions.add(b.sessionId);
+  // The health ledger. Every session sits in exactly one bucket and the
+  // buckets sum to the total, so the headline percentage can be checked
+  // against the rows under it rather than taken on faith.
+  const ledger = report?.ledger ?? null;
+  if (ledger && ledger.total > 0) {
+    rows.push(["Sessions", `${ledger.total} on this device · ${formatSize(ledger.totalBytes)}`]);
+    rows.push(["Sync", syncVerdict(ledger)]);
+    rows.push(["  Delivered", `${sessions(ledger.delivered)} · ${formatSize(ledger.deliveredBytes)}`]);
+    // Ordered by how much they matter, not by severity: the two healthy rows
+    // sit together under the number, and anything wrong gets its own box.
+    if (ledger.uploading > 0) {
+      rows.push([
+        "  Uploading",
+        `${sessions(ledger.uploading)} · ${formatSize(ledger.uploadingBytes)} left`,
+      ]);
     }
-    const parts: string[] = [];
-    if (goneSessions.size > 0) {
-      parts.push(`${goneSessions.size} partial on server (local file deleted)`);
+    if (ledger.inProgress > 0) {
+      rows.push(["  In progress", `${sessions(ledger.inProgress)} · being written right now`]);
     }
-    if (agedSessions.size > 0) {
-      parts.push(`${agedSessions.size} partial on server (last change over 30 days ago)`);
-    }
-    if (parts.length > 0) rows.push(["Sync gaps", parts.join("; ")]);
   }
   // Partially-synced sessions under locations no longer watched (a data root
   // was removed). Nothing will pick these up under the current config, so
-  // they get one informational row instead of nagging "Sync gaps" forever.
+  // they get one informational row instead of nagging forever.
   if (report && report.unwatched > 0) {
     rows.push([
       "Unwatched",
       `${report.unwatched} partially-synced session${report.unwatched === 1 ? "" : "s"} under locations no longer watched`,
     ]);
   }
-  // Sessions paused on a temporarily-unavailable store. Transient (they resume
-  // on their own), so this is a distinct, softer signal from the "Sync gaps"
-  // above — the upload isn't lost, it's waiting and retrying.
-  if (report && report.skipped.length > 0) {
-    rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
-    rows.push(["Details", "hx doctor sync"]);
+
+  // Real loss gets its own box ABOVE the reassuring one, so it can never be
+  // read as part of the waiting story. This is the only thing that moves the
+  // percentage off 100%.
+  const lossRows: Array<[string, string]> = [];
+  if (ledger && ledger.incomplete > 0) {
+    // "gone", not "deleted": the source may have been removed OR simply aged
+    // out of the 30-day discovery window. --detailed splits the two.
+    lossRows.push([
+      "Incomplete",
+      `${sessions(ledger.incomplete)} · source file gone before upload finished`,
+    ]);
+    lossRows.push(["  Recover", "hx status --detailed explains each one"]);
   }
-  printStatusTable(rows);
+
+  // Sessions only an offline store still owes bytes to. Never suppressed when
+  // non-zero: printing 100% above is honest ONLY because this box is always
+  // adjacent to it. Its first row says "nothing lost" before naming anything.
+  const waitRows: Array<[string, string]> = [];
+  if (ledger && ledger.waiting > 0) {
+    waitRows.push([
+      "Waiting",
+      `${sessions(ledger.waiting)} · nothing lost, all still on disk`,
+    ]);
+    waitRows.push(["  Fortresses", formatLagging(ledger)]);
+    const attention = needsAttention(ledger);
+    if (attention.length > 0) {
+      waitRows.push([
+        "  Needs you",
+        attention.map((d) => `${d.label} offline ${d.offlineDays}d`).join(" · "),
+      ]);
+    }
+    waitRows.push(["Details", "hx status --detailed"]);
+  }
+
+  // Each box is one idea: the device and its health; what was lost; what is
+  // merely waiting. Shared widths keep their edges aligned, and a blank line
+  // separates them so two adjacent borders don't read as one heavy rule.
+  const widths = sharedTableWidths(rows, lossRows, waitRows);
+  printStatusTable(rows, widths);
+  for (const box of [lossRows, waitRows]) {
+    if (box.length === 0) continue;
+    log("");
+    printStatusTable(box, widths);
+  }
+}
+
+function sessions(n: number): string {
+  return `${n} session${n === 1 ? "" : "s"}`;
+}
+
+/** The headline. A percentage only ever appears with what it is a percentage
+ *  OF, and the words name the DOMINANT reason it is not 100%. */
+function syncVerdict(ledger: SyncLedger): string {
+  // A backlog outranks loss here even though loss is worse. The percentage is
+  // driven by whatever is biggest, and naming the 50 lost sessions while 536
+  // are still uploading would blame the wrong thing for the number. Loss is
+  // never buried — it has its own box directly underneath.
+  if (ledger.uploading > 0) {
+    return `${ledger.percent}% — catching up · ${formatSize(ledger.uploadingBytes)} left`;
+  }
+  if (ledger.incomplete > 0) {
+    return `${ledger.percent}% — ${sessions(ledger.incomplete)} incomplete`;
+  }
+  if (ledger.waiting > 0) return `${ledger.percent}% — everything that can be sent, is sent`;
+  return `${ledger.percent}% — all sessions sent`;
+}
+
+/** Name the offline stores when there are few enough to read; count them
+ *  otherwise. One offline Fortress is the common case and deserves its name. */
+function formatLagging(ledger: SyncLedger): string {
+  const { lagging } = ledger;
+  if (lagging.length === 1) {
+    const d = lagging[0]!;
+    return `${d.label} · ${formatOutage(d.offlineDays)} · retrying automatically`;
+  }
+  return `${lagging.length} offline · retrying automatically`;
 }
 
 /** The roots to DESCRIBE from the CLI: the daemon's stamp when present
@@ -710,12 +767,10 @@ function formatRootsRow(roots: ResolvedRoots): string {
     .join(" · ");
 }
 
-async function cmdDoctor(): Promise<void> {
-  if (process.argv[3] !== "sync") {
-    log("usage: hx doctor sync [--json]");
-    process.exitCode = 64;
-    return;
-  }
+/** The full sync ledger + per-destination remediation. Backs both
+ *  `hx status --detailed` and the older `hx doctor sync` spelling, so the two
+ *  can never drift apart. */
+async function cmdSyncDetail(): Promise<void> {
   const cfg = await ensureConfig();
   const settings = await readSettings();
   const { roots } = await effectiveRootsForCli(settings);
@@ -724,6 +779,15 @@ async function cmdDoctor(): Promise<void> {
   if (hasFlag("json")) log(JSON.stringify(doctor, null, 2));
   else log(formatSyncDoctorText(doctor));
   if (!doctor.ok) process.exitCode = 1;
+}
+
+async function cmdDoctor(): Promise<void> {
+  if (process.argv[3] !== "sync") {
+    log("usage: hx doctor sync [--json]   (same as `hx status --detailed`)");
+    process.exitCode = 64;
+    return;
+  }
+  await cmdSyncDetail();
 }
 
 async function cmdRetry(): Promise<void> {
@@ -776,16 +840,32 @@ function formatSize(bytes: number): string {
 // box-drawing characters, so the output stays grep-friendly. Columns size to
 // content; .length / .padEnd are exact here because every glyph in the values
 // (—, ·, the box characters) is a single UTF-16 code unit.
-function printStatusTable(rows: Array<[string, string]>): void {
+/** Column widths shared by a run of stacked tables, so their edges line up.
+ *  `hx status` prints health, loss and waiting as separate boxes; sizing each
+ *  independently would step their right edges in and out down the screen. */
+export function sharedTableWidths(...groups: Array<Array<[string, string]>>): TableWidths {
+  const rows = groups.flat();
+  return {
+    label: Math.max(0, ...rows.map(([k]) => k.length)),
+    value: Math.max(0, ...rows.map(([, v]) => v.length)),
+  };
+}
+
+export interface TableWidths {
+  label: number;
+  value: number;
+}
+
+function printStatusTable(rows: Array<[string, string]>, min?: TableWidths): void {
   if (rows.length === 0) return;
-  const labelW = Math.max(...rows.map(([k]) => k.length));
+  const labelW = Math.max(min?.label ?? 0, ...rows.map(([k]) => k.length));
 
   if (!process.stdout.isTTY) {
     for (const [k, v] of rows) log(`${`${k}:`.padEnd(labelW + 1)} ${v}`);
     return;
   }
 
-  const valueW = Math.max(...rows.map(([, v]) => v.length));
+  const valueW = Math.max(min?.value ?? 0, ...rows.map(([, v]) => v.length));
   const utf8 = /utf-?8/i.test(
     process.env.LC_ALL ?? process.env.LC_CTYPE ?? process.env.LANG ?? "",
   );
@@ -1254,8 +1334,8 @@ async function main(): Promise<void> {
       log("  start      Install + run as a background service (run by connect)");
       log("  stop       Pause the background service");
       log("  restart    Reload + restart the background service");
-      log("  status     Show connection status and link quality");
-      log("  doctor sync  Explain blocked sessions (pass --json for automation)");
+      log("  status     Show connection status, link quality and sync health");
+      log("             --detailed  Full ledger + why anything is waiting (--json too)");
       log("  logs       Tail the daemon's stdout / stderr");
       log("  ui         Open the local HX Client UI (http://localhost:8000; --port, --no-open)");
       log("");

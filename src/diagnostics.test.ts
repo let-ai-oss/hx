@@ -6,11 +6,18 @@ import {
   formatSyncDoctorText,
 } from "./diagnostics.js";
 import type { SyncReport } from "./watch.js";
+import { buildLedger } from "./ledger.js";
+
+/** Real (empty) ledger — the doctor report reads only the blocker fields, so
+ *  these fixtures exercise the same shape computeSyncReport produces. */
+const noLedger = (): SyncReport["ledger"] =>
+  buildLedger({ files: [], state: { files: {} }, incompleteSessions: 0, nowMs: 0 });
 
 const blockedReport = (): SyncReport => ({
   snapshot: { total: 777, done: 775, totalBytes: 10 },
   behind: [],
   unwatched: 0,
+  ledger: noLedger(),
   skipped: ["s1", "s2"].map((sessionId, index) => ({
     path: `/private/${sessionId}.jsonl`,
     family: "claude-cli",
@@ -80,7 +87,13 @@ describe("sync diagnostics", () => {
 
   it("reports a fully caught-up client as healthy", () => {
     const out = buildSyncDoctorReport(
-      { snapshot: { total: 12, done: 12, totalBytes: 50 }, behind: [], skipped: [], unwatched: 0 },
+      {
+        snapshot: { total: 12, done: 12, totalBytes: 50 },
+        behind: [],
+        skipped: [],
+        unwatched: 0,
+        ledger: noLedger(),
+      },
       "https://beta.let.ai/_api/hx-gateway",
       0,
     );

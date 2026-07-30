@@ -1,6 +1,7 @@
 import type { SyncReport, SyncSkippedEntry } from "./watch.js";
 import type { FileSkipReason, SyncBlockerDestination } from "./state.js";
 import type { ResolvedRoots, RootOrigin } from "./roots.js";
+import { formatOutage, type SyncLedger } from "./ledger.js";
 import { collapseHome } from "./settings.js";
 
 export interface DoctorSession {
@@ -49,6 +50,10 @@ export interface SyncDoctorReport {
     outsideScanWindow: number;
   };
   blockers: DoctorBlocker[];
+  /** Every session in exactly one bucket + the health percentage. Unlike
+   *  `sync` above (a min-across-destinations count kept for the gateway's
+   *  wire format) this is what `hx status` shows. */
+  ledger: SyncLedger;
   /** The data roots the report was computed over (empty on legacy callers). */
   roots: DoctorRoot[];
   /** Partially-synced sessions under no current root (a removed data root) —
@@ -205,6 +210,7 @@ export function buildSyncDoctorReport(
       outsideScanWindow: aged.size,
     },
     blockers,
+    ledger: report.ledger,
     roots: roots
       ? [
           ...roots.claude.map((r): DoctorRoot => ({ family: "claude", configDir: r.configDir, origin: r.origin, exists: r.exists })),
@@ -244,11 +250,73 @@ export function formatStatusBlocker(skipped: SyncSkippedEntry[], nowMs = Date.no
   return `${sessions} session${sessions === 1 ? "" : "s"} — ${org} Fortress offline${heartbeat}${repo}`;
 }
 
-export function formatSyncDoctorText(report: SyncDoctorReport): string {
+/** Right-align a count in a fixed gutter so the bucket column scans. */
+function num(n: number, width = 6): string {
+  return String(n).padStart(width);
+}
+
+/**
+ * The session ledger, shown with its arithmetic. Printing the sum and the
+ * formula makes the headline percentage auditable — a reader can check that
+ * the buckets account for every session rather than trusting the number.
+ */
+export function formatLedgerSection(ledger: SyncLedger): string[] {
   const lines = [
-    "HX sync doctor",
-    `Sync: ${report.sync.percent}% — ${report.sync.done} / ${report.sync.total} sessions`,
+    "",
+    "SESSIONS",
+    `  Delivered   ${num(ledger.delivered)}   reached every reachable destination`,
   ];
+  if (ledger.uploading > 0) {
+    lines.push(`  Uploading   ${num(ledger.uploading)}   bytes still going to a reachable store`);
+  }
+  if (ledger.inProgress > 0) {
+    lines.push(`  In progress ${num(ledger.inProgress)}   still being written`);
+  }
+  if (ledger.waiting > 0) {
+    lines.push(`  Waiting     ${num(ledger.waiting)}   an offline Fortress owes bytes`);
+  }
+  if (ledger.incomplete > 0) {
+    lines.push(`  Incomplete  ${num(ledger.incomplete)}   source file gone before upload finished`);
+  }
+  lines.push(`              ${"─".repeat(6)}`);
+  lines.push(`              ${num(ledger.total)}`);
+  const sendable = ledger.delivered + ledger.uploading + ledger.incomplete;
+  lines.push(
+    `  Sync ${ledger.percent}% = ${ledger.delivered} delivered / ${sendable} sendable` +
+      ` (in-progress and waiting sessions are excluded — nothing you can act on)`,
+  );
+  if (ledger.lagging.length > 0) {
+    lines.push("");
+    lines.push("OFFLINE DESTINATIONS");
+    for (const d of ledger.lagging) {
+      const seen = d.lastSeenAt ? ` · last seen ${d.lastSeenAt}` : " · never seen";
+      lines.push(`  ${d.label}  —  ${d.sessions} waiting · ${formatOutage(d.offlineDays)}${seen}`);
+    }
+    lines.push(
+      "  Counts overlap where one session fans out to more than one Fortress.",
+    );
+  }
+  return lines;
+}
+
+/** Session ids shown per destination before the list is summarised. A device
+ *  fanning a whole history at an offline store lists hundreds otherwise, which
+ *  buries the remediation links under an unreadable wall. Automation reads
+ *  `--json`, which is never truncated. */
+const MAX_LISTED_SESSIONS = 8;
+
+function formatSessionList(sessions: DoctorSession[]): string {
+  const shown = sessions.slice(0, MAX_LISTED_SESSIONS);
+  const rest = sessions.length - shown.length;
+  const list = shown.map((s) => `${s.family}:${s.sessionId}`).join(", ");
+  return rest > 0 ? `${list} …and ${rest} more (see --json)` : list;
+}
+
+export function formatSyncDoctorText(report: SyncDoctorReport): string {
+  // Lead with the ledger percentage, not report.sync — the latter is the
+  // min-across-destinations count kept for the gateway wire format, and it
+  // would contradict the number `hx status` just printed.
+  const lines = ["HX sync — detailed", ...formatLedgerSection(report.ledger).slice(1)];
   if (report.roots.length > 0) {
     lines.push(
       `Watching: ${report.roots
@@ -273,9 +341,7 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
       lines.push(`  Fix: ${blocker.remediation.guidance}`);
       if (d?.lastSeenAt) lines.push(`  Fortress last heartbeat: ${d.lastSeenAt}`);
       if (blocker.nextRetryAt) lines.push(`  Next automatic retry: ${blocker.nextRetryAt}`);
-      lines.push(
-        `  Sessions: ${blocker.sessions.map((session) => `${session.family}:${session.sessionId}`).join(", ")}`,
-      );
+      lines.push(`  Sessions: ${formatSessionList(blocker.sessions)}`);
       if (blocker.remediation.fortressSettingsUrl) {
         lines.push(`  Fortress settings: ${blocker.remediation.fortressSettingsUrl}`);
       }
@@ -298,6 +364,15 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     lines.push("");
     lines.push(
       `Unwatched: ${report.unwatchedSessions} partially-synced session${report.unwatchedSessions === 1 ? "" : "s"} under locations no longer watched (removed data root)`,
+    );
+  }
+  // Held is not lost. Say so explicitly: four warning paragraphs above read as
+  // data loss without it, and the whole point of excluding waiting sessions
+  // from the percentage is that they are safe on disk.
+  if (report.ledger.waiting > 0) {
+    lines.push("");
+    lines.push(
+      `Nothing is lost — all ${report.ledger.waiting} waiting session${report.ledger.waiting === 1 ? " is" : "s are"} still on disk and retrying.`,
     );
   }
   if (report.ok) lines.push("Result: healthy — 100% uploaded");
