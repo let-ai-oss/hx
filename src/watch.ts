@@ -366,9 +366,14 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
 
 /**
  * Drop files the device's settings keep local (excluded folders, path rules,
- * personal gate). Matching happens on the persisted state identity; a file
- * with no state entry yet passes — its first ingest seeds the entry and the
- * pre-upload check in tickOnce keeps its bytes on the machine.
+ * personal gate) and sessions the server has permanently deleted (tombstoned):
+ * those never upload again by design, so they must not count against the sync
+ * surface either — a deleted session otherwise reads "1 session pending" in
+ * `hx status` forever. Matching happens on the persisted state identity; a
+ * file with no state entry yet passes — its first ingest seeds the entry, the
+ * pre-upload check in tickOnce keeps its bytes on the machine, and a
+ * tombstoned one's first attempt 410s, records the tombstone, and drops out
+ * of this surface on the next pass.
  */
 export function filterWatched(
   files: DiscoveredFile[],
@@ -378,6 +383,7 @@ export function filterWatched(
   return files.filter((f) => {
     const fs = state.files[f.path];
     if (!fs) return true;
+    if (isDeletedSession(state, fs.family, fs.sessionId)) return false;
     return !shouldSkipFile(settings, fs);
   });
 }
