@@ -1,6 +1,6 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
-import { filterWatched, snapshotFrom } from "./watch.js";
+import { collectBehind, filterWatched, snapshotFrom } from "./watch.js";
 import { DEFAULT_SETTINGS, type HxSettings } from "./settings.js";
 import type { DiscoveredFile } from "./sources.js";
 import type { FileState, HxState } from "./state.js";
@@ -47,8 +47,9 @@ describe("filterWatched", () => {
   });
 
   it("still passes an untracked file even when its session is tombstoned", () => {
-    // No state entry means no identity to match here — the first attempt 410s,
-    // records the tombstone, and the NEXT pass drops the file above.
+    // No state entry means no identity to match here — the tick seeds the
+    // entry and its local tombstone check (or, if the tombstone was lost, one
+    // 410 round trip) stops the upload; the next pass drops the file above.
     const s: HxState = { files: {}, deletedSessions: { "claude-cli:/c": 1 } };
     assert.deepEqual(filterWatched([file("/c")], s, DEFAULT_SETTINGS).map((f) => f.path), ["/c"]);
   });
@@ -60,5 +61,22 @@ describe("filterWatched", () => {
     const snap = snapshotFrom(filterWatched(files, s, DEFAULT_SETTINGS), s);
     assert.equal(snap.total, 2);
     assert.equal(snap.totalBytes, 20);
+  });
+
+  it("keeps a tombstoned session out of the behind/unwatched fold too", () => {
+    // Same contract once the file ages past the discovery window: a deleted
+    // session is neither "behind" nor "unwatched" — without the gate it would
+    // resurface in Sync gaps and redden `hx doctor sync` after ~30 days.
+    const p = "/home/u/.claude/projects/x/gone.jsonl";
+    const roots = [{ configDir: "/home/u/.claude", origin: "default" as const, exists: true }];
+    const base: HxState = {
+      files: { [p]: entry(p, { lastKnownSize: 10, offsets: {} }) },
+    };
+    const withoutTombstone = collectBehind(base, new Set(), new Set(), roots);
+    assert.equal(withoutTombstone.behind.length, 1);
+    const s: HxState = { ...base, deletedSessions: { [`claude-cli:${p}`]: 1 } };
+    const withTombstone = collectBehind(s, new Set(), new Set(), roots);
+    assert.equal(withTombstone.behind.length, 0);
+    assert.equal(withTombstone.unwatched, 0);
   });
 });

@@ -371,9 +371,10 @@ async function ensureFileState(file: DiscoveredFile, scope: StateScope): Promise
  * surface either — a deleted session otherwise reads "1 session pending" in
  * `hx status` forever. Matching happens on the persisted state identity; a
  * file with no state entry yet passes — its first ingest seeds the entry, the
- * pre-upload check in tickOnce keeps its bytes on the machine, and a
- * tombstoned one's first attempt 410s, records the tombstone, and drops out
- * of this surface on the next pass.
+ * pre-upload check in tickOnce keeps its bytes on the machine, and the tick's
+ * own tombstone check stops a deleted session locally before any request;
+ * only a device that LOST the tombstone pays one 410 round trip to re-learn
+ * it, after which the file drops out of this surface on the next pass.
  */
 export function filterWatched(
   files: DiscoveredFile[],
@@ -1508,6 +1509,12 @@ export function collectBehind(
   const unwatchedSessions = new Set<string>();
   for (const [p, fs] of Object.entries(state.files)) {
     if (discovered.has(p)) continue;
+    // Server-deleted (tombstoned) sessions never upload again by design — they
+    // are neither behind nor unwatched, the same exclusion filterWatched
+    // applies to the live surface. Without this the phantom that filter fixes
+    // re-materializes here (and reddens `hx doctor sync`) once the file ages
+    // past the discovery window.
+    if (isDeletedSession(state, fs.family, fs.sessionId)) continue;
     if (liveSessions.has(`${fs.family}:${fs.sessionId}`)) continue; // shadowed twin
     if (fs.lastKnownSize === undefined) continue; // legacy entry — size unknown
     const uploaded = minOffset(fs);
