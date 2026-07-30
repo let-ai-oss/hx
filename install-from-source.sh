@@ -7,7 +7,7 @@
 # URL into ~/.let/hx/config.json and the interactive `hx connect` device flow
 # (which opens your browser) — is identical to the binary installer.
 #
-# Usage (the gateway URL is optional and defaults to beta, i.e. current prod):
+# Usage (the gateway URL is optional and defaults to production, let.ai):
 #
 #   ./install-from-source.sh [gateway-url]
 #
@@ -19,7 +19,7 @@ INSTALL_DIR="${HOME}/.let/bin"
 BIN="${INSTALL_DIR}/hx"
 HX_DIR="${HOME}/.let/hx"
 CONFIG="${HX_DIR}/config.json"
-DEFAULT_GATEWAY_URL="https://beta.let.ai/_api/hx-gateway"
+DEFAULT_GATEWAY_URL="https://let.ai/_api/hx-gateway"
 
 usage() {
   echo "usage: ./install-from-source.sh [gateway-url]" >&2
@@ -27,7 +27,7 @@ usage() {
 }
 
 # --- parse args --------------------------------------------------------
-# A single optional positional <gateway-url>, defaulting to beta. `hx connect`
+# A single optional positional <gateway-url>, defaulting to production. `hx connect`
 # has no --gateway flag and no env var: the gateway is read only from
 # config.json, so we seed it below.
 GATEWAY_URL="$DEFAULT_GATEWAY_URL"
