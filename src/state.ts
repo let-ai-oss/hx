@@ -404,18 +404,16 @@ export async function touchMtime(
 /** Per-file retry backoff cap — a broken file retries at most every 30 min. */
 const FILE_BACKOFF_CAP_MS = 30 * 60_000;
 
-/** Record a failed upload attempt for one file and schedule its next try with
- *  exponential backoff from `baseMs`. Returns the chosen delay (ms).
- *
- *  `skipReason` distinguishes a transient store outage (the file is fine, its
- *  destination is temporarily unavailable) from an ordinary per-file fault: when
- *  set it is stamped for `hx status`; when omitted any stale reason is cleared,
- *  so a file that fails for a new reason never keeps advertising the old one. */
 /** Bench a file for a FIXED window without touching its failure streak. Used
  *  by the gateway-outage probe in `tickOnce`: the probed file is not at fault,
  *  so it must not accrue compounding backoff (nor a skipReason) — just a short
  *  fixed pause so consecutive passes rotate their probes instead of hammering
- *  one file, and so a recovered gateway is retried within one base window. */
+ *  one file, and so a recovered gateway is retried within one base window.
+ *
+ *  Deliberately does NOT clear an existing skipReason/blocker either: a file
+ *  previously in a recognized hold keeps advertising that hold through the
+ *  ≤30s probe window; the next success clears it and the next classified
+ *  failure replaces it. */
 export async function benchFileProbe(
   filePath: string,
   delayMs: number,
@@ -428,6 +426,13 @@ export async function benchFileProbe(
   await schedulePersist(state, scope);
 }
 
+/** Record a failed upload attempt for one file and schedule its next try with
+ *  exponential backoff from `baseMs`. Returns the chosen delay (ms).
+ *
+ *  `skipReason` distinguishes a transient store outage (the file is fine, its
+ *  destination is temporarily unavailable) from an ordinary per-file fault: when
+ *  set it is stamped for `hx status`; when omitted any stale reason is cleared,
+ *  so a file that fails for a new reason never keeps advertising the old one. */
 export async function recordFileFailure(
   filePath: string,
   baseMs: number,
