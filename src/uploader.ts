@@ -82,15 +82,29 @@ export class HxHttpError extends Error {
     return this.status === 429 || this.status >= 500;
   }
 
-  /** A 503 whose body names vault_offline: THIS session's vault is down while
-   *  the gateway itself is healthy. Callers should skip just this file with a
-   *  long per-file backoff instead of pausing the whole pass — other sessions
-   *  (and other stores) keep uploading. */
+  /** A 503 whose body names a PER-SESSION vault condition — `vault_offline`,
+   *  or the MC-2602 `vault_home_unreachable` hold (home Fortress not
+   *  connected): THIS session's vault is down while the gateway itself is
+   *  healthy. Callers should skip just this file with a long per-file backoff
+   *  instead of pausing the whole pass — other sessions (and other stores)
+   *  keep uploading. */
   get vaultOffline(): boolean {
-    return (
-      this.status === 503 &&
-      (this.blocker?.reason === "vault_offline" || this.message.includes("vault_offline"))
-    );
+    return this.vaultBlockReason !== null;
+  }
+
+  /** The specific per-session hold named by a 503, or null when the 503 is
+   *  (as far as this client can tell) the shared gateway itself. */
+  get vaultBlockReason(): "vault_offline" | "vault_home_unreachable" | null {
+    if (this.status !== 503) return null;
+    if (
+      this.blocker &&
+      (this.blocker.reason === "vault_offline" || this.blocker.reason === "vault_home_unreachable")
+    ) {
+      return this.blocker.reason;
+    }
+    if (this.message.includes('"error":"vault_home_unreachable"')) return "vault_home_unreachable";
+    if (this.message.includes("vault_offline")) return "vault_offline";
+    return null;
   }
 
   /** 410 session_deleted: the session was PERMANENTLY deleted server-side. The
@@ -111,12 +125,14 @@ export function vaultBlockerFromDestinations(destinations: unknown): SyncBlocker
   const sanitized = destinations.flatMap((raw): SyncBlockerDestination[] => {
     if (!raw || typeof raw !== "object") return [];
     const d = raw as Record<string, unknown>;
-    if (typeof d.vaultOrgId !== "string" || d.reason !== "vault_offline") return [];
+    const reason =
+      d.reason === "vault_offline" || d.reason === "vault_home_unreachable" ? d.reason : null;
+    if (typeof d.vaultOrgId !== "string" || reason === null) return [];
     const nullableString = (value: unknown): string | null =>
       typeof value === "string" ? value : null;
     return [{
       vaultOrgId: d.vaultOrgId,
-      reason: "vault_offline",
+      reason,
       orgName: nullableString(d.orgName),
       orgSlug: nullableString(d.orgSlug),
       projectId: nullableString(d.projectId),
@@ -127,17 +143,41 @@ export function vaultBlockerFromDestinations(destinations: unknown): SyncBlocker
     }];
   });
   return sanitized.length > 0
-    ? { reason: "vault_offline", destinations: sanitized }
+    ? {
+        reason: sanitized.some((d) => d.reason === "vault_home_unreachable")
+          ? "vault_home_unreachable"
+          : "vault_offline",
+        destinations: sanitized,
+      }
     : undefined;
 }
 
-async function throwHttp(res: Response, label: string): Promise<never> {
+export async function throwHttp(res: Response, label: string): Promise<never> {
   const txt = await res.text().catch(() => "");
   let blocker: SyncBlockerDetails | undefined;
   try {
-    const body = JSON.parse(txt) as { error?: unknown; destinations?: unknown };
-    if (body.error === "vault_offline") {
+    const body = JSON.parse(txt) as { error?: unknown; vaultOrgId?: unknown; destinations?: unknown };
+    if (body.error === "vault_offline" || body.error === "vault_home_unreachable") {
       blocker = vaultBlockerFromDestinations(body.destinations);
+      // The MC-2602 hold answers `destinations: []` with the home vault named at
+      // the top level — synthesize the single-entry blocker so status/doctor
+      // can still name the org holding this session.
+      if (!blocker && typeof body.vaultOrgId === "string" && body.vaultOrgId.length <= 128) {
+        blocker = {
+          reason: body.error,
+          destinations: [{
+            vaultOrgId: body.vaultOrgId,
+            reason: body.error,
+            orgName: null,
+            orgSlug: null,
+            projectId: null,
+            projectName: null,
+            projectSlug: null,
+            repoSlug: null,
+            lastSeenAt: null,
+          }],
+        };
+      }
     }
   } catch {
     // Old gateways and storage services may return text/HTML. Keep the bounded

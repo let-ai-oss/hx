@@ -26,12 +26,12 @@ export type StateScope = "main" | "local";
  *  gateway reported the session's vault down (503 vault_offline); `store_unreachable`
  *  = a store this session routes to directly answered with a 5xx or couldn't be
  *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
-export type FileSkipReason = "vault_offline" | "store_unreachable";
+export type FileSkipReason = "vault_offline" | "vault_home_unreachable" | "store_unreachable";
 
 /** Non-sensitive routing context returned by the gateway for a held upload. */
 export interface SyncBlockerDestination {
   vaultOrgId: string;
-  reason: "vault_offline";
+  reason: "vault_offline" | "vault_home_unreachable";
   /** Optional for compatibility with gateways that predate rich blockers. */
   orgName?: string | null;
   orgSlug?: string | null;
@@ -403,6 +403,28 @@ export async function touchMtime(
 
 /** Per-file retry backoff cap — a broken file retries at most every 30 min. */
 const FILE_BACKOFF_CAP_MS = 30 * 60_000;
+
+/** Bench a file for a FIXED window without touching its failure streak. Used
+ *  by the gateway-outage probe in `tickOnce`: the probed file is not at fault,
+ *  so it must not accrue compounding backoff (nor a skipReason) — just a short
+ *  fixed pause so consecutive passes rotate their probes instead of hammering
+ *  one file, and so a recovered gateway is retried within one base window.
+ *
+ *  Deliberately does NOT clear an existing skipReason/blocker either: a file
+ *  previously in a recognized hold keeps advertising that hold through the
+ *  ≤30s probe window; the next success clears it and the next classified
+ *  failure replaces it. */
+export async function benchFileProbe(
+  filePath: string,
+  delayMs: number,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return;
+  existing.nextAttemptAtMs = Date.now() + delayMs;
+  await schedulePersist(state, scope);
+}
 
 /** Record a failed upload attempt for one file and schedule its next try with
  *  exponential backoff from `baseMs`. Returns the chosen delay (ms).

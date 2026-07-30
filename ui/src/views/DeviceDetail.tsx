@@ -192,7 +192,7 @@ export function DeviceDetail() {
               {doctor.blockers.map((b, i) => (
                 <div className="row" key={i}>
                   <span className="dot warn"></span>
-                  <div className="who"><b>{plural(b.sessions, "session")} held at {b.orgName ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : "store unreachable — retrying with backoff"}</div></div>
+                  <div className="who"><b>{plural(b.sessions, "session")} held at {b.orgName ?? "an organization vault"}</b><div className="sub">{b.reason === "vault_offline" ? "Session Vault offline — retrying with backoff" : b.reason === "vault_home_unreachable" ? "Home Fortress not connected — retrying with backoff" : "store unreachable — retrying with backoff"}</div></div>
                   <div><span className="pill warn">Held</span></div>
                   <div className="m">{b.nextRetryAtMs ? `next retry ${fmtClock(b.nextRetryAtMs)}` : "retrying"}</div>
                 </div>

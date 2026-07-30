@@ -39,6 +39,7 @@ import {
   type HxState,
   type SyncBlockerDetails,
   type StateScope,
+  benchFileProbe,
   clearFileFailure,
   clearHeal,
   destKey,
@@ -181,8 +182,9 @@ export function classifyUpstreamError(
   fortress: boolean,
 ): SessionUpstreamUnavailable | null {
   if (err instanceof HxHttpError) {
-    if (err.vaultOffline) {
-      return new SessionUpstreamUnavailable("vault_offline", err.status, err, err.blocker);
+    const blockReason = err.vaultBlockReason;
+    if (blockReason !== null) {
+      return new SessionUpstreamUnavailable(blockReason, err.status, err, err.blocker);
     }
     if (fortress && err.serverUnavailable) {
       return new SessionUpstreamUnavailable("store_unreachable", err.status, err);
@@ -201,9 +203,9 @@ export function classifyUpstreamError(
 
 /** Human-readable form of a skip reason for the daemon log. */
 function describeSkip(reason: FileSkipReason): string {
-  return reason === "vault_offline"
-    ? "session vault temporarily unavailable"
-    : "session store unreachable";
+  if (reason === "vault_offline") return "session vault temporarily unavailable";
+  if (reason === "vault_home_unreachable") return "session's home fortress not connected";
+  return "session store unreachable";
 }
 
 export interface WatchOptions {
@@ -704,10 +706,10 @@ async function ingestOne(
   if (heldBlocker) {
     const err = new HxHttpError(
       503,
-      "append-url reported a held vault_offline destination",
+      `append-url reported a held ${heldBlocker.reason} destination`,
       heldBlocker,
     );
-    throw new SessionUpstreamUnavailable("vault_offline", 503, err, heldBlocker);
+    throw new SessionUpstreamUnavailable(heldBlocker.reason, 503, err, heldBlocker);
   }
   return true;
 }
@@ -1551,6 +1553,10 @@ export async function tickOnce(
 
   let uploaded = 0;
   let failed = 0;
+  // Distinct files that hit a gateway-shaped 5xx this pass — see the
+  // serverUnavailable branch below: one file's unrecognized 5xx must not be
+  // read as a wholesale outage.
+  const gatewayUnavailableFiles = new Set<string>();
   for (let i = 0; i < files.length; i++) {
     const f = files[i]!;
     // Per-file backoff: a file that keeps failing (bad request, offline vault)
@@ -1630,12 +1636,28 @@ export async function tickOnce(
         continue;
       }
       if (err instanceof HxHttpError && err.serverUnavailable) {
-        // The shared cloud gateway is refusing uploads wholesale — this is NOT
-        // this file's fault, so do NOT saddle it with a per-file backoff (that
-        // would make this one file lag behind the rest once the gateway
-        // recovers). The pass-level exponential backoff in run() handles it.
-        log(`  [hx] gateway unavailable (${err.status}); pausing this pass`);
-        break;
+        // A wholesale gateway outage and a per-session 5xx this client does not
+        // yet recognize look identical from a single file. Only a SECOND
+        // distinct file failing the same way proves the gateway; until then,
+        // give this one file a short backoff and keep the pass alive — one
+        // unrecognized poison file must never zero the device's throughput
+        // (the vault_home_unreachable incident, 2026-07-30). On a real outage
+        // the first file pays one short undeserved backoff; the pass-level
+        // exponential backoff in run() still handles the outage itself.
+        gatewayUnavailableFiles.add(f.path);
+        if (gatewayUnavailableFiles.size >= 2) {
+          log(
+            `  [hx] gateway unavailable (${err.status}) on ${gatewayUnavailableFiles.size} files; pausing this pass`,
+          );
+          break;
+        }
+        // Fixed bench, NOT recordFileFailure: the probe is not this file's
+        // fault, so it must not accrue a compounding (and restart-surviving)
+        // failure streak — on a real outage with one pending file that would
+        // quietly replace the 5-min pass backoff with a 30-min bench.
+        await benchFileProbe(f.path, FILE_RETRY_BASE_MS, scope);
+        log(`  [hx] 5xx (${err.status}) on one file; probing another before pausing the pass`);
+        continue;
       }
       // A genuine per-file fault (4xx, parse error, a doomed sidecar): back it
       // off so it doesn't burn a gateway round trip every poll.
@@ -1728,7 +1750,7 @@ export async function tickOnce(
               c.path,
               SESSION_SKIP_RETRY_BASE_MS,
               scope,
-              "vault_offline",
+              err.vaultBlockReason ?? "vault_offline",
               err.blocker,
             );
             continue;
