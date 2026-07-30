@@ -39,6 +39,7 @@ import {
   type HxState,
   type SyncBlockerDetails,
   type StateScope,
+  benchFileProbe,
   clearFileFailure,
   clearHeal,
   destKey,
@@ -705,10 +706,10 @@ async function ingestOne(
   if (heldBlocker) {
     const err = new HxHttpError(
       503,
-      "append-url reported a held vault_offline destination",
+      `append-url reported a held ${heldBlocker.reason} destination`,
       heldBlocker,
     );
-    throw new SessionUpstreamUnavailable("vault_offline", 503, err, heldBlocker);
+    throw new SessionUpstreamUnavailable(heldBlocker.reason, 503, err, heldBlocker);
   }
   return true;
 }
@@ -1650,7 +1651,11 @@ export async function tickOnce(
           );
           break;
         }
-        await recordFileFailure(f.path, FILE_RETRY_BASE_MS, scope);
+        // Fixed bench, NOT recordFileFailure: the probe is not this file's
+        // fault, so it must not accrue a compounding (and restart-surviving)
+        // failure streak — on a real outage with one pending file that would
+        // quietly replace the 5-min pass backoff with a 30-min bench.
+        await benchFileProbe(f.path, FILE_RETRY_BASE_MS, scope);
         log(`  [hx] 5xx (${err.status}) on one file; probing another before pausing the pass`);
         continue;
       }
@@ -1745,7 +1750,7 @@ export async function tickOnce(
               c.path,
               SESSION_SKIP_RETRY_BASE_MS,
               scope,
-              "vault_offline",
+              err.vaultBlockReason ?? "vault_offline",
               err.blocker,
             );
             continue;

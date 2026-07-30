@@ -411,6 +411,23 @@ const FILE_BACKOFF_CAP_MS = 30 * 60_000;
  *  destination is temporarily unavailable) from an ordinary per-file fault: when
  *  set it is stamped for `hx status`; when omitted any stale reason is cleared,
  *  so a file that fails for a new reason never keeps advertising the old one. */
+/** Bench a file for a FIXED window without touching its failure streak. Used
+ *  by the gateway-outage probe in `tickOnce`: the probed file is not at fault,
+ *  so it must not accrue compounding backoff (nor a skipReason) — just a short
+ *  fixed pause so consecutive passes rotate their probes instead of hammering
+ *  one file, and so a recovered gateway is retried within one base window. */
+export async function benchFileProbe(
+  filePath: string,
+  delayMs: number,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  const existing = state.files[filePath];
+  if (!existing) return;
+  existing.nextAttemptAtMs = Date.now() + delayMs;
+  await schedulePersist(state, scope);
+}
+
 export async function recordFileFailure(
   filePath: string,
   baseMs: number,

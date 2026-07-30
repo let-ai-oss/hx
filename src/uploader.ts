@@ -102,7 +102,7 @@ export class HxHttpError extends Error {
     ) {
       return this.blocker.reason;
     }
-    if (this.message.includes("vault_home_unreachable")) return "vault_home_unreachable";
+    if (this.message.includes('"error":"vault_home_unreachable"')) return "vault_home_unreachable";
     if (this.message.includes("vault_offline")) return "vault_offline";
     return null;
   }
@@ -152,7 +152,7 @@ export function vaultBlockerFromDestinations(destinations: unknown): SyncBlocker
     : undefined;
 }
 
-async function throwHttp(res: Response, label: string): Promise<never> {
+export async function throwHttp(res: Response, label: string): Promise<never> {
   const txt = await res.text().catch(() => "");
   let blocker: SyncBlockerDetails | undefined;
   try {
@@ -162,7 +162,7 @@ async function throwHttp(res: Response, label: string): Promise<never> {
       // The MC-2602 hold answers `destinations: []` with the home vault named at
       // the top level — synthesize the single-entry blocker so status/doctor
       // can still name the org holding this session.
-      if (!blocker && typeof body.vaultOrgId === "string") {
+      if (!blocker && typeof body.vaultOrgId === "string" && body.vaultOrgId.length <= 128) {
         blocker = {
           reason: body.error,
           destinations: [{

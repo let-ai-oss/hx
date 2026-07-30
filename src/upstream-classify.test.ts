@@ -3,7 +3,7 @@
 // pass-wide "gateway unavailable" — one held session froze a device's entire
 // upload loop on 2026-07-30.
 import { describe, expect, it } from "bun:test";
-import { HxHttpError } from "./uploader.js";
+import { HxHttpError, throwHttp } from "./uploader.js";
 import { classifyUpstreamError, SessionUpstreamUnavailable } from "./watch.js";
 
 const holdBody = '{"error":"vault_home_unreachable","vaultOrgId":"org-1","destinations":[]}';
@@ -54,6 +54,22 @@ describe("classifyUpstreamError", () => {
     });
     expect(err.vaultBlockReason).toBe("vault_home_unreachable");
     expect(err.vaultOffline).toBe(true);
+  });
+
+  it("throwHttp synthesizes the blocker from the hold's top-level vaultOrgId", async () => {
+    // The exact body the gateway sent during the 2026-07-30 incident.
+    const res = new Response(holdBody, { status: 503 });
+    let thrown: unknown;
+    try {
+      await throwHttp(res, "append-url");
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as HxHttpError;
+    expect(err).toBeInstanceOf(HxHttpError);
+    expect(err.vaultBlockReason).toBe("vault_home_unreachable");
+    expect(err.blocker?.reason).toBe("vault_home_unreachable");
+    expect(err.blocker?.destinations[0]?.vaultOrgId).toBe("org-1");
   });
 
   it("keeps non-503 statuses out of the vault-hold classification", () => {
