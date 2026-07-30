@@ -26,12 +26,12 @@ export type StateScope = "main" | "local";
  *  gateway reported the session's vault down (503 vault_offline); `store_unreachable`
  *  = a store this session routes to directly answered with a 5xx or couldn't be
  *  reached at all. Surfaced by `hx status` so a stuck session shows a reason. */
-export type FileSkipReason = "vault_offline" | "store_unreachable";
+export type FileSkipReason = "vault_offline" | "vault_home_unreachable" | "store_unreachable";
 
 /** Non-sensitive routing context returned by the gateway for a held upload. */
 export interface SyncBlockerDestination {
   vaultOrgId: string;
-  reason: "vault_offline";
+  reason: "vault_offline" | "vault_home_unreachable";
   /** Optional for compatibility with gateways that predate rich blockers. */
   orgName?: string | null;
   orgSlug?: string | null;
