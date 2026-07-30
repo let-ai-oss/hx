@@ -47,6 +47,7 @@ import {
   isDeletedSession,
   loadState,
   recordDeletedSession,
+  setStateGateway,
   recordFileFailure,
   minOffset,
   offsetFor,
@@ -1104,6 +1105,143 @@ async function syncGroupMirror(cfg: HxConfig, log: (msg: string) => void): Promi
   }
 }
 
+/** What a gateway-switch verify answer means for the local offset. Pure so the
+ *  decision is testable without a gateway or a filesystem.
+ *
+ *  `adopt` — the new gateway already holds exactly what we have: take the local
+ *  size as the cursor and upload nothing. `resume` — it holds a prefix (the
+ *  session files are append-only, which is the same assumption every chunk
+ *  append already rests on): continue from there. `replace` — it holds nothing,
+ *  or MORE than we do, which we cannot explain by appends, so fall back to
+ *  today's behaviour and re-upload the file whole. */
+export function adoptionDecision(
+  status: "ok" | "divergent" | "skipped" | "deleted",
+  storeBytes: number | null,
+  localBytes: number,
+): { action: "adopt" | "resume" | "replace" | "tombstone"; offset: number } {
+  if (status === "deleted") return { action: "tombstone", offset: 0 };
+  if (status === "ok") return { action: "adopt", offset: localBytes };
+  if (status === "divergent" && storeBytes !== null && storeBytes > 0 && storeBytes < localBytes) {
+    return { action: "resume", offset: storeBytes };
+  }
+  return { action: "replace", offset: 0 };
+}
+
+/**
+ * One-shot pass after the device is pointed at a DIFFERENT gateway. Offsets are
+ * per destination, and a destination key does not survive that move: the new
+ * gateway's store is a different store, so every session reads as "nothing
+ * uploaded" and the daemon re-ships the entire corpus. The new gateway often
+ * already holds most of it — a restored snapshot, a migrated tenant — and since
+ * sessions are keyed by user+family+id nothing duplicates, so the re-upload is
+ * pure waste that also shows the user 0% for as long as it takes.
+ *
+ * So ask first. `sessions/verify` already answers "how many bytes do you hold
+ * for this session" — the audit uses it in the other direction, to detect a
+ * store that LOST bytes. Here we use it to adopt what the new gateway has.
+ *
+ * Runs once per gateway change (stamped in state), before the first upload pass.
+ */
+async function adoptRemoteOffsets(
+  cfg: HxConfig,
+  opts: WatchOptions,
+  log: (msg: string) => void,
+): Promise<void> {
+  const scope = scopeOf(cfg);
+  const state = await loadState(scope);
+  if (state.gateway === cfg.gatewayBaseUrl) return;
+  const previous = state.gateway;
+  const roots = resolveDataRoots(await readSettings());
+  const [claude, codex] = await Promise.all([
+    discoverClaudeFiles(roots.claude),
+    discoverCodexFiles(roots.codex),
+  ]);
+  let files = [...claude, ...codex];
+  if (opts.only) files = files.filter((f) => f.path === opts.only);
+  files = electUploaders(files, state);
+  const candidates: Array<{ path: string; fState: FileState; localBytes: number }> = [];
+  for (const f of files) {
+    const fState = state.files[f.path];
+    // No entry at all = never uploaded from this device to anywhere; uploading
+    // it is correct. Already has a cursor on this destination = the switch did
+    // not blank it, and the routine audit owns that case.
+    if (!fState || offsetFor(fState, null) > 0) continue;
+    if (isDeletedSession(state, fState.family, fState.sessionId)) continue;
+    let localBytes: number;
+    try {
+      localBytes = (await stat(f.path)).size;
+    } catch {
+      continue;
+    }
+    if (localBytes === 0) continue;
+    candidates.push({ path: f.path, fState, localBytes });
+  }
+  if (files.length === 0) {
+    // Discovery came up empty, which is not the same as "nothing to adopt": a
+    // daemon can start before its data roots are readable (launchd at boot, a
+    // service env without CLAUDE_CONFIG_DIR, a home on a network mount). Stamping
+    // here would spend the single adoption pass on nothing and leave the device
+    // re-uploading its whole corpus, so leave the stamp unset and try next start.
+    return;
+  }
+  if (candidates.length === 0) {
+    await setStateGateway(cfg.gatewayBaseUrl, scope);
+    return;
+  }
+  log(
+    `[hx] gateway changed${previous ? ` (${previous} → ${cfg.gatewayBaseUrl})` : ""} — checking what it already has for ${candidates.length} session(s)`,
+  );
+  let adopted = 0;
+  let resumed = 0;
+  let replaced = 0;
+  for (let i = 0; i < candidates.length; i += VERIFY_BATCH) {
+    const batch = candidates.slice(i, i + VERIFY_BATCH);
+    let results;
+    try {
+      results = await verifySessions(
+        cfg,
+        batch.map(({ fState, localBytes }) => ({
+          family: fState.family as never,
+          sessionId: fState.sessionId,
+          byteCount: localBytes,
+        })),
+      );
+    } catch (err) {
+      if (err instanceof HxHttpError && err.status === 404) {
+        // Gateway predates sessions/verify: nothing to adopt from. Stamp it so
+        // we don't re-ask every start, and let the normal passes upload.
+        await setStateGateway(cfg.gatewayBaseUrl, scope);
+        log("[hx] gateway has no sessions/verify — uploading without adoption");
+        return;
+      }
+      // Transient: leave the stamp alone so the next start tries again.
+      log(`[hx] gateway check failed (${(err as Error).message}) — will retry`);
+      return;
+    }
+    const byKey = new Map(results.map((r) => [`${r.family}:${r.sessionId}`, r]));
+    for (const { path: filePath, fState, localBytes } of batch) {
+      const r = byKey.get(`${fState.family}:${fState.sessionId}`);
+      if (!r) continue;
+      const { action, offset } = adoptionDecision(r.status, r.storeBytes, localBytes);
+      if (action === "tombstone") {
+        await recordDeletedSession(fState.family, fState.sessionId, scope);
+        continue;
+      }
+      if (action === "replace") {
+        replaced += 1;
+        continue;
+      }
+      await setOffsetFor(filePath, null, offset, fState.lastMtimeMs, scope);
+      if (action === "adopt") adopted += 1;
+      else resumed += 1;
+    }
+  }
+  await setStateGateway(cfg.gatewayBaseUrl, scope);
+  log(
+    `[hx] gateway check done: ${adopted} already there, ${resumed} resuming mid-file, ${replaced} to upload in full`,
+  );
+}
+
 /**
  * Canonical divergence audit. For every file this device has uploaded bytes
  * for, ask the gateway whether the canonical object in the store actually
@@ -1918,6 +2056,7 @@ export async function startWatch(
     if (passBusy) return; // a pass is mid-flight; the next interval retries
     passBusy = true;
     try {
+      await adoptRemoteOffsets(cfg, opts, log);
       await auditCanonicals(cfg, opts, log);
     } catch (err) {
       log(`[hx] canonical audit error: ${(err as Error).message}`);

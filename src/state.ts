@@ -223,6 +223,17 @@ export interface HxState {
    *  strings per lane and lanes are bounded by real agent activity, same
    *  growth class as `files`. Additive; older binaries ignore it. */
   childUploaders?: Record<string, string>;
+  /** The gateway URL these offsets were earned against. Offsets are per
+   *  DESTINATION, and a destination key means nothing across gateways: the same
+   *  `letai` key resolves to a different store behind a different gateway, and a
+   *  Fortress key reachable through one may not be reachable through the other.
+   *  So when this stamp doesn't match the configured gateway, the offsets
+   *  describe storage this device is no longer talking to, and must be
+   *  re-established against the new one (adoptRemoteOffsets in watch.ts) rather
+   *  than trusted or thrown away — thrown away, every session the new gateway
+   *  already holds is uploaded again. Absent on state written by older binaries,
+   *  which counts as "unknown gateway" and triggers exactly one pass. */
+  gateway?: string;
 }
 
 const STATE_DIR = HX_DIR;
@@ -283,6 +294,17 @@ function schedulePersist(state: HxState, scope: StateScope): Promise<void> {
     .catch(() => persist(state, scope));
   writeChains.set(scope, chain);
   return chain;
+}
+
+/** Stamp the offsets as belonging to this gateway. Called once the offsets have
+ *  actually been re-established against it, never before. */
+export async function setStateGateway(
+  gateway: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  state.gateway = gateway;
+  await schedulePersist(state, scope);
 }
 
 export async function getFileState(
