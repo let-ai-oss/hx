@@ -639,6 +639,12 @@ async function cmdStatus(): Promise<void> {
   const ledger = report?.ledger ?? null;
   if (ledger && ledger.total > 0) {
     rows.push(["Sessions", `${ledger.total} on this device · ${formatSize(ledger.totalBytes)}`]);
+    // How deep the local history actually goes. Worth its own row because the
+    // discovery window prunes at 30 days: seeing the span makes it obvious
+    // whether older history exists on disk at all, rather than leaving the
+    // count to imply a depth it may not have.
+    const range = formatSessionRange(ledger.oldestMs, ledger.newestMs);
+    if (range) rows.push(["Session range", range]);
     rows.push(["Sync", syncVerdict(ledger)]);
     rows.push(["  Delivered", `${sessions(ledger.delivered)} · ${formatSize(ledger.deliveredBytes)}`]);
     // Ordered by how much they matter, not by severity: the two healthy rows
@@ -729,6 +735,24 @@ async function cmdStatus(): Promise<void> {
     log("");
     printStatusTable(box, widths);
   }
+}
+
+/** "May 1 – Aug 1, 2026 · 92 days". The year is stated once when both ends
+ *  share it, and a single-day span collapses to one date. Null when nothing is
+ *  on disk to bound. */
+function formatSessionRange(oldestMs: number | null, newestMs: number | null): string | null {
+  if (oldestMs === null || newestMs === null) return null;
+  const a = new Date(oldestMs);
+  const b = new Date(newestMs);
+  const fmt = (d: Date, withYear: boolean): string =>
+    new Intl.DateTimeFormat("en", {
+      month: "short",
+      day: "numeric",
+      ...(withYear ? { year: "numeric" as const } : {}),
+    }).format(d);
+  if (a.toDateString() === b.toDateString()) return fmt(b, true);
+  const days = Math.max(1, Math.round((newestMs - oldestMs) / 86_400_000));
+  return `${fmt(a, a.getFullYear() !== b.getFullYear())} – ${fmt(b, true)} · ${days} days`;
 }
 
 function sessions(n: number): string {

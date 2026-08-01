@@ -69,6 +69,12 @@ export interface DestinationLag {
 export interface SyncLedger {
   total: number;
   totalBytes: number;
+  /** Oldest and newest last-activity time across the sessions still ON DISK,
+   *  in epoch ms; null when none are. Drives the status "Session range" row.
+   *  Deliberately excludes `incomplete` sessions — their source file is gone,
+   *  so there is no mtime to read and they are no longer on this device. */
+  oldestMs: number | null;
+  newestMs: number | null;
   delivered: number;
   live: number;
   uploading: number;
@@ -188,6 +194,8 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let uploading = 0;
   let waiting = 0;
   let totalBytes = 0;
+  let oldestMs: number | null = null;
+  let newestMs: number | null = null;
   let deliveredBytes = 0;
   let uploadingBytes = 0;
   let waitingBytes = 0;
@@ -195,6 +203,11 @@ export function buildLedger(input: LedgerInput): SyncLedger {
 
   for (const file of files) {
     totalBytes += file.size;
+    // mtime, not a parsed session start: it is what discovery already carries
+    // for every family, and "last activity" is the honest thing to bound a
+    // range by — a session resumed today belongs at today's end of it.
+    if (oldestMs === null || file.mtimeMs < oldestMs) oldestMs = file.mtimeMs;
+    if (newestMs === null || file.mtimeMs > newestMs) newestMs = file.mtimeMs;
     const c = classifyFile(file, state, nowMs);
     switch (c.state) {
       case "delivered":
@@ -255,6 +268,8 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   return {
     total: files.length + incompleteSessions,
     totalBytes,
+    oldestMs,
+    newestMs,
     delivered,
     live,
     uploading,

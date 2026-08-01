@@ -1519,9 +1519,20 @@ export function collectSkipped(files: DiscoveredFile[], state: HxState): SyncSki
 export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<SyncReport> {
   const settings = await readSettings();
   const roots = rootsOverride ?? resolveDataRoots(settings);
+  // UNWINDOWED — this is a REPORT, not the hot loop. The 30-day bound exists so
+  // a 1.5s sweep stays cheap; describing the device is a once-per-invocation
+  // read where it only distorts.
+  //
+  // Two things went wrong while this was windowed. The daemon now backfills
+  // files older than the window, so `hx status` was omitting sessions it was
+  // actively uploading. And an aged-out file still sitting on disk was counted
+  // as `incomplete` — "source file gone, permanently partial" — when it is
+  // neither gone nor unrecoverable; the backfill sweep will deliver it. Only
+  // genuinely-vanished sources are incomplete, and that needs discovery to see
+  // everything before it can tell the difference.
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude),
-    discoverCodexFiles(roots.codex),
+    discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
+    discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
   ]);
   const all = [...claude, ...codex];
   const state = await loadState();

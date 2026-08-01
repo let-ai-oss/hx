@@ -280,6 +280,11 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
   }
   lines.push(`              ${"─".repeat(6)}`);
   lines.push(`              ${num(ledger.total)}`);
+  if (ledger.oldestMs !== null && ledger.newestMs !== null) {
+    const iso = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+    const days = Math.max(1, Math.round((ledger.newestMs - ledger.oldestMs) / 86_400_000));
+    lines.push(`  Range       ${iso(ledger.oldestMs)} → ${iso(ledger.newestMs)}  (${days} days on disk)`);
+  }
   const sendable = ledger.delivered + ledger.uploading + ledger.incomplete;
   lines.push(
     `  Sync ${ledger.percent}% = ${ledger.delivered} delivered / ${sendable} sendable` +
