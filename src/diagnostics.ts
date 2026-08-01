@@ -285,6 +285,16 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     `  Sync ${ledger.percent}% = ${ledger.delivered} delivered / ${sendable} sendable` +
       ` (in-progress and waiting sessions are excluded — nothing you can act on)`,
   );
+  if (ledger.failing.length > 0) {
+    lines.push("");
+    lines.push("FAILING DESTINATIONS — reachable, but rejecting writes");
+    for (const f of ledger.failing) {
+      const since = f.failingHours === null ? "" : ` · for ${f.failingHours}h`;
+      lines.push(`  ${f.label}  —  ${f.errorCode}${since}`);
+    }
+    lines.push("  Every retry is being refused; this does not self-heal. Check the");
+    lines.push("  storage credentials/config on the server side, then: hx retry --all");
+  }
   if (ledger.lagging.length > 0) {
     lines.push("");
     lines.push("OFFLINE DESTINATIONS");

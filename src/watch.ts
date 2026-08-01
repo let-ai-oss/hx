@@ -60,6 +60,9 @@ import {
   stampEffectiveRoots,
   touchMtime,
   upsertFileState,
+  clearDestinationUploadError,
+  recordDestinationUploadError,
+  clearGenericBackoffs,
 } from "./state.js";
 import { planFanout } from "./fanout.js";
 import { appendActivity, trimActivity } from "./activity.js";
@@ -427,6 +430,15 @@ function deriveFallbackTitle(
   return base && base.length > 0 ? base : null;
 }
 
+/** Compact label for a hard upload failure: the status plus the storage
+ *  provider's error code when the body carries one (GCS/S3 XML `<Code>`), e.g.
+ *  "403 SignatureDoesNotMatch". The code is what distinguishes a stale signing
+ *  key from a permission problem, so it is worth surfacing verbatim. */
+export function uploadErrorCode(err: HxHttpError): string {
+  const m = /<Code>([A-Za-z0-9_]+)<\/Code>/.exec(err.message);
+  return m ? `${err.status} ${m[1]}` : String(err.status);
+}
+
 async function ingestOne(
   cfg: HxConfig,
   file: DiscoveredFile,
@@ -666,6 +678,9 @@ async function ingestOne(
         // to the session's store, so one sync off any destination's new tail is
         // enough — capture the first.
         if (artifactText === null) artifactText = text;
+        // A committed chunk ends this destination's failure run (no-op unless
+        // one is latched — see recordDestinationUploadError in the catch).
+        await clearDestinationUploadError(destKey(step.vaultOrgId), scope);
         anyProgress = true;
         roundProgress = true;
         log(
@@ -690,6 +705,18 @@ async function ingestOne(
             `  [hx] destination ${step.vaultOrgId ?? "let.ai"} unavailable (${err.status}); will retry`,
           );
           continue;
+        }
+        // A hard rejection (403/401/400) from a REACHABLE store. Latch it on
+        // the destination registry before the error propagates into the
+        // generic per-file backoff: without this, a store rejecting every
+        // write is indistinguishable from a slow backlog — the shape that hid
+        // a 12-hour credential outage behind a silent "0%".
+        if (err instanceof HxHttpError) {
+          await recordDestinationUploadError(
+            destKey(step.vaultOrgId),
+            uploadErrorCode(err),
+            scope,
+          ).catch(() => {});
         }
         throw err;
       }
@@ -1867,6 +1894,21 @@ export async function startWatch(
   log(`[hx] watching data roots: ${describeRoots(resolveDataRoots(await readSettings()))}`);
   log(`[hx] poll interval ${FAST_POLL_MS}ms; gateway ${cfg.gatewayBaseUrl}`);
   void trimActivity(); // cap the UI journal once per daemon lifetime
+
+  // A restart is a human signalling "conditions changed" — serving out stale
+  // exponential penalties helps nobody. After the 2026-08-01 credential
+  // outage, 803 files sat pinned at the 30-minute backoff cap for a fault
+  // that was already fixed. Generic backoffs only: a skipReason hold means
+  // the gateway said the store is DOWN, and that is still true until it says
+  // otherwise (`hx retry --blocked` / `--all` release those deliberately).
+  try {
+    const dropped = await clearGenericBackoffs(scopeOf(cfg));
+    if (dropped > 0) {
+      log(`[hx] cleared ${dropped} stale retry backoff${dropped === 1 ? "" : "s"} on start`);
+    }
+  } catch {
+    // Best-effort: an unreadable state file surfaces through the normal pass.
+  }
 
   // Publish the resolved roots as device truth (state.effectiveRoots) so the
   // UI server and doctor describe what THIS long-running loop watches. Gated

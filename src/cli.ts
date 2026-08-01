@@ -663,6 +663,20 @@ async function cmdStatus(): Promise<void> {
     ]);
   }
 
+  // A destination rejecting writes gets the LOUDEST box: unlike waiting
+  // (safe, self-healing) and even loss (already happened), failing is damage
+  // in progress — every retry is being refused. Names the store and the
+  // storage layer's own error so the fix starts from the right place.
+  const failRows: Array<[string, string]> = [];
+  if (ledger && ledger.failing.length > 0) {
+    for (const f of ledger.failing.slice(0, 3)) {
+      const since =
+        f.failingHours === null ? "" : f.failingHours < 1 ? " · started under an hour ago" : ` · for ${f.failingHours}h`;
+      failRows.push([failRows.length === 0 ? "Failing" : " ", `${f.label} · ${f.errorCode}${since}`]);
+    }
+    failRows.push(["  What now", "uploads are being rejected — check server credentials/config"]);
+  }
+
   // Real loss gets its own box ABOVE the reassuring one, so it can never be
   // read as part of the waiting story. This is the only thing that moves the
   // percentage off 100%.
@@ -700,9 +714,9 @@ async function cmdStatus(): Promise<void> {
   // Each box is one idea: the device and its health; what was lost; what is
   // merely waiting. Shared widths keep their edges aligned, and a blank line
   // separates them so two adjacent borders don't read as one heavy rule.
-  const widths = sharedTableWidths(rows, lossRows, waitRows);
+  const widths = sharedTableWidths(rows, failRows, lossRows, waitRows);
   printStatusTable(rows, widths);
-  for (const box of [lossRows, waitRows]) {
+  for (const box of [failRows, lossRows, waitRows]) {
     if (box.length === 0) continue;
     log("");
     printStatusTable(box, widths);
@@ -716,6 +730,12 @@ function sessions(n: number): string {
 /** The headline. A percentage only ever appears with what it is a percentage
  *  OF, and the words name the DOMINANT reason it is not 100%. */
 function syncVerdict(ledger: SyncLedger): string {
+  // A failing destination outranks everything: it means bytes SHOULD be
+  // moving and are being rejected — the shape that hid a 12-hour credential
+  // outage behind an innocent-looking backlog percentage.
+  if (ledger.failing.length > 0) {
+    return `${ledger.percent}% — uploads failing · ${ledger.failing[0]!.errorCode}`;
+  }
   // A backlog outranks loss here even though loss is worse. The percentage is
   // driven by whatever is biggest, and naming the 50 lost sessions while 536
   // are still uploading would blame the wrong thing for the number. Loss is
@@ -791,8 +811,16 @@ async function cmdDoctor(): Promise<void> {
 }
 
 async function cmdRetry(): Promise<void> {
-  if (!hasFlag("blocked")) {
-    log("usage: hx retry --blocked");
+  // --blocked releases vault holds; --all also clears generic failure
+  // backoffs. The distinction exists because a central fault (a storage-layer
+  // 403, a broken gateway) is NOT a vault hold: it drives files into the
+  // generic 30-minute backoff cap that --blocked cannot touch, and an
+  // already-fixed incident then recovers at a crawl.
+  const all = hasFlag("all");
+  if (!all && !hasFlag("blocked")) {
+    log("usage: hx retry --blocked | --all");
+    log("  --blocked  release sessions held by an offline Fortress");
+    log("  --all      also clear every retry backoff (after a fixed incident)");
     process.exitCode = 64;
     return;
   }
@@ -803,8 +831,8 @@ async function cmdRetry(): Promise<void> {
   // "no blocked sessions" and never release the daemon's holds).
   const { roots: retryRoots } = await effectiveRootsForCli(await readSettings());
   const report = await computeSyncReport(retryRoots);
-  if (report.skipped.length === 0) {
-    log("No blocked sessions to retry.");
+  if (!all && report.skipped.length === 0) {
+    log("No blocked sessions to retry. (`hx retry --all` clears every backoff.)");
     return;
   }
 
@@ -815,13 +843,14 @@ async function cmdRetry(): Promise<void> {
   const ops = getDaemonOps();
   const before = await ops.state().catch(() => ({ loaded: false, pid: null }));
   const dotfileConsent = before.loaded ? await resolveDotfileConsent(ops) : "denied";
-  const r = await retryBlocked(cfg, { dotfileConsent, log });
+  const r = await retryBlocked(cfg, { dotfileConsent, log, scope: all ? "all" : "blocked" });
+  const what = all ? "backed-off" : "blocked";
   if (r.restarted) {
     log(
-      `Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"}; daemon restarted for an immediate retry.`,
+      `Released ${r.sessions} ${what} session${r.sessions === 1 ? "" : "s"}; daemon restarted for an immediate retry.`,
     );
   } else {
-    log(`Released ${r.sessions} blocked session${r.sessions === 1 ? "" : "s"}; ran one retry pass now.`);
+    log(`Released ${r.sessions} ${what} session${r.sessions === 1 ? "" : "s"}; ran one retry pass now.`);
     if (r.pass) log(`Retry pass complete. uploaded=${r.pass.uploaded} failed=${r.pass.failed}`);
   }
   log("Check the result with `hx status`.");
@@ -1342,7 +1371,8 @@ async function main(): Promise<void> {
       log("Maintenance:");
       log("  backfill   Upload tasks + plans for sessions already on disk");
       log("  reattribute  Re-detect + report repo attribution for uploaded sessions");
-      log("  retry --blocked  Clear destination backoff and retry immediately");
+      log("  retry --blocked  Release Fortress-held sessions and retry immediately");
+      log("  retry --all      Also clear every retry backoff (after a fixed incident)");
       log("  update     Fetch the latest hx binary and restart the daemon");
       log("  disconnect Forget the device token");
       log("  uninstall  Remove daemon + binary (pass --purge to also remove ~/.let/hx/)");
