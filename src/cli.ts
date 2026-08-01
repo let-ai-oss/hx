@@ -649,8 +649,16 @@ async function cmdStatus(): Promise<void> {
         `${sessions(ledger.uploading)} · ${formatSize(ledger.uploadingBytes)} left`,
       ]);
     }
-    if (ledger.inProgress > 0) {
-      rows.push(["  In progress", `${sessions(ledger.inProgress)} · being written right now`]);
+    if (ledger.live > 0) {
+      // "Live", not "In progress": every OTHER row here is a delivery state,
+      // and this one is purely local — an agent is still writing the session
+      // on this machine. "In progress" sat directly under "Uploading" and read
+      // as a transfer in flight, which is the one thing it never means. The
+      // value names the device explicitly for the same reason.
+      rows.push([
+        "  Live",
+        `${sessions(ledger.live)} ${ledger.live === 1 ? "is" : "are"} actively working on this device`,
+      ]);
     }
   }
   // Partially-synced sessions under locations no longer watched (a data root

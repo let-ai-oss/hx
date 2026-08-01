@@ -269,8 +269,8 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
   if (ledger.uploading > 0) {
     lines.push(`  Uploading   ${num(ledger.uploading)}   bytes still going to a reachable store`);
   }
-  if (ledger.inProgress > 0) {
-    lines.push(`  In progress ${num(ledger.inProgress)}   still being written`);
+  if (ledger.live > 0) {
+    lines.push(`  Live        ${num(ledger.live)}   actively working on this device (local)`);
   }
   if (ledger.waiting > 0) {
     lines.push(`  Waiting     ${num(ledger.waiting)}   an offline Fortress owes bytes`);
