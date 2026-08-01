@@ -38,8 +38,10 @@ export const LIVE_WINDOW_MS = 15 * 60_000;
 export type SessionState =
   /** Reached every destination that is currently reachable. */
   | "delivered"
-  /** Still being written (inside {@link LIVE_WINDOW_MS}) — excluded from the %. */
-  | "in_progress"
+  /** LOCAL state, not a delivery state: an agent or a human is still writing
+   *  this session on this device (inside {@link LIVE_WINDOW_MS}). Excluded
+   *  from the % — a session still being produced is not a sync failure. */
+  | "live"
   /** A REACHABLE destination is still owed bytes — a real backlog, counted. */
   | "uploading"
   /** Only OFFLINE destinations are owed bytes — excluded from the %. */
@@ -68,7 +70,7 @@ export interface SyncLedger {
   total: number;
   totalBytes: number;
   delivered: number;
-  inProgress: number;
+  live: number;
   uploading: number;
   waiting: number;
   incomplete: number;
@@ -159,10 +161,11 @@ export function classifyFile(
 ): { state: Exclude<SessionState, "incomplete">; reachableBytes: number; offline: Map<string, number> } {
   const fs = state.files[file.path];
   const { reachable, offline } = lagOf(fs, file.size, state);
-  // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session being
-  // written is never a backlog and never a fault, whatever it still owes.
+  // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session still
+  // being written on this device is never a backlog and never a fault,
+  // whatever it still owes.
   if (nowMs - file.mtimeMs < LIVE_WINDOW_MS) {
-    return { state: "in_progress", reachableBytes: reachable, offline };
+    return { state: "live", reachableBytes: reachable, offline };
   }
   if (reachable > 0) return { state: "uploading", reachableBytes: reachable, offline };
   if (offline.size > 0) return { state: "waiting", reachableBytes: 0, offline };
@@ -181,7 +184,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   const orgNames = input.orgNames ?? {};
 
   let delivered = 0;
-  let inProgress = 0;
+  let live = 0;
   let uploading = 0;
   let waiting = 0;
   let totalBytes = 0;
@@ -198,8 +201,8 @@ export function buildLedger(input: LedgerInput): SyncLedger {
         delivered += 1;
         deliveredBytes += file.size;
         break;
-      case "in_progress":
-        inProgress += 1;
+      case "live":
+        live += 1;
         break;
       case "uploading":
         uploading += 1;
@@ -253,7 +256,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     total: files.length + incompleteSessions,
     totalBytes,
     delivered,
-    inProgress,
+    live,
     uploading,
     waiting,
     incomplete: incompleteSessions,

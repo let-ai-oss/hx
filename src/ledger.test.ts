@@ -74,7 +74,7 @@ describe("ledger classification", () => {
     // next tick; counting that as backlog is what kept the number off 100%.
     const state = stateWithOfflineFortress({ a: entry("a", { letai: 90 }) });
     const c = classifyFile(file("a", 100, 60_000), state, NOW);
-    assert.equal(c.state, "in_progress");
+    assert.equal(c.state, "live");
   });
 
   it("reclassifies once the live window lapses", () => {
@@ -113,10 +113,10 @@ describe("ledger percentage", () => {
     assert.equal(ledger.percent, 100);
     assert.equal(ledger.delivered, 1);
     assert.equal(ledger.waiting, 1);
-    assert.equal(ledger.inProgress, 1);
+    assert.equal(ledger.live, 1);
     // The parts must account for every session — the number is auditable.
     assert.equal(
-      ledger.delivered + ledger.inProgress + ledger.uploading + ledger.waiting + ledger.incomplete,
+      ledger.delivered + ledger.live + ledger.uploading + ledger.waiting + ledger.incomplete,
       ledger.total,
     );
   });
@@ -303,5 +303,28 @@ describe("backoff clearing", () => {
     assert.equal(state.files.broken?.consecutiveFailures, undefined);
     assert.equal(state.files.held?.skipReason, "vault_offline");
     assert.equal(state.files.held?.consecutiveFailures, 4);
+  });
+});
+
+describe("live bucket naming", () => {
+  it("classifies a locally-active session as live, never as a transfer state", () => {
+    // The bucket is LOCAL: an agent is writing the file on this device. It
+    // must never be confused with uploading, which is what the old
+    // "in_progress" label read as when printed under "Uploading".
+    const state = stateWithOfflineFortress({ a: entry("a", { letai: 90 }) });
+    assert.equal(classifyFile(file("a", 100, 60_000), state, NOW).state, "live");
+  });
+
+  it("keeps live sessions out of the percentage entirely", () => {
+    const files = { a: entry("a", { letai: 0 }) };
+    const ledger = buildLedger({
+      files: [file("a", 100, 1_000)],
+      state: stateWithOfflineFortress(files),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.live, 1);
+    assert.equal(ledger.uploading, 0, "a live tail is not a backlog");
+    assert.equal(ledger.percent, 100, "someone typing must never dent the number");
   });
 });
