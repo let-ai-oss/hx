@@ -219,6 +219,71 @@ export interface DestinationRecord {
   heldSinceMs?: number;
   /** When the gateway last told us anything about it. */
   observedAtMs: number;
+  /** Consecutive hard upload failures against this destination (a signed PUT
+   *  or commit rejected — 403/401/400, not an outage). Cleared by any
+   *  successful commit to it. A destination that is REACHABLE but rejecting
+   *  every write is otherwise indistinguishable from a slow backlog — that
+   *  exact shape hid a 12-hour credential outage behind a silent "0%". */
+  consecutiveErrors?: number;
+  /** Short label of the most recent hard failure, e.g. "403 SignatureDoesNotMatch". */
+  lastErrorCode?: string;
+  /** When the most recent hard failure was observed (ms). */
+  lastErrorAtMs?: number;
+  /** When the CURRENT unbroken run of failures began (ms) — "failing for 2h". */
+  failingSinceMs?: number;
+}
+
+/** Fold one hard upload failure into the registry. Pure for tests. */
+export function applyDestinationUploadError(
+  state: HxState,
+  key: string,
+  code: string,
+  nowMs: number,
+): void {
+  const registry = (state.destinations ??= {});
+  const prev = registry[key];
+  const record: DestinationRecord = prev ?? {
+    // First sighting can precede any gateway destination report (legacy
+    // single-destination responses) — seed a minimal ready record.
+    vaultOrgId: key === destKey(null) ? null : key,
+    status: "ready",
+    observedAtMs: nowMs,
+  };
+  record.consecutiveErrors = (record.consecutiveErrors ?? 0) + 1;
+  record.lastErrorCode = code;
+  record.lastErrorAtMs = nowMs;
+  record.failingSinceMs = record.failingSinceMs ?? nowMs;
+  registry[key] = record;
+}
+
+/** A successful commit to the destination ends the failure run. Pure. */
+export function applyDestinationUploadSuccess(state: HxState, key: string): boolean {
+  const record = state.destinations?.[key];
+  if (!record || record.consecutiveErrors === undefined) return false;
+  delete record.consecutiveErrors;
+  delete record.lastErrorCode;
+  delete record.lastErrorAtMs;
+  delete record.failingSinceMs;
+  return true;
+}
+
+/** Persisted wrappers around the pure fold/clear above. */
+export async function recordDestinationUploadError(
+  key: string,
+  code: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  applyDestinationUploadError(state, key, code, Date.now());
+  await schedulePersist(state, scope);
+}
+
+export async function clearDestinationUploadError(
+  key: string,
+  scope: StateScope = "main",
+): Promise<void> {
+  const state = await loadState(scope);
+  if (applyDestinationUploadSuccess(state, key)) await schedulePersist(state, scope);
 }
 
 /** One destination as the gateway just described it, narrowed to what we keep. */
@@ -690,6 +755,80 @@ export function clearBlockedFailuresFromState(
     delete entry.blocker;
   }
   return { files, sessions: sessions.size };
+}
+
+/**
+ * Clear EVERY per-file retry backoff — vault holds AND generic failures.
+ *
+ * `--blocked` only matches entries carrying a `skipReason`, which is exactly
+ * right for a Fortress outage and exactly wrong for a central fault: a 403
+ * from the storage layer takes the generic failure path, so after the
+ * 2026-08-01 credential outage 803 files sat pinned at the 30-minute backoff
+ * cap with nothing for `--blocked` to clear, and an already-fixed fleet
+ * recovered at 0.13 MB/s. This is the "the incident is over, retry everything
+ * now" lever. Destination failure runs are reset too — the next pass either
+ * succeeds (proving recovery) or re-latches them within one attempt.
+ */
+export function clearAllFailuresFromState(
+  state: HxState,
+): { files: number; sessions: number } {
+  const sessions = new Set<string>();
+  let files = 0;
+  for (const entry of Object.values(state.files)) {
+    if (
+      entry.skipReason === undefined &&
+      entry.blocker === undefined &&
+      entry.consecutiveFailures === undefined &&
+      entry.nextAttemptAtMs === undefined
+    ) {
+      continue;
+    }
+    files += 1;
+    sessions.add(`${entry.family}:${entry.sessionId}`);
+    delete entry.consecutiveFailures;
+    delete entry.nextAttemptAtMs;
+    delete entry.skipReason;
+    delete entry.blocker;
+  }
+  for (const key of Object.keys(state.destinations ?? {})) {
+    applyDestinationUploadSuccess(state, key);
+  }
+  return { files, sessions: sessions.size };
+}
+
+export async function clearAllFailures(
+  scope: StateScope = "main",
+): Promise<{ files: number; sessions: number }> {
+  const state = await loadState(scope);
+  const cleared = clearAllFailuresFromState(state);
+  if (cleared.files > 0) await schedulePersist(state, scope);
+  return cleared;
+}
+
+/**
+ * Drop generic (non-hold) backoffs only — the daemon-restart variant. A
+ * restart is a human signalling "conditions changed", so waiting out stale
+ * exponential penalties serves nobody; vault holds are deliberately kept
+ * (the store really is down until the gateway says otherwise).
+ */
+export function clearGenericBackoffsFromState(state: HxState): number {
+  let files = 0;
+  for (const entry of Object.values(state.files)) {
+    if (entry.skipReason !== undefined) continue; // a real hold — keep it
+    if (entry.consecutiveFailures === undefined && entry.nextAttemptAtMs === undefined) continue;
+    files += 1;
+    delete entry.consecutiveFailures;
+    delete entry.nextAttemptAtMs;
+    delete entry.blocker;
+  }
+  return files;
+}
+
+export async function clearGenericBackoffs(scope: StateScope = "main"): Promise<number> {
+  const state = await loadState(scope);
+  const files = clearGenericBackoffsFromState(state);
+  if (files > 0) await schedulePersist(state, scope);
+  return files;
 }
 
 /** Past the 30-day discovery window with margin — see HxState.deletedSessions. */

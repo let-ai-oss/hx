@@ -8,7 +8,7 @@
 // click must not edit dotfiles. On launchd/systemd the value is irrelevant.
 
 import { getDaemonOps, type DaemonState } from "./daemon.js";
-import { clearBlockedFailures, resetStateCache } from "./state.js";
+import { clearAllFailures, clearBlockedFailures, resetStateCache } from "./state.js";
 import { tickOnce } from "./watch.js";
 import { assertSecureFetchUrl } from "./net.js";
 import { writeConfig, type HxConfig } from "./config.js";
@@ -52,13 +52,21 @@ export interface RetryBlockedResult {
 
 export async function retryBlocked(
   cfg: HxConfig,
-  opts: { dotfileConsent: DotfileConsent; log: (msg: string) => void; foregroundPass?: boolean },
+  opts: {
+    dotfileConsent: DotfileConsent;
+    log: (msg: string) => void;
+    foregroundPass?: boolean;
+    /** "blocked" (default) releases vault holds only; "all" also clears the
+     *  generic failure backoffs — the after-a-central-incident lever. */
+    scope?: "blocked" | "all";
+  },
 ): Promise<RetryBlockedResult> {
   const ops = getDaemonOps();
   const before = await ops.state().catch(() => ({ loaded: false, pid: null }));
   if (before.loaded) await ops.stop();
   resetStateCache();
-  const cleared = await clearBlockedFailures();
+  const cleared =
+    opts.scope === "all" ? await clearAllFailures() : await clearBlockedFailures();
   if (before.loaded) {
     await ops.install({ binPath: process.execPath, dotfileConsent: opts.dotfileConsent });
     return { ...cleared, restarted: true };

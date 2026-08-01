@@ -1,7 +1,15 @@
 import { describe, it } from "bun:test";
 import assert from "node:assert/strict";
 import { buildLedger, classifyFile, isDestinationOffline, LIVE_WINDOW_MS, needsAttention } from "./ledger.js";
-import { applyDestinationReports, type FileState, type HxState } from "./state.js";
+import {
+  applyDestinationReports,
+  applyDestinationUploadError,
+  applyDestinationUploadSuccess,
+  clearAllFailuresFromState,
+  clearGenericBackoffsFromState,
+  type FileState,
+  type HxState,
+} from "./state.js";
 
 const NOW = Date.UTC(2026, 6, 29, 12, 0, 0);
 const DAY = 86_400_000;
@@ -217,5 +225,83 @@ describe("destination registry", () => {
     applyDestinationReports(state, [{ vaultOrgId: "orgA", status: "held", orgName: "Den Co" }], NOW - DAY);
     applyDestinationReports(state, [{ vaultOrgId: "orgA", status: "ready" }], NOW);
     assert.equal(state.destinations?.orgA?.orgName, "Den Co");
+  });
+});
+
+describe("failing destinations", () => {
+  const failedState = (errors: number): HxState => {
+    const state: HxState = { files: {} };
+    applyDestinationReports(state, [{ vaultOrgId: null, status: "ready" }], NOW);
+    for (let i = 0; i < errors; i++) {
+      applyDestinationUploadError(state, "letai", "403 SignatureDoesNotMatch", NOW - (errors - i) * 60_000);
+    }
+    return state;
+  };
+
+  it("stays quiet below the threshold — one blip is not a condition", () => {
+    const ledger = buildLedger({ files: [], state: failedState(2), incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.failing.length, 0);
+  });
+
+  it("latches after consecutive hard failures, with the storage layer's own code", () => {
+    // The 2026-08-01 outage shape: reachable store, every PUT rejected. The
+    // old status showed an innocent 0% with no error anywhere.
+    const ledger = buildLedger({ files: [], state: failedState(5), incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.failing.length, 1);
+    assert.equal(ledger.failing[0]?.errorCode, "403 SignatureDoesNotMatch");
+    assert.equal(ledger.failing[0]?.label, "primary store");
+  });
+
+  it("a successful commit ends the run immediately", () => {
+    const state = failedState(5);
+    assert.equal(applyDestinationUploadSuccess(state, "letai"), true);
+    const ledger = buildLedger({ files: [], state, incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.failing.length, 0);
+  });
+
+  it("a held destination is WAITING, never failing — the stories must not mix", () => {
+    const state: HxState = { files: {} };
+    applyDestinationReports(state, [{ vaultOrgId: "orgA", status: "held" }], NOW);
+    for (let i = 0; i < 5; i++) applyDestinationUploadError(state, "orgA", "503", NOW);
+    const ledger = buildLedger({ files: [], state, incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.failing.length, 0);
+  });
+
+  it("ages the failure run in whole hours", () => {
+    const state: HxState = { files: {} };
+    for (let i = 0; i < 3; i++) applyDestinationUploadError(state, "letai", "403", NOW - 2 * 3_600_000 + i);
+    const ledger = buildLedger({ files: [], state, incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.failing[0]?.failingHours, 2);
+  });
+});
+
+describe("backoff clearing", () => {
+  const withBackoffs = (): HxState => ({
+    files: {
+      held: { ...entry("held", { letai: 0 }), skipReason: "vault_offline", consecutiveFailures: 4, nextAttemptAtMs: NOW + 60_000 },
+      broken: { ...entry("broken", { letai: 0 }), consecutiveFailures: 12, nextAttemptAtMs: NOW + 30 * 60_000 },
+      healthy: entry("healthy", { letai: 10 }),
+    },
+  });
+
+  it("clearAll releases holds AND generic backoffs, and resets failure runs", () => {
+    const state = withBackoffs();
+    applyDestinationUploadError(state, "letai", "403", NOW);
+    const r = clearAllFailuresFromState(state);
+    assert.equal(r.files, 2);
+    assert.equal(state.files.held?.skipReason, undefined);
+    assert.equal(state.files.broken?.nextAttemptAtMs, undefined);
+    assert.equal(state.destinations?.letai?.consecutiveErrors, undefined);
+  });
+
+  it("the restart clear drops generic backoffs but keeps vault holds", () => {
+    // A hold means the gateway said the store is DOWN — a restart doesn't
+    // change that; only recovery (or an explicit retry) should.
+    const state = withBackoffs();
+    const n = clearGenericBackoffsFromState(state);
+    assert.equal(n, 1);
+    assert.equal(state.files.broken?.consecutiveFailures, undefined);
+    assert.equal(state.files.held?.skipReason, "vault_offline");
+    assert.equal(state.files.held?.consecutiveFailures, 4);
   });
 });

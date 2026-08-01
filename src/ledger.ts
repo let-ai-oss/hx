@@ -85,6 +85,11 @@ export interface SyncLedger {
   waitingBytes: number;
   /** Offline destinations holding waiting sessions, worst (oldest) first. */
   lagging: DestinationLag[];
+  /** Reachable destinations rejecting writes, longest-failing first. Uploading
+   *  sessions aimed at these are counted in the % as usual (the store IS
+   *  reachable — bytes should be moving), but the headline names the failure
+   *  instead of reading as an innocent backlog. */
+  failing: FailingDestination[];
 }
 
 /** A discovered file, narrowed to what classification needs. */
@@ -257,6 +262,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     uploadingBytes,
     waitingBytes,
     lagging,
+    failing: failingDestinations(state, nowMs, orgNames),
   };
 }
 
@@ -266,6 +272,51 @@ export function formatOutage(days: number | null): string {
   if (days === null) return "offline";
   if (days < 1) return "offline since today";
   return `offline ${days}d`;
+}
+
+/** Consecutive hard rejections before a destination reads as FAILING. One is a
+ *  blip; three in a row with no successful commit between them is a condition. */
+export const FAILING_AFTER = 3;
+
+/** A reachable destination that is rejecting writes. Distinct from `lagging`
+ *  (offline stores): those hold sessions safely, while a failing store means
+ *  bytes SHOULD be moving and are not — the highest-urgency state, and the one
+ *  the 2026-08-01 credential outage proved invisible without this. */
+export interface FailingDestination {
+  key: string;
+  label: string;
+  /** e.g. "403 SignatureDoesNotMatch" — the storage layer's own words. */
+  errorCode: string;
+  /** Whole hours since the current failure run began (0 for under an hour). */
+  failingHours: number | null;
+}
+
+/** Reachable destinations currently latched on a hard-failure run. */
+export function failingDestinations(
+  state: HxState,
+  nowMs: number,
+  orgNames: Record<string, string> = {},
+): FailingDestination[] {
+  const out: FailingDestination[] = [];
+  for (const [key, record] of Object.entries(state.destinations ?? {})) {
+    if (record.status === "held") continue; // offline is the WAITING story
+    if ((record.consecutiveErrors ?? 0) < FAILING_AFTER) continue;
+    const label =
+      (record.vaultOrgId && orgNames[record.vaultOrgId]) ||
+      record.orgName ||
+      (record.vaultOrgId === null || key === destKey(null) ? "primary store" : key);
+    out.push({
+      key,
+      label,
+      errorCode: record.lastErrorCode ?? "unknown error",
+      failingHours:
+        record.failingSinceMs === undefined
+          ? null
+          : Math.floor((nowMs - record.failingSinceMs) / 3_600_000),
+    });
+  }
+  // Longest-running failure first — same rule as lagging.
+  return out.sort((a, b) => (b.failingHours ?? -1) - (a.failingHours ?? -1));
 }
 
 /** How long a destination must be offline before waiting stops being a plan
