@@ -122,3 +122,35 @@ describe("backfill schedule", () => {
     assert.equal(backfillDue("local", NOW), true, "the --local tee sweeps on its own schedule");
   });
 });
+
+// The coverage matrix the backfill + the (now unwindowed) canonical audit
+// must jointly satisfy after a gateway change. Neither mechanism covers it
+// alone, and a gap in either one loses history silently.
+describe("gateway-change coverage matrix", () => {
+  const OLD = 60; // days — outside the live window
+  const NEW = 2;  // days — inside it
+
+  it("backfill owns >30d files with NO delivery record", () => {
+    const out = selectBackfill([file("old-never", 100, OLD)], { files: {} }, NOW);
+    assert.equal(out.length, 1);
+  });
+
+  it("backfill DELIBERATELY skips >30d files whose offsets claim delivery", () => {
+    // This is the case the audit must cover: after beta → prod the offsets are
+    // stale-but-complete, so the file looks done. If the audit is windowed,
+    // nothing reaches this file and its history never re-uploads.
+    const state = stateWith(entry("old-looks-done", { letai: 100 }));
+    const out = selectBackfill([file("old-looks-done", 100, OLD)], state, NOW);
+    assert.equal(out.length, 0, "backfill must not claim it — the audit verifies it against the server");
+  });
+
+  it("backfill leaves everything inside the live window to the hot loop", () => {
+    const state = stateWith(entry("fresh", { letai: 40 }));
+    assert.equal(selectBackfill([file("fresh", 100, NEW)], state, NOW).length, 0);
+  });
+
+  it("a partial >30d file is still claimed by backfill", () => {
+    const state = stateWith(entry("old-partial", { letai: 40 }));
+    assert.equal(selectBackfill([file("old-partial", 100, OLD)], state, NOW).length, 1);
+  });
+});

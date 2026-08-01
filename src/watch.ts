@@ -1174,9 +1174,25 @@ async function auditCanonicals(
   const scope = scopeOf(cfg);
   if (SELF_HEAL.get(scope) === false) return;
   const roots = resolveDataRoots(await readSettings());
+  // UNWINDOWED, deliberately. The audit's whole job is "does the server still
+  // hold what our offsets claim it holds?", and that question does not expire
+  // after 30 days — the answer is wrong for exactly as long as the file sits
+  // on disk.
+  //
+  // A windowed audit left a hole nothing else could cover. When a device's
+  // gateway changes (beta → prod), state.json KEEPS its per-file offsets, so
+  // every old session reads as already-delivered while the new bucket holds
+  // none of it. Such a file is skipped by the backfill sweep (it looks
+  // delivered) AND invisible to a 30-day audit — so it would never re-upload,
+  // silently, forever. Measured on one device after the 2026-07-30 cutover:
+  // 71 files / 46.7 MB in that blind spot.
+  //
+  // Cheap: discovery is a warm stat sweep, candidates are already filtered to
+  // offset > 0, and verifySessions batches 1,000 per round trip — an extra
+  // few hundred sessions is a fraction of one request, twice an hour.
   const [claude, codex] = await Promise.all([
-    discoverClaudeFiles(roots.claude),
-    discoverCodexFiles(roots.codex),
+    discoverClaudeFiles(roots.claude, { maxAgeMs: Infinity }),
+    discoverCodexFiles(roots.codex, { maxAgeMs: Infinity }),
   ]);
   let files = [...claude, ...codex];
   if (opts.only) files = files.filter((f) => f.path === opts.only);
