@@ -66,6 +66,7 @@ import { appendActivity, trimActivity } from "./activity.js";
 import { runReattributeSweep } from "./reattribute.js";
 import { readOrgNames, rememberOrgNames } from "./org-names.js";
 import { buildLedger, type SyncLedger } from "./ledger.js";
+import { backfillDue, discoverBackfill, markBackfillRun } from "./backfill.js";
 import { collapseHome, isPaused, readSettings, shouldSkipFile, type HxSettings } from "./settings.js";
 import { type HxConfig } from "./config.js";
 import { resolveRoute, type Route } from "./route.js";
@@ -1592,6 +1593,35 @@ export async function tickOnce(
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
+
+  // The unwindowed sweep: once on start, then hourly. Live discovery above
+  // prunes to 30 days for CADENCE (a 1.5s loop cannot stat 100k files), but
+  // that bound was also silently deciding what would ever be uploaded at all —
+  // so a file that went 30 days unignested was abandoned with no report. This
+  // reaches everything still on disk that has not been fully delivered.
+  // Merged BEFORE election/filtering so a backfilled file passes through the
+  // identical gates (twin election, settings excludes, tombstones, routing).
+  if (!opts.only && backfillDue(scope, Date.now())) {
+    markBackfillRun(scope, Date.now());
+    try {
+      const older = await discoverBackfill(roots, state, Date.now());
+      if (older.length > 0) {
+        const known = new Set(files.map((f) => f.path));
+        const added = older.filter((f) => !known.has(f.path));
+        const unseen = added.filter((f) => !state.files[f.path]).length;
+        if (added.length > 0) {
+          log(
+            `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} older than the 30-day window still undelivered (${unseen} never ingested) — queueing`,
+          );
+          files = [...files, ...added];
+        }
+      }
+    } catch (err) {
+      // Never let the slow sweep break a pass: the live backlog matters more,
+      // and the next hourly attempt retries anyway.
+      log(`[hx] backfill sweep skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   files = filterWatched(electUploaders(files, state, log), state, settings);
   onProgress?.(snapshotFrom(files, state));
 
