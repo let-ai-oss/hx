@@ -328,3 +328,46 @@ describe("live bucket naming", () => {
     assert.equal(ledger.percent, 100, "someone typing must never dent the number");
   });
 });
+
+describe("session date range", () => {
+  it("spans oldest to newest last-activity across on-disk sessions", () => {
+    const ledger = buildLedger({
+      files: [file("a", 10, 60 * DAY), file("b", 10, 1 * DAY), file("c", 10, 30 * DAY)],
+      state: { files: {} },
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.oldestMs, NOW - 60 * DAY);
+    assert.equal(ledger.newestMs, NOW - 1 * DAY);
+  });
+
+  it("is null on an empty device rather than ±Infinity", () => {
+    // Math.min/max over an empty list would yield Infinity and render as an
+    // absurd date; the row is omitted instead.
+    const ledger = buildLedger({ files: [], state: { files: {} }, incompleteSessions: 0, nowMs: NOW });
+    assert.equal(ledger.oldestMs, null);
+    assert.equal(ledger.newestMs, null);
+  });
+
+  it("ignores incomplete sessions, which are no longer on disk", () => {
+    const ledger = buildLedger({
+      files: [file("a", 10, 5 * DAY)],
+      state: { files: {} },
+      incompleteSessions: 7,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.total, 8, "incomplete still counts toward the total");
+    assert.equal(ledger.oldestMs, NOW - 5 * DAY, "but cannot widen the range — it has no mtime");
+    assert.equal(ledger.newestMs, NOW - 5 * DAY);
+  });
+
+  it("collapses to a single instant when only one session exists", () => {
+    const ledger = buildLedger({
+      files: [file("solo", 10, 3 * DAY)],
+      state: { files: {} },
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.oldestMs, ledger.newestMs);
+  });
+});
