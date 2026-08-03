@@ -47,6 +47,7 @@ import {
   getFileState,
   isDeletedSession,
   loadState,
+  reconcileGateway,
   recordDeletedSession,
   recordFileFailure,
   minOffset,
@@ -1065,6 +1066,18 @@ export async function backfillArtifacts(
   cfg: HxConfig,
   log: (msg: string) => void,
 ): Promise<{ tasks: number; plans: number; failed: number }> {
+  // Backfill's skip check is the artifact-hash map — "this task set is already
+  // uploaded THERE". That is per-gateway knowledge, and this entry point does
+  // not pass through tickOnce, so reconcile here too: `hx backfill` as the
+  // first command after a gateway switch must not skip on hashes recorded
+  // against the previous gateway.
+  const gatewaySwitch = await reconcileGateway(cfg.gatewayBaseUrl, scopeOf(cfg));
+  if (gatewaySwitch.kind === "reset") {
+    log(
+      `[hx] gateway changed → dropped upload offsets for ${gatewaySwitch.filesReset} file(s); ` +
+        `re-verifying everything against ${cfg.gatewayBaseUrl}`,
+    );
+  }
   const settings = await readSettings();
   const roots = resolveDataRoots(settings);
   const tasksDirs = roots.claude.map((r) => claudeTasksDir(r.configDir));
@@ -1644,6 +1657,21 @@ export async function tickOnce(
   if (opts.only) files = files.filter((f) => f.path === opts.only);
 
   const scope = scopeOf(cfg);
+  // Offsets are only meaningful against the gateway that produced them. If
+  // the configured gateway changed since this state file was written (a
+  // cutover, an env switch, a hand-edited config), everything it claims is
+  // about the WRONG server — reset before trusting a single byte of it.
+  // Cheap when nothing changed. tickOnce covers the daemon loop and one-shot
+  // `hx tick`; other consumers of per-gateway state reconcile at their own
+  // entry (backfillArtifacts), and read-only surfaces flag a pending stamp
+  // instead of writing (cmdStatus).
+  const gatewaySwitch = await reconcileGateway(cfg.gatewayBaseUrl, scope);
+  if (gatewaySwitch.kind === "reset") {
+    log(
+      `[hx] gateway changed → dropped upload offsets for ${gatewaySwitch.filesReset} file(s); ` +
+        `re-verifying everything against ${cfg.gatewayBaseUrl}`,
+    );
+  }
   // Report before uploading anything so a freshly connected device shows its
   // full backlog ("0 / 1,203") immediately, not only after the first pass.
   const state = await loadState(scope);
