@@ -471,6 +471,44 @@ export async function uploadTeamMirror(
 // (e.g. an ephemeral-filesystem deploy wiped it) — the watcher responds by
 // resetting that file's offset to 0, which re-uploads it with replace:true.
 
+/** What the SERVER holds for this device — the "in cloud" half of the count. */
+export interface DeviceInventory {
+  sessions: number;
+  bytes: number;
+  oldestAt: string | null;
+  newestAt: string | null;
+}
+
+/**
+ * Ask the gateway what it has for this device.
+ *
+ * `hx status` can only count what is still on disk, and Claude Code prunes
+ * transcripts after 30 days — so the local number is a rolling window while the
+ * archive keeps growing. Reporting only the local one makes the product look
+ * like a mirror of that window instead of the archive it is.
+ *
+ * Best-effort by design: a gateway that predates the endpoint 404s and the row
+ * is simply omitted, never an error.
+ */
+export async function fetchDeviceInventory(cfg: HxConfig): Promise<DeviceInventory | null> {
+  try {
+    const res = await fetch(`${cfg.gatewayBaseUrl}/devices/inventory`, {
+      headers: authHeaders(cfg),
+    });
+    if (!res.ok) return null;
+    const json = (await res.json()) as Partial<DeviceInventory>;
+    if (typeof json.sessions !== "number" || typeof json.bytes !== "number") return null;
+    return {
+      sessions: json.sessions,
+      bytes: json.bytes,
+      oldestAt: json.oldestAt ?? null,
+      newestAt: json.newestAt ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export interface VerifySessionsItem {
   family: Family;
   sessionId: string;

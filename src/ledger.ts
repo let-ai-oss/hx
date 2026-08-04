@@ -46,7 +46,9 @@ export type SessionState =
   | "uploading"
   /** Only OFFLINE destinations are owed bytes — excluded from the %. */
   | "waiting"
-  /** Source file gone before a reachable destination got the bytes. Permanent. */
+  /** Source file no longer on disk and delivery was never confirmed. There is
+   *  nothing left to send and nothing to act on, so this is REPORTED but never
+   *  counted — see SyncLedger.notOnDisk. */
   | "incomplete";
 
 /** A destination owing bytes to at least one waiting session. */
@@ -79,8 +81,27 @@ export interface SyncLedger {
   live: number;
   uploading: number;
   waiting: number;
+  /** The subset of `waiting` with NO complete copy at any reachable store — a
+   *  customer-Fortress session whose only whole transcript is the local file.
+   *  Counted in the percentage, unlike the rest of `waiting`: it is actionable
+   *  (bring the Fortress back) and it has a deadline (Claude Code prunes at 30
+   *  days), after which the session is genuinely gone. */
+  waitingUnprotected: number;
+  /** Sessions whose local file is gone and whose delivery was never confirmed.
+   *
+   *  Deliberately OUTSIDE `total` and outside the percentage. Claude Code prunes
+   *  transcripts after 30 days, so every session eventually leaves the disk;
+   *  counting the unconfirmed ones as a fault built a pile that only ever grew,
+   *  and nothing in it can be acted on — there is no file left to send. Measured
+   *  on two real devices, that pile was wrong 8 times out of 10 and roughly 100
+   *  times out of 103: the sessions were on the server all along.
+   *
+   *  A device that genuinely cannot upload is still loud while it matters —
+   *  `failing` names a rejecting store and `uploading` climbs, both for the ~30
+   *  days before anything is pruned. This number is the post-hoc record, kept
+   *  for diagnostics only. */
   incomplete: number;
-  /** delivered / (delivered + uploading + incomplete), floored. 100 when idle. */
+  /** delivered / (delivered + uploading), floored. 100 when idle. */
   percent: number;
   /** On-disk bytes of the sessions that have actually landed everywhere. */
   deliveredBytes: number;
@@ -136,6 +157,29 @@ export function isDestinationOffline(state: HxState, key: string): boolean {
   return state.destinations?.[key]?.status === "held";
 }
 
+/**
+ * Is there a COMPLETE copy at a destination we can currently reach?
+ *
+ * This is what decides whether an offline Fortress owing bytes is merely slow
+ * or is actually dangerous. When a session fans out and the shared store already
+ * holds all of it, a lagging Fortress is a nuisance — the transcript is safe.
+ * When a session lives ONLY in a customer Fortress (the residency rule: an org
+ * with its own Fortress keeps its sessions there and nowhere else), an offline
+ * Fortress means the sole complete copy is the local jsonl — and Claude Code
+ * deletes that after 30 days. Same bucket, opposite stakes.
+ */
+function hasReachableCompleteCopy(
+  fs: FileState | undefined,
+  size: number,
+  state: HxState,
+): boolean {
+  for (const [key, offset] of Object.entries(fs?.offsets ?? {})) {
+    if (isDestinationOffline(state, key)) continue;
+    if (offset >= size) return true;
+  }
+  return false;
+}
+
 /** Per-destination undelivered bytes for one file, split by reachability. */
 function lagOf(
   fs: FileState | undefined,
@@ -164,18 +208,26 @@ export function classifyFile(
   file: LedgerFile,
   state: HxState,
   nowMs: number,
-): { state: Exclude<SessionState, "incomplete">; reachableBytes: number; offline: Map<string, number> } {
+): {
+  state: Exclude<SessionState, "incomplete">;
+  reachableBytes: number;
+  offline: Map<string, number>;
+  /** Waiting AND no complete copy anywhere reachable — the only whole
+   *  transcript is the local file, which Claude Code prunes at 30 days. */
+  unprotected: boolean;
+} {
   const fs = state.files[file.path];
   const { reachable, offline } = lagOf(fs, file.size, state);
+  const unprotected = offline.size > 0 && !hasReachableCompleteCopy(fs, file.size, state);
   // Live tail first, and unconditionally: see LIVE_WINDOW_MS. A session still
   // being written on this device is never a backlog and never a fault,
   // whatever it still owes.
   if (nowMs - file.mtimeMs < LIVE_WINDOW_MS) {
-    return { state: "live", reachableBytes: reachable, offline };
+    return { state: "live", reachableBytes: reachable, offline, unprotected: false };
   }
-  if (reachable > 0) return { state: "uploading", reachableBytes: reachable, offline };
-  if (offline.size > 0) return { state: "waiting", reachableBytes: 0, offline };
-  return { state: "delivered", reachableBytes: 0, offline };
+  if (reachable > 0) return { state: "uploading", reachableBytes: reachable, offline, unprotected };
+  if (offline.size > 0) return { state: "waiting", reachableBytes: 0, offline, unprotected };
+  return { state: "delivered", reachableBytes: 0, offline, unprotected: false };
 }
 
 function offlineDaysOf(state: HxState, key: string, nowMs: number): number | null {
@@ -193,6 +245,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let live = 0;
   let uploading = 0;
   let waiting = 0;
+  let waitingUnprotected = 0;
   let totalBytes = 0;
   let oldestMs: number | null = null;
   let newestMs: number | null = null;
@@ -223,6 +276,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
         break;
       case "waiting": {
         waiting += 1;
+        if (c.unprotected) waitingUnprotected += 1;
         // Only `waiting` sessions are billed to a destination, so the per-
         // destination counts and the Waiting total describe the same set. They
         // still sum to MORE than `waiting` when a session fans out to several
@@ -244,7 +298,15 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     }
   }
 
-  const sendable = delivered + uploading + incompleteSessions;
+  // `incompleteSessions` is deliberately absent: nothing in it is on disk, so
+  // nothing in it can be sent, and a number nobody can act on does not belong
+  // in a health percentage.
+  // `waiting` normally stays out: a session already complete on a reachable
+  // store is safe however long a secondary Fortress lags. But a session whose
+  // ONLY complete copy is the local file is neither safe nor unactionable, and
+  // excluding it let a device report "100% — all sessions sent" while a
+  // transcript counted down to deletion. Those count.
+  const sendable = delivered + uploading + waitingUnprotected;
   const percent = sendable === 0 ? 100 : Math.floor((delivered / sendable) * 100);
 
   const lagging: DestinationLag[] = [...lag.entries()]
@@ -266,7 +328,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
 
   return {
-    total: files.length + incompleteSessions,
+    total: files.length,
     totalBytes,
     oldestMs,
     newestMs,
@@ -274,6 +336,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     live,
     uploading,
     waiting,
+    waitingUnprotected,
     incomplete: incompleteSessions,
     percent,
     deliveredBytes,
