@@ -15,6 +15,7 @@ import { backfillArtifacts, computeSyncReport, computeSyncSnapshot, startWatch, 
 import { runReattributeSweep } from "./reattribute.js";
 import { getDaemonOps, tailLogs, type DaemonOps, type DaemonState } from "./daemon.js";
 import { probeConnection, formatRate } from "./probe.js";
+import { fetchDeviceInventory } from "./uploader.js";
 import { runUpdate, type UpdateProgress, type UpdateResult } from "./update.js";
 import { ProgressBar } from "./progress.js";
 import { runUninstall } from "./uninstall.js";
@@ -619,6 +620,9 @@ async function cmdStatus(): Promise<void> {
   // persisted destination hold should still name the affected org/repo.
   const report = await computeSyncReport(watchRoots).catch(() => null);
   const probe = await probeConnection(cfg);
+  // The "in cloud" half of the count. Best-effort: an older gateway, or no
+  // network, omits the row rather than failing the command.
+  const archive = probe.up ? await fetchDeviceInventory(cfg) : null;
   if (!probe.up) {
     rows.push(["Connection", `down — ${probe.reason}`]);
     if (report && report.skipped.length > 0) {
@@ -632,13 +636,36 @@ async function cmdStatus(): Promise<void> {
     "Connection",
     `up — ${probe.quality} (${probe.latencyMs} ms, ${formatRate(probe.bytesPerSec)})`,
   ]);
+  // A session that is ON DISK and cannot upload because its Fortress is offline
+  // is the one thing here a person can act on — and it was only rendered when
+  // the whole gateway was down too, i.e. never in the case that matters.
+  //
+  // It falls through every other surface: `Waiting` needs an offset key for the
+  // held destination, and a vault_home_unreachable session never gets one (the
+  // append-url 503s before any destination list comes back), so it classifies
+  // as ordinary `uploading` and the Fortress disappears from the ledger. On one
+  // device that left a Fortress-held session sitting anonymously inside
+  // "Uploading 17" with nothing on screen naming a Fortress at all.
+  //
+  // report.skipped is local state and needs no network, so it is just as
+  // available when the probe is up.
+  if (report && report.skipped.length > 0) {
+    rows.push(["Blocked", formatStatusBlocker(report.skipped)]);
+    rows.push(["  Details", "hx status --detailed"]);
+  }
 
   // The health ledger. Every session sits in exactly one bucket and the
   // buckets sum to the total, so the headline percentage can be checked
   // against the rows under it rather than taken on faith.
   const ledger = report?.ledger ?? null;
   if (ledger && ledger.total > 0) {
-    rows.push(["Sessions", `${ledger.total} on this device · ${formatSize(ledger.totalBytes)}`]);
+    // Both halves. `total` is the on-disk set by construction now, and
+    // `totalBytes` has always covered on-disk files only, so the count and the
+    // size finally describe one population.
+    rows.push(["Sessions", `${ledger.total} on disk · ${formatSize(ledger.totalBytes)}`]);
+    if (archive) {
+      rows.push([" ", `${archive.sessions} in cloud · ${formatSize(archive.bytes)}`]);
+    }
     // How deep the local history actually goes. Worth its own row because the
     // discovery window prunes at 30 days: seeing the span makes it obvious
     // whether older history exists on disk at all, rather than leaving the
@@ -694,16 +721,13 @@ async function cmdStatus(): Promise<void> {
   // Real loss gets its own box ABOVE the reassuring one, so it can never be
   // read as part of the waiting story. This is the only thing that moves the
   // percentage off 100%.
+  // No box for sessions whose file is gone. Nothing in that set is on disk, so
+  // nothing in it can be sent and nothing in it can be acted on; it is reported
+  // in `--detailed` for diagnostics instead of alarming on every run. What a
+  // person CAN act on — a rejecting store, a Fortress hold, a real backlog —
+  // has its own box above and stays loud for the ~30 days before Claude Code
+  // prunes anything.
   const lossRows: Array<[string, string]> = [];
-  if (ledger && ledger.incomplete > 0) {
-    // "gone", not "deleted": the source may have been removed OR simply aged
-    // out of the 30-day discovery window. --detailed splits the two.
-    lossRows.push([
-      "Incomplete",
-      `${sessions(ledger.incomplete)} · source file gone before upload finished`,
-    ]);
-    lossRows.push(["  Recover", "hx status --detailed explains each one"]);
-  }
 
   // Sessions only an offline store still owes bytes to. Never suppressed when
   // non-zero: printing 100% above is honest ONLY because this box is always
@@ -774,9 +798,6 @@ function syncVerdict(ledger: SyncLedger): string {
   // never buried — it has its own box directly underneath.
   if (ledger.uploading > 0) {
     return `${ledger.percent}% — catching up · ${formatSize(ledger.uploadingBytes)} left`;
-  }
-  if (ledger.incomplete > 0) {
-    return `${ledger.percent}% — ${sessions(ledger.incomplete)} incomplete`;
   }
   if (ledger.waiting > 0) return `${ledger.percent}% — everything that can be sent, is sent`;
   return `${ledger.percent}% — all sessions sent`;

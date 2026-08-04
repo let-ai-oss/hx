@@ -46,7 +46,9 @@ export type SessionState =
   | "uploading"
   /** Only OFFLINE destinations are owed bytes — excluded from the %. */
   | "waiting"
-  /** Source file gone before a reachable destination got the bytes. Permanent. */
+  /** Source file no longer on disk and delivery was never confirmed. There is
+   *  nothing left to send and nothing to act on, so this is REPORTED but never
+   *  counted — see SyncLedger.notOnDisk. */
   | "incomplete";
 
 /** A destination owing bytes to at least one waiting session. */
@@ -79,8 +81,21 @@ export interface SyncLedger {
   live: number;
   uploading: number;
   waiting: number;
+  /** Sessions whose local file is gone and whose delivery was never confirmed.
+   *
+   *  Deliberately OUTSIDE `total` and outside the percentage. Claude Code prunes
+   *  transcripts after 30 days, so every session eventually leaves the disk;
+   *  counting the unconfirmed ones as a fault built a pile that only ever grew,
+   *  and nothing in it can be acted on — there is no file left to send. Measured
+   *  on two real devices, that pile was wrong 8 times out of 10 and roughly 100
+   *  times out of 103: the sessions were on the server all along.
+   *
+   *  A device that genuinely cannot upload is still loud while it matters —
+   *  `failing` names a rejecting store and `uploading` climbs, both for the ~30
+   *  days before anything is pruned. This number is the post-hoc record, kept
+   *  for diagnostics only. */
   incomplete: number;
-  /** delivered / (delivered + uploading + incomplete), floored. 100 when idle. */
+  /** delivered / (delivered + uploading), floored. 100 when idle. */
   percent: number;
   /** On-disk bytes of the sessions that have actually landed everywhere. */
   deliveredBytes: number;
@@ -244,7 +259,10 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     }
   }
 
-  const sendable = delivered + uploading + incompleteSessions;
+  // `incompleteSessions` is deliberately absent: nothing in it is on disk, so
+  // nothing in it can be sent, and a number nobody can act on does not belong
+  // in a health percentage.
+  const sendable = delivered + uploading;
   const percent = sendable === 0 ? 100 : Math.floor((delivered / sendable) * 100);
 
   const lagging: DestinationLag[] = [...lag.entries()]
@@ -266,7 +284,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     .sort((a, b) => (b.offlineDays ?? -1) - (a.offlineDays ?? -1) || b.sessions - a.sessions);
 
   return {
-    total: files.length + incompleteSessions,
+    total: files.length,
     totalBytes,
     oldestMs,
     newestMs,

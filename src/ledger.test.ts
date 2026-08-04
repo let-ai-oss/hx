@@ -133,21 +133,35 @@ describe("ledger percentage", () => {
     assert.equal(ledger.percent, 50);
   });
 
-  it("drops below 100% for real loss", () => {
+  // DELIBERATE REVERSAL. This asserted that a session whose file is gone pulls
+  // the percentage down (9/10 = 90%). It no longer does, and it no longer
+  // counts toward the total.
+  //
+  // Claude Code prunes transcripts after 30 days, so EVERY session eventually
+  // leaves the disk. Treating the unconfirmed ones as a fault built a pile that
+  // only grew, and nothing in it can be acted on — there is no file left to
+  // send. On two real devices that pile was wrong 8 times out of 10 and about
+  // 100 times out of 103: the sessions were on the server the whole time.
+  //
+  // Genuine inability to upload is still loud WHILE it is actionable —
+  // `failing` names a rejecting store and `uploading` climbs, both for the ~30
+  // days before anything is pruned. See the `Not on disk` line in --detailed
+  // for the post-hoc record.
+  it("is unmoved by sessions that are no longer on disk", () => {
     const paths = Array.from({ length: 9 }, (_, i) => `s${i}`);
     const files = Object.fromEntries(paths.map((p) => [p, entry(p, { letai: 10 })]));
     const ledger = buildLedger({
       files: paths.map((p) => file(p, 10)),
       state: stateWithOfflineFortress(files),
-      // Sessions whose source vanished mid-upload are not on disk any more, so
-      // they add to the total rather than being found among `files`.
       incompleteSessions: 1,
       nowMs: NOW,
     });
     assert.equal(ledger.delivered, 9);
+    // Still REPORTED — the diagnostic record survives...
     assert.equal(ledger.incomplete, 1);
-    assert.equal(ledger.percent, 90);
-    assert.equal(ledger.total, 10);
+    // ...but out of both the percentage and the total.
+    assert.equal(ledger.percent, 100);
+    assert.equal(ledger.total, 9);
   });
 
   it("is 100% on an empty device rather than NaN", () => {
@@ -356,7 +370,9 @@ describe("session date range", () => {
       incompleteSessions: 7,
       nowMs: NOW,
     });
-    assert.equal(ledger.total, 8, "incomplete still counts toward the total");
+    // CHANGED from 8: `total` is now the on-disk set, so "N on disk" in
+    // `hx status` means what it says. The 7 stay visible via ledger.incomplete.
+    assert.equal(ledger.total, 1, "total is what is actually on disk");
     assert.equal(ledger.oldestMs, NOW - 5 * DAY, "but cannot widen the range — it has no mtime");
     assert.equal(ledger.newestMs, NOW - 5 * DAY);
   });

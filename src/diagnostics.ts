@@ -275,20 +275,28 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
   if (ledger.waiting > 0) {
     lines.push(`  Waiting     ${num(ledger.waiting)}   an offline Fortress owes bytes`);
   }
-  if (ledger.incomplete > 0) {
-    lines.push(`  Incomplete  ${num(ledger.incomplete)}   source file gone before upload finished`);
-  }
   lines.push(`              ${"─".repeat(6)}`);
   lines.push(`              ${num(ledger.total)}`);
+  if (ledger.incomplete > 0) {
+    // OUTSIDE the sum, and said plainly: this accumulates for as long as the
+    // device is used, so a reader who meets a four-digit number here needs to
+    // know immediately that it is a ledger, not a fault.
+    const pad = " ".repeat(23);
+    lines.push(
+      `  Not on disk ${num(ledger.incomplete)}   removed locally before delivery could be confirmed.`,
+    );
+    lines.push(`${pad}Grows over time — Claude Code prunes at 30 days. Not a`);
+    lines.push(`${pad}fault and not counted; kept for diagnostics.`);
+  }
   if (ledger.oldestMs !== null && ledger.newestMs !== null) {
     const iso = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
     const days = Math.max(1, Math.round((ledger.newestMs - ledger.oldestMs) / 86_400_000));
     lines.push(`  Range       ${iso(ledger.oldestMs)} → ${iso(ledger.newestMs)}  (${days} days on disk)`);
   }
-  const sendable = ledger.delivered + ledger.uploading + ledger.incomplete;
+  const sendable = ledger.delivered + ledger.uploading;
   lines.push(
     `  Sync ${ledger.percent}% = ${ledger.delivered} delivered / ${sendable} sendable` +
-      ` (in-progress and waiting sessions are excluded — nothing you can act on)`,
+      ` (live, waiting and no-longer-on-disk sessions are excluded — nothing you can act on)`,
   );
   if (ledger.failing.length > 0) {
     lines.push("");
@@ -368,12 +376,6 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     lines.push("After fixing the destination or repository attachment:");
     lines.push("  hx retry --blocked");
     lines.push("  hx status");
-  }
-  if (report.gaps.sessions > 0) {
-    lines.push("");
-    lines.push(
-      `Sync gaps: ${report.gaps.sessions} session${report.gaps.sessions === 1 ? "" : "s"} (${report.gaps.localFileDeleted} deleted locally, ${report.gaps.outsideScanWindow} outside the scan window)`,
-    );
   }
   if (report.unwatchedSessions > 0) {
     lines.push("");
