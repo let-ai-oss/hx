@@ -272,8 +272,15 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
   if (ledger.live > 0) {
     lines.push(`  Live        ${num(ledger.live)}   actively working on this device (local)`);
   }
-  if (ledger.waiting > 0) {
-    lines.push(`  Waiting     ${num(ledger.waiting)}   an offline Fortress owes bytes`);
+  if (ledger.waiting - ledger.waitingUnprotected > 0) {
+    lines.push(
+      `  Waiting     ${num(ledger.waiting - ledger.waitingUnprotected)}   an offline Fortress owes bytes (a complete copy is already safe)`,
+    );
+  }
+  if (ledger.waitingUnprotected > 0) {
+    lines.push(
+      `  At risk     ${num(ledger.waitingUnprotected)}   only complete copy is on THIS DEVICE — Fortress offline`,
+    );
   }
   lines.push(`              ${"─".repeat(6)}`);
   lines.push(`              ${num(ledger.total)}`);
@@ -293,10 +300,13 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     const days = Math.max(1, Math.round((ledger.newestMs - ledger.oldestMs) / 86_400_000));
     lines.push(`  Range       ${iso(ledger.oldestMs)} → ${iso(ledger.newestMs)}  (${days} days on disk)`);
   }
-  const sendable = ledger.delivered + ledger.uploading;
+  // Must mirror buildLedger exactly, or the printed arithmetic contradicts the
+  // number beside it — the whole point of showing the formula.
+  const sendable = ledger.delivered + ledger.uploading + ledger.waitingUnprotected;
   lines.push(
     `  Sync ${ledger.percent}% = ${ledger.delivered} delivered / ${sendable} sendable` +
-      ` (live, waiting and no-longer-on-disk sessions are excluded — nothing you can act on)`,
+      ` (live sessions, sessions already safe elsewhere, and sessions no longer on` +
+      ` disk are excluded — nothing you can act on)`,
   );
   if (ledger.failing.length > 0) {
     lines.push("");
@@ -386,11 +396,20 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
   // Held is not lost. Say so explicitly: four warning paragraphs above read as
   // data loss without it, and the whole point of excluding waiting sessions
   // from the percentage is that they are safe on disk.
-  if (report.ledger.waiting > 0) {
+  const safeWaiting = report.ledger.waiting - report.ledger.waitingUnprotected;
+  if (safeWaiting > 0) {
     lines.push("");
     lines.push(
-      `Nothing is lost — all ${report.ledger.waiting} waiting session${report.ledger.waiting === 1 ? " is" : "s are"} still on disk and retrying.`,
+      `Nothing is lost — ${safeWaiting} waiting session${safeWaiting === 1 ? " is" : "s are"} already complete on a reachable store and still retrying.`,
     );
+  }
+  if (report.ledger.waitingUnprotected > 0) {
+    lines.push("");
+    lines.push(
+      `AT RISK — ${report.ledger.waitingUnprotected} session${report.ledger.waitingUnprotected === 1 ? "" : "s"} exist ONLY on this device: their Fortress is`,
+    );
+    lines.push("offline and there is no copy anywhere else. Claude Code deletes transcripts");
+    lines.push("after 30 days; bring the Fortress online before then or they are gone.");
   }
   if (report.ok) lines.push("Result: healthy — 100% uploaded");
   return lines.join("\n");

@@ -387,3 +387,68 @@ describe("session date range", () => {
     assert.equal(ledger.oldestMs, ledger.newestMs);
   });
 });
+
+// Residency: an org with its own Fortress keeps its sessions THERE and nowhere
+// else — there is no let.ai copy. That makes two situations share the `waiting`
+// bucket with opposite stakes, and the ledger used to treat them identically:
+// both left the percentage, so a device could report "100% — all sessions sent"
+// while the only complete copy of a transcript sat on its own disk with a
+// 30-day fuse on it.
+describe("waiting sessions with no copy anywhere else", () => {
+  const held = (files: Record<string, FileState>): HxState => {
+    const state: HxState = { files };
+    applyDestinationReports(
+      state,
+      [
+        { vaultOrgId: null, status: "ready" },
+        { vaultOrgId: "orgF", status: "held", orgName: "my-fortress", lastSeenAt: null },
+      ],
+      NOW - 10 * DAY,
+    );
+    return state;
+  };
+
+  it("counts a Fortress-only session against the device", () => {
+    // Half-delivered to a Fortress that is now offline, and no let.ai copy
+    // exists by design. The whole transcript is on this laptop only.
+    const files = { a: entry("a", { orgF: 400 }) };
+    const ledger = buildLedger({
+      files: [file("a", 1000)],
+      state: held(files),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.waiting, 1);
+    assert.equal(ledger.waitingUnprotected, 1);
+    assert.equal(ledger.percent, 0, "not 100% — this session is one prune from gone");
+  });
+
+  it("still excuses a fan-out session that is already complete elsewhere", () => {
+    // The case 6178afe fixed: complete on the reachable store, a secondary
+    // Fortress merely behind. Safe, unactionable, stays out of the percentage.
+    const files = { a: entry("a", { letai: 1000, orgF: 0 }) };
+    const ledger = buildLedger({
+      files: [file("a", 1000)],
+      state: held(files),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(ledger.waiting, 1);
+    assert.equal(ledger.waitingUnprotected, 0);
+    assert.equal(ledger.percent, 100);
+  });
+
+  it("does not treat a partial copy on a reachable store as protection", () => {
+    const files = { a: entry("a", { letai: 900, orgF: 0 }) };
+    const ledger = buildLedger({
+      files: [file("a", 1000)],
+      state: held(files),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    // letai is owed 100 bytes, so this is `uploading`, not `waiting` — but the
+    // point stands: 900 of 1000 is not a complete copy.
+    assert.equal(ledger.uploading, 1);
+    assert.equal(ledger.percent, 0);
+  });
+});

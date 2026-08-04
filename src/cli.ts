@@ -733,10 +733,19 @@ async function cmdStatus(): Promise<void> {
   // non-zero: printing 100% above is honest ONLY because this box is always
   // adjacent to it. Its first row says "nothing lost" before naming anything.
   const waitRows: Array<[string, string]> = [];
-  if (ledger && ledger.waiting > 0) {
+  if (ledger && ledger.waitingUnprotected > 0) {
+    // NOT "nothing lost". These have no copy anywhere else, and the local file
+    // has a 30-day fuse.
+    waitRows.push([
+      "At risk",
+      `${sessions(ledger.waitingUnprotected)} · only copy is on this device — Fortress offline`,
+    ]);
+    waitRows.push(["  Act", "bring the Fortress online; Claude Code deletes local copies at 30 days"]);
+  }
+  if (ledger && ledger.waiting - ledger.waitingUnprotected > 0) {
     waitRows.push([
       "Waiting",
-      `${sessions(ledger.waiting)} · nothing lost, all still on disk`,
+      `${sessions(ledger.waiting - ledger.waitingUnprotected)} · nothing lost, already complete elsewhere`,
     ]);
     waitRows.push(["  Fortresses", formatLagging(ledger)]);
     const attention = needsAttention(ledger);
@@ -798,6 +807,9 @@ function syncVerdict(ledger: SyncLedger): string {
   // never buried — it has its own box directly underneath.
   if (ledger.uploading > 0) {
     return `${ledger.percent}% — catching up · ${formatSize(ledger.uploadingBytes)} left`;
+  }
+  if (ledger.waitingUnprotected > 0) {
+    return `${ledger.percent}% — ${sessions(ledger.waitingUnprotected)} only on this device, Fortress offline`;
   }
   if (ledger.waiting > 0) return `${ledger.percent}% — everything that can be sent, is sent`;
   return `${ledger.percent}% — all sessions sent`;
