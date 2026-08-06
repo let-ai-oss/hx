@@ -250,6 +250,13 @@ export function formatStatusBlocker(skipped: SyncSkippedEntry[], nowMs = Date.no
   return `${sessions} session${sessions === 1 ? "" : "s"} — ${org} Fortress offline${heartbeat}${repo}`;
 }
 
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MB`;
+  return `${(n / 1073741824).toFixed(2)} GB`;
+}
+
 /** Right-align a count in a fixed gutter so the bucket column scans. */
 function num(n: number, width = 6): string {
   return String(n).padStart(width);
@@ -317,6 +324,40 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
     }
     lines.push("  Every retry is being refused; this does not self-heal. Check the");
     lines.push("  storage credentials/config on the server side, then: hx retry --all");
+  }
+  if (ledger.notDelivered.length > 0) {
+    lines.push("");
+    lines.push("SESSIONS STILL OWING BYTES — what each one is waiting on");
+    for (const d of ledger.notDelivered.slice(0, MAX_LISTED_SESSIONS)) {
+      lines.push(
+        `  ${d.family}:${d.sessionId}  ${fmtBytes(d.owedBytes)} owed · ${d.ageDays}d old · ${d.bucket}`,
+      );
+      for (const dest of d.destinations) {
+        if (dest.owed === 0) {
+          lines.push(`      ${dest.label}: complete (${dest.offset.toLocaleString()} B)`);
+          continue;
+        }
+        // An UNKNOWN destination is the actionable one — the client is billing
+        // bytes to a store it has no record of, so nothing will ever drain it.
+        const note =
+          dest.state === "unknown"
+            ? "  <-- NOT KNOWN to this device; nothing will ever send here"
+            : dest.state === "offline"
+              ? "  (offline)"
+              : "";
+        lines.push(
+          `      ${dest.label}: ${dest.offset.toLocaleString()} / ${d.sizeBytes.toLocaleString()} B${note}`,
+        );
+      }
+    }
+    const rest = ledger.notDelivered.length - MAX_LISTED_SESSIONS;
+    if (rest > 0) lines.push(`  …and ${rest} more (see --json)`);
+    if (ledger.notDelivered.some((d) => d.destinations.some((x) => x.state === "unknown" && x.owed > 0))) {
+      lines.push("");
+      lines.push("  A destination marked NOT KNOWN was advertised to this device once and");
+      lines.push("  never registered. Its bytes can never be delivered and the session will");
+      lines.push("  sit here forever. This is a client bug — please report it.");
+    }
   }
   if (ledger.lagging.length > 0) {
     lines.push("");

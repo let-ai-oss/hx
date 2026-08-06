@@ -150,6 +150,32 @@ const SYNC_REPORT_MIN_MS = 1_500;
 const VERIFY_INTERVAL_MS = 30 * 60_000;
 const VERIFY_BATCH = 1_000;
 
+/** How often the same file may repeat a "not progressing" explanation. The
+ *  tick runs every ~1.5s; without this, one stuck file would emit ~57,000 lines
+ *  a day. Keyed by path+reason so a CHANGE of reason is always reported at
+ *  once — the transition is the interesting part. */
+const STUCK_LOG_INTERVAL_MS = 30 * 60_000;
+const stuckLogged = new Map<string, { reason: string; atMs: number }>();
+
+/**
+ * Say why a file that owes bytes is not being sent — once per reason per file
+ * per interval.
+ *
+ * The tick has several `continue`s and one `return false` that decline to
+ * upload without emitting anything. That is how a device sat at "17 sessions ·
+ * 135.5 MB" byte-identical for days with an empty log: the sessions were never
+ * attempted, so there was no error to print, and success prints nothing either.
+ * Absence of output read as "nothing happening" when it meant "nothing will
+ * ever happen".
+ */
+function logStuck(path: string, reason: string, log: (m: string) => void): void {
+  const prev = stuckLogged.get(path);
+  const now = Date.now();
+  if (prev && prev.reason === reason && now - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
+  stuckLogged.set(path, { reason, atMs: now });
+  log(`  [stuck] ${path}: ${reason}`);
+}
+
 /**
  * A session's OWN destination store is temporarily unavailable — its vault is
  * offline, or a store it routes to directly is down. Distinct from the shared
@@ -1690,7 +1716,15 @@ export async function tickOnce(
     // Per-file backoff: a file that keeps failing (bad request, offline vault)
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
-    if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
+    if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) {
+      const mins = Math.round((pending.nextAttemptAtMs - Date.now()) / 60_000);
+      logStuck(
+        f.path,
+        `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
+        log,
+      );
+      continue;
+    }
     // A file seen for the first time has no state entry for filterWatched to
     // match — seed it now and re-check before any byte leaves the machine.
     // With the personal gate armed, a repo file with UNKNOWN attribution asks
@@ -1715,18 +1749,45 @@ export async function tickOnce(
           await upsertFileState(seeded, scope);
         }
       }
-      if (shouldSkipFile(settings, seeded)) continue;
+      if (shouldSkipFile(settings, seeded)) {
+        // The personal-sync gate and the folder/rule excludes drop a file for
+        // good. Silent, this is indistinguishable from "still uploading".
+        logStuck(
+          f.path,
+          `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
+          log,
+        );
+        continue;
+      }
     }
     // Server-side permanent delete: terminal per-session stop — no request, no
     // backoff, covers every rediscovered twin of the session (the flag is
     // session-keyed, not per-file).
     {
       const entry = state.files[f.path];
-      if (entry && isDeletedSession(state, entry.family, entry.sessionId)) continue;
+      if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
+        logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
+        continue;
+      }
     }
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
+      else if (pending && pending.lastKnownSize !== undefined && minOffset(pending) < f.size) {
+        // Asked the gateway, got a plan, and it produced no committable bytes —
+        // while the file still owes some. That happens when every destination
+        // the gateway actually returns is already caught up, and the shortfall
+        // is billed to a destination it no longer lists. Nothing will drain it.
+        const owed = Object.entries(pending.offsets ?? {})
+          .filter(([, v]) => f.size - v > 0)
+          .map(([k, v]) => `${k} at ${v}/${f.size}`)
+          .join(", ");
+        logStuck(
+          f.path,
+          `owes bytes but the gateway planned no upload for it — ${owed || "no destinations recorded"}. The destination may no longer exist.`,
+          log,
+        );
+      }
       if (pending?.consecutiveFailures !== undefined || pending?.nextAttemptAtMs !== undefined) {
         await clearFileFailure(f.path, scope);
       }

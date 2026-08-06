@@ -452,3 +452,78 @@ describe("waiting sessions with no copy anywhere else", () => {
     assert.equal(ledger.percent, 0);
   });
 });
+
+// Per-session diagnosis. The motivating incident: a device sat at
+// "Uploading 17 sessions · 135.5 MB" byte-identical for days, with an empty
+// log, because the shortfall was billed to a destination the client had no
+// record of — so no upload was ever planned and nothing ever failed. Reading
+// the ledger could not tell you that; this can.
+describe("notDelivered diagnosis", () => {
+  const stateWith = (offsets: Record<string, number>, register: boolean): HxState => {
+    const state: HxState = { files: { a: entry("a", offsets) } };
+    applyDestinationReports(
+      state,
+      register
+        ? [
+            { vaultOrgId: null, status: "ready" },
+            { vaultOrgId: "orgX", status: "held", orgName: "Acme", lastSeenAt: null },
+          ]
+        : [{ vaultOrgId: null, status: "ready" }],
+      NOW - DAY,
+    );
+    return state;
+  };
+  const build = (offsets: Record<string, number>, register: boolean) =>
+    buildLedger({
+      files: [file("a", 1000)],
+      state: stateWith(offsets, register),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+
+  it("marks a destination with NO registry entry as unknown", () => {
+    // The phantom: advertised once, never registered, billed as reachable.
+    const l = build({ letai: 1000, orgX: 0 }, false);
+    const d = l.notDelivered[0]!;
+    const orgX = d.destinations.find((x) => x.key === "orgX")!;
+    assert.equal(orgX.state, "unknown");
+    assert.equal(orgX.owed, 1000);
+    // and the complete one is reported as complete, so the contrast is visible
+    assert.equal(d.destinations.find((x) => x.key === "letai")!.owed, 0);
+  });
+
+  it("marks a registered held destination as offline, not unknown", () => {
+    const l = build({ letai: 1000, orgX: 0 }, true);
+    assert.equal(l.notDelivered[0]!.destinations.find((x) => x.key === "orgX")!.state, "offline");
+  });
+
+  it("marks the shared bucket as reachable even before it is registered", () => {
+    // destKey(null) is always known — a total outage is the probe's job.
+    const l = build({ letai: 400 }, false);
+    assert.equal(l.notDelivered[0]!.destinations[0]!.state, "reachable");
+  });
+
+  it("bills a session with no offsets at all to the primary", () => {
+    const l = build({}, false);
+    const d = l.notDelivered[0]!;
+    assert.equal(d.destinations.length, 1);
+    assert.equal(d.destinations[0]!.key, "letai");
+    assert.equal(d.owedBytes, 1000);
+  });
+
+  it("says nothing about a delivered session", () => {
+    const l = build({ letai: 1000 }, false);
+    assert.equal(l.notDelivered.length, 0);
+  });
+
+  it("orders by bytes owed so the worst reads first", () => {
+    const files = { a: entry("a", { letai: 0 }), b: entry("b", { letai: 0 }) };
+    const l = buildLedger({
+      files: [file("a", 10), file("b", 5000)],
+      state: stateWithOfflineFortress(files),
+      incompleteSessions: 0,
+      nowMs: NOW,
+    });
+    assert.equal(l.notDelivered[0]!.owedBytes, 5000);
+  });
+});

@@ -112,6 +112,9 @@ export interface SyncLedger {
    *  double-count a fanned-out session, deliberately — each store really is
    *  owed those bytes — but a headline "held" figure must not. */
   waitingBytes: number;
+  /** Per-session detail for every on-disk session that still owes bytes —
+   *  what `hx status --detailed` prints so a stuck session explains itself. */
+  notDelivered: SessionDiagnosis[];
   /** Offline destinations holding waiting sessions, worst (oldest) first. */
   lagging: DestinationLag[];
   /** Reachable destinations rejecting writes, longest-failing first. Uploading
@@ -119,6 +122,36 @@ export interface SyncLedger {
    *  reachable — bytes should be moving), but the headline names the failure
    *  instead of reading as an innocent backlog. */
   failing: FailingDestination[];
+}
+
+/** One destination's standing for a session that still owes bytes. */
+export interface DestinationStanding {
+  /** Registry key ({@link destKey}) — "letai" for the shared bucket. */
+  key: string;
+  /** Friendly name where we have one, else the raw key. */
+  label: string;
+  offset: number;
+  owed: number;
+  /** `unknown` is the one that matters: an offset key with NO registry entry.
+   *  The client has no evidence such a store exists, yet lagOf bills it as
+   *  reachable — so a destination that was advertised once and never seen
+   *  again pins a session in `uploading` forever, undrainable, with nothing
+   *  in the log. That is exactly how one device sat at "17 sessions · 135.5 MB"
+   *  unchanged for days. Naming it here is the whole point of this struct. */
+  state: "reachable" | "offline" | "unknown";
+}
+
+/** Why one on-disk session is not delivered — enough to act on without a
+ *  debugger. Built only for sessions that owe bytes, so it stays small. */
+export interface SessionDiagnosis {
+  sessionId: string;
+  family: string;
+  path: string;
+  bucket: SessionState;
+  sizeBytes: number;
+  owedBytes: number;
+  ageDays: number;
+  destinations: DestinationStanding[];
 }
 
 /** A discovered file, narrowed to what classification needs. */
@@ -253,6 +286,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
   let uploadingBytes = 0;
   let waitingBytes = 0;
   const lag = new Map<string, { sessions: number; bytes: number }>();
+  const notDelivered: SessionDiagnosis[] = [];
 
   for (const file of files) {
     totalBytes += file.size;
@@ -262,6 +296,43 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     if (oldestMs === null || file.mtimeMs < oldestMs) oldestMs = file.mtimeMs;
     if (newestMs === null || file.mtimeMs > newestMs) newestMs = file.mtimeMs;
     const c = classifyFile(file, state, nowMs);
+    if (c.state !== "delivered") {
+      const fs = state.files[file.path];
+      const offsets = fs?.offsets ?? {};
+      const keys = Object.keys(offsets);
+      const standings: DestinationStanding[] = (keys.length === 0
+        ? [{ key: destKey(null), offset: 0 }]
+        : keys.map((k) => ({ key: k, offset: offsets[k] ?? 0 }))
+      ).map(({ key, offset }) => {
+        const record = state.destinations?.[key];
+        const label =
+          (record?.vaultOrgId && orgNames[record.vaultOrgId]) || record?.orgName || key;
+        const known = key === destKey(null) || record !== undefined;
+        return {
+          key,
+          label,
+          offset,
+          owed: Math.max(0, file.size - offset),
+          state: isDestinationOffline(state, key)
+            ? ("offline" as const)
+            : known
+              ? ("reachable" as const)
+              : ("unknown" as const),
+        };
+      });
+      if (standings.some((d) => d.owed > 0)) {
+        notDelivered.push({
+          sessionId: fs?.sessionId ?? file.path,
+          family: fs?.family ?? "unknown",
+          path: file.path,
+          bucket: c.state,
+          sizeBytes: file.size,
+          owedBytes: standings.reduce((n, d) => n + d.owed, 0),
+          ageDays: Math.floor((nowMs - file.mtimeMs) / 86_400_000),
+          destinations: standings,
+        });
+      }
+    }
     switch (c.state) {
       case "delivered":
         delivered += 1;
@@ -342,6 +413,7 @@ export function buildLedger(input: LedgerInput): SyncLedger {
     deliveredBytes,
     uploadingBytes,
     waitingBytes,
+    notDelivered: notDelivered.sort((a, b) => b.owedBytes - a.owedBytes),
     lagging,
     failing: failingDestinations(state, nowMs, orgNames),
   };
