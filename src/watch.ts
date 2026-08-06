@@ -1522,6 +1522,15 @@ export interface SyncReport {
    *  is still on disk. `onDiskButUndiscovered` should always be empty — if it
    *  is not, discovery is skipping a file that exists, which is a bug. */
   undiscovered: { fileGone: number; onDiskButUndiscovered: number };
+  /** Child agent lanes (`<sessionId>/subagents/*.jsonl` and workflow lanes).
+   *
+   *  They are tracked in state.files, uploaded by their OWN pass, and until now
+   *  reported by nothing at all — on one real device 706 of 756 tracked entries
+   *  were child lanes, so 93% of what the client tracks was invisible on every
+   *  surface. Excluding them from the session checks (they are found by a
+   *  different discovery) is correct; excluding them from the OUTPUT is how a
+   *  whole category of stall would go unnoticed. Counted here instead. */
+  childLanes: { tracked: number; onDisk: number; gone: number; owing: number; owedBytes: number };
   /** DISTINCT partially-uploaded sessions sitting under NO current data root
    *  — a root was removed (or the daemon hasn't adopted one yet). They are
    *  not "behind" (nothing will ever pick them up under the current config),
@@ -1643,8 +1652,22 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
     p.includes("/subagents/") || p.includes("/workflows/");
   let fileGone = 0;
   let onDiskButUndiscovered = 0;
-  for (const p of Object.keys(state.files)) {
-    if (discovered.has(p) || isChildLane(p)) continue;
+  const childLanes = { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 };
+  for (const [p, fs] of Object.entries(state.files)) {
+    if (isChildLane(p)) {
+      childLanes.tracked += 1;
+      const here = existsSync(p);
+      if (here) childLanes.onDisk += 1;
+      else childLanes.gone += 1;
+      // Only an on-disk lane can still be sent; a pruned one is as final as a
+      // pruned session and must not read as backlog.
+      if (here && fs.lastKnownSize !== undefined && minOffset(fs) < fs.lastKnownSize) {
+        childLanes.owing += 1;
+        childLanes.owedBytes += fs.lastKnownSize - minOffset(fs);
+      }
+      continue;
+    }
+    if (discovered.has(p)) continue;
     if (existsSync(p)) onDiskButUndiscovered += 1;
     else fileGone += 1;
   }
@@ -1654,6 +1677,7 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
     skipped: collectSkipped(elected, state),
     excluded,
     undiscovered: { fileGone, onDiskButUndiscovered },
+    childLanes,
     unwatched,
     ledger: buildLedger({
       files: elected,

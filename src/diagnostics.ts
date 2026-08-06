@@ -63,6 +63,8 @@ export interface SyncDoctorReport {
   excluded: SyncReport["excluded"];
   /** Tracked files discovery did not return, split by whether they still exist. */
   undiscovered: SyncReport["undiscovered"];
+  /** Child agent lanes — tracked, uploaded separately, previously unreported. */
+  childLanes: SyncReport["childLanes"];
 }
 
 interface MutableBlocker {
@@ -224,6 +226,7 @@ export function buildSyncDoctorReport(
     unwatchedSessions: report.unwatched,
     excluded: report.excluded,
     undiscovered: report.undiscovered,
+    childLanes: report.childLanes,
   };
 }
 
@@ -459,6 +462,17 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
       `WARNING: ${report.undiscovered.onDiskButUndiscovered} tracked file(s) exist on disk but discovery did not return them.`,
     );
     lines.push("This should never happen — discovery is unwindowed here. Please report it.");
+  }
+  if (report.childLanes.tracked > 0) {
+    lines.push("");
+    const c = report.childLanes;
+    lines.push(
+      `Child agent lanes: ${c.tracked} tracked · ${c.onDisk} on disk · ${c.gone} pruned` +
+        (c.owing > 0 ? ` · ${c.owing} still owing ${fmtBytes(c.owedBytes)}` : " · all delivered"),
+    );
+    if (c.owing > 0) {
+      lines.push("These upload on their own pass; a stall here is invisible in the session counts above.");
+    }
   }
   if (report.undiscovered.fileGone > 0) {
     lines.push("");

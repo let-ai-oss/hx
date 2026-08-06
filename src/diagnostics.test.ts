@@ -19,6 +19,7 @@ const blockedReport = (): SyncReport => ({
   unwatched: 0,
   excluded: [],
   undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
+  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
   ledger: noLedger(),
   skipped: ["s1", "s2"].map((sessionId, index) => ({
     path: `/private/${sessionId}.jsonl`,
@@ -96,6 +97,7 @@ describe("sync diagnostics", () => {
         unwatched: 0,
   excluded: [],
   undiscovered: { fileGone: 0, onDiskButUndiscovered: 0 },
+  childLanes: { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 },
         ledger: noLedger(),
       },
       "https://beta.let.ai/_api/hx-gateway",
