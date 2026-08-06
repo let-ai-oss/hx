@@ -59,6 +59,10 @@ export interface SyncDoctorReport {
   /** Partially-synced sessions under no current root (a removed data root) —
    *  informational, not an error: nothing will pick them up as configured. */
   unwatchedSessions: number;
+  /** Sessions the settings filters dropped before any upload was attempted. */
+  excluded: SyncReport["excluded"];
+  /** Tracked files discovery did not return, split by whether they still exist. */
+  undiscovered: SyncReport["undiscovered"];
 }
 
 interface MutableBlocker {
@@ -218,6 +222,8 @@ export function buildSyncDoctorReport(
         ]
       : [],
     unwatchedSessions: report.unwatched,
+    excluded: report.excluded,
+    undiscovered: report.undiscovered,
   };
 }
 
@@ -332,6 +338,14 @@ export function formatLedgerSection(ledger: SyncLedger): string[] {
       lines.push(
         `  ${d.family}:${d.sessionId}  ${fmtBytes(d.owedBytes)} owed · ${d.ageDays}d old · ${d.bucket}`,
       );
+      const last = d.lastUploadAt ? `last upload ${d.lastUploadAt}` : "NEVER uploaded";
+      const attr = `repo ${d.repoSlug ?? "(none)"} · attributed ${d.attributed ?? "unknown"}`;
+      lines.push(`      ${last} · ${attr}`);
+      if (d.skipReason || d.consecutiveFailures > 0 || d.nextAttemptAt) {
+        lines.push(
+          `      held: ${d.skipReason ?? "none"} · ${d.consecutiveFailures} consecutive failures · next attempt ${d.nextAttemptAt ?? "immediately"}`,
+        );
+      }
       for (const dest of d.destinations) {
         if (dest.owed === 0) {
           lines.push(`      ${dest.label}: complete (${dest.offset.toLocaleString()} B)`);
@@ -427,6 +441,30 @@ export function formatSyncDoctorText(report: SyncDoctorReport): string {
     lines.push("After fixing the destination or repository attachment:");
     lines.push("  hx retry --blocked");
     lines.push("  hx status");
+  }
+  if (report.excluded.length > 0) {
+    lines.push("");
+    lines.push(
+      `EXCLUDED BY SETTINGS — ${report.excluded.length} session${report.excluded.length === 1 ? "" : "s"} dropped before any upload is attempted`,
+    );
+    for (const e of report.excluded.slice(0, MAX_LISTED_SESSIONS)) {
+      lines.push(`  ${e.family}:${e.sessionId}  ${e.reason}`);
+    }
+    const rest = report.excluded.length - MAX_LISTED_SESSIONS;
+    if (rest > 0) lines.push(`  …and ${rest} more (see --json)`);
+  }
+  if (report.undiscovered.onDiskButUndiscovered > 0) {
+    lines.push("");
+    lines.push(
+      `WARNING: ${report.undiscovered.onDiskButUndiscovered} tracked file(s) exist on disk but discovery did not return them.`,
+    );
+    lines.push("This should never happen — discovery is unwindowed here. Please report it.");
+  }
+  if (report.undiscovered.fileGone > 0) {
+    lines.push("");
+    lines.push(
+      `Tracked but no longer on disk: ${report.undiscovered.fileGone} file entr${report.undiscovered.fileGone === 1 ? "y" : "ies"} (normal — Claude Code prunes at 30 days).`,
+    );
   }
   if (report.unwatchedSessions > 0) {
     lines.push("");

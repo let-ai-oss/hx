@@ -1506,6 +1506,22 @@ export interface SyncReport {
    *  status` prints. Derived from per-destination offsets + the durable
    *  destination registry, so it sees holds the transient skipReason misses. */
   ledger: SyncLedger;
+  /** Sessions the settings filters DROP before any upload is attempted — the
+   *  personal-sync gate or an exclude rule. They vanish from every count, so
+   *  without this they are indistinguishable from sessions that do not exist. */
+  excluded: Array<{
+    path: string;
+    family: string;
+    sessionId: string;
+    repoSlug: string | null;
+    cwd: string | null;
+    attributed: boolean | null;
+    reason: string;
+  }>;
+  /** Tracked sessions that discovery did NOT return, split by whether the file
+   *  is still on disk. `onDiskButUndiscovered` should always be empty — if it
+   *  is not, discovery is skipping a file that exists, which is a bug. */
+  undiscovered: { fileGone: number; onDiskButUndiscovered: number };
   /** DISTINCT partially-uploaded sessions sitting under NO current data root
    *  — a root was removed (or the daemon hasn't adopted one yet). They are
    *  not "behind" (nothing will ever pick them up under the current config),
@@ -1581,11 +1597,63 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
   // Settings filtering applies to the ELECTED set only: `discovered` and
   // `liveSessions` above stay unfiltered so an excluded-but-present file can
   // never masquerade as a vanished-source gap.
-  const elected = filterWatched(electUploaders(all, state), state, settings);
+  const preFilter = electUploaders(all, state);
+  const elected = filterWatched(preFilter, state, settings);
+  // What the settings filters removed, and WHY. filterWatched is silent by
+  // design (it runs on the hot path), so an excluded session simply stops
+  // existing as far as every surface is concerned.
+  const keptPaths = new Set(elected.map((f) => f.path));
+  const excluded = preFilter
+    .filter((f) => !keptPaths.has(f.path))
+    .map((f) => {
+      const fs = state.files[f.path];
+      const folderHit = settings.excludedFolders.some(
+        (e) => e.family === fs?.family && e.cwd === fs?.cwd,
+      );
+      const reason = !fs
+        ? "no state entry"
+        : isDeletedSession(state, fs.family, fs.sessionId)
+          ? "deleted on the server (tombstoned)"
+          : folderHit
+            ? `excluded folder ${fs.cwd ?? "?"}`
+            : settings.excludeRules.length > 0 && fs.cwd
+              ? `matched an exclude rule (cwd ${fs.cwd})`
+              : `personal-sync gate: personalSync=${settings.personalSync}, repoSlug=${fs.repoSlug ?? "null"}, attributed=${fs.attributed}`;
+      return {
+        path: f.path,
+        family: fs?.family ?? "unknown",
+        sessionId: fs?.sessionId ?? "unknown",
+        repoSlug: fs?.repoSlug ?? null,
+        cwd: fs?.cwd ?? null,
+        attributed: fs?.attributed ?? null,
+        reason,
+      };
+    });
+  // A tracked SESSION file discovery did not return. Split so "the transcript
+  // was pruned" (normal) is never confused with "discovery cannot see a file
+  // that is right there" (a bug we would otherwise never notice).
+  //
+  // Child agent lanes are excluded deliberately. state.files tracks them too —
+  // on one real device, 706 of 756 entries were `<sessionId>/subagents/*.jsonl`
+  // — but they are found by their own discovery pass, not this one. Comparing
+  // the whole map against session discovery reported 602 phantom "missing"
+  // files on a completely healthy machine, which is exactly the kind of
+  // false alarm that teaches people to ignore warnings.
+  const isChildLane = (p: string): boolean =>
+    p.includes("/subagents/") || p.includes("/workflows/");
+  let fileGone = 0;
+  let onDiskButUndiscovered = 0;
+  for (const p of Object.keys(state.files)) {
+    if (discovered.has(p) || isChildLane(p)) continue;
+    if (existsSync(p)) onDiskButUndiscovered += 1;
+    else fileGone += 1;
+  }
   return {
     snapshot: snapshotFrom(elected, state),
     behind,
     skipped: collectSkipped(elected, state),
+    excluded,
+    undiscovered: { fileGone, onDiskButUndiscovered },
     unwatched,
     ledger: buildLedger({
       files: elected,
@@ -1694,7 +1762,15 @@ export async function tickOnce(
             `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} older than the 30-day window still undelivered (${unseen} never ingested) — queueing`,
           );
           files = [...files, ...added];
+        } else {
+          // Silence here was ambiguous: "the sweep is not running" and "the
+          // sweep ran and found nothing" looked identical from the log.
+          log(
+            `[hx] backfill: ${older.length} session(s) older than the window, all already queued this pass — nothing to add`,
+          );
         }
+      } else {
+        log("[hx] backfill: nothing older than the 30-day window still owes bytes");
       }
     } catch (err) {
       // Never let the slow sweep break a pass: the live backlog matters more,

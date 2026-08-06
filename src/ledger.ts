@@ -151,6 +151,17 @@ export interface SessionDiagnosis {
   sizeBytes: number;
   owedBytes: number;
   ageDays: number;
+  /** Last time ANY byte of this session was committed, ISO; null if never. A
+   *  session that owes bytes and has never uploaded is a different problem
+   *  from one that stalled part-way, and the two were indistinguishable. */
+  lastUploadAt: string | null;
+  /** Per-file failure latches — why the tick would decline to try it. */
+  skipReason: string | null;
+  consecutiveFailures: number;
+  nextAttemptAt: string | null;
+  /** Gateway-confirmed workspace attribution, when the gateway has echoed it. */
+  repoSlug: string | null;
+  attributed: boolean | null;
   destinations: DestinationStanding[];
 }
 
@@ -329,6 +340,12 @@ export function buildLedger(input: LedgerInput): SyncLedger {
           sizeBytes: file.size,
           owedBytes: standings.reduce((n, d) => n + d.owed, 0),
           ageDays: Math.floor((nowMs - file.mtimeMs) / 86_400_000),
+          lastUploadAt: fs?.lastUploadAtMs ? new Date(fs.lastUploadAtMs).toISOString() : null,
+          skipReason: fs?.skipReason ?? null,
+          consecutiveFailures: fs?.consecutiveFailures ?? 0,
+          nextAttemptAt: fs?.nextAttemptAtMs ? new Date(fs.nextAttemptAtMs).toISOString() : null,
+          repoSlug: fs?.repoSlug ?? null,
+          attributed: fs?.attributed ?? null,
           destinations: standings,
         });
       }
