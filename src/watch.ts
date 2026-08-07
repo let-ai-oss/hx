@@ -150,6 +150,32 @@ const SYNC_REPORT_MIN_MS = 1_500;
 const VERIFY_INTERVAL_MS = 30 * 60_000;
 const VERIFY_BATCH = 1_000;
 
+/** How often the same file may repeat a "not progressing" explanation. The
+ *  tick runs every ~1.5s; without this, one stuck file would emit ~57,000 lines
+ *  a day. Keyed by path+reason so a CHANGE of reason is always reported at
+ *  once — the transition is the interesting part. */
+const STUCK_LOG_INTERVAL_MS = 30 * 60_000;
+const stuckLogged = new Map<string, { reason: string; atMs: number }>();
+
+/**
+ * Say why a file that owes bytes is not being sent — once per reason per file
+ * per interval.
+ *
+ * The tick has several `continue`s and one `return false` that decline to
+ * upload without emitting anything. That is how a device sat at "17 sessions ·
+ * 135.5 MB" byte-identical for days with an empty log: the sessions were never
+ * attempted, so there was no error to print, and success prints nothing either.
+ * Absence of output read as "nothing happening" when it meant "nothing will
+ * ever happen".
+ */
+function logStuck(path: string, reason: string, log: (m: string) => void): void {
+  const prev = stuckLogged.get(path);
+  const now = Date.now();
+  if (prev && prev.reason === reason && now - prev.atMs < STUCK_LOG_INTERVAL_MS) return;
+  stuckLogged.set(path, { reason, atMs: now });
+  log(`  [stuck] ${path}: ${reason}`);
+}
+
 /**
  * A session's OWN destination store is temporarily unavailable — its vault is
  * offline, or a store it routes to directly is down. Distinct from the shared
@@ -1480,6 +1506,31 @@ export interface SyncReport {
    *  status` prints. Derived from per-destination offsets + the durable
    *  destination registry, so it sees holds the transient skipReason misses. */
   ledger: SyncLedger;
+  /** Sessions the settings filters DROP before any upload is attempted — the
+   *  personal-sync gate or an exclude rule. They vanish from every count, so
+   *  without this they are indistinguishable from sessions that do not exist. */
+  excluded: Array<{
+    path: string;
+    family: string;
+    sessionId: string;
+    repoSlug: string | null;
+    cwd: string | null;
+    attributed: boolean | null;
+    reason: string;
+  }>;
+  /** Tracked sessions that discovery did NOT return, split by whether the file
+   *  is still on disk. `onDiskButUndiscovered` should always be empty — if it
+   *  is not, discovery is skipping a file that exists, which is a bug. */
+  undiscovered: { fileGone: number; onDiskButUndiscovered: number };
+  /** Child agent lanes (`<sessionId>/subagents/*.jsonl` and workflow lanes).
+   *
+   *  They are tracked in state.files, uploaded by their OWN pass, and until now
+   *  reported by nothing at all — on one real device 706 of 756 tracked entries
+   *  were child lanes, so 93% of what the client tracks was invisible on every
+   *  surface. Excluding them from the session checks (they are found by a
+   *  different discovery) is correct; excluding them from the OUTPUT is how a
+   *  whole category of stall would go unnoticed. Counted here instead. */
+  childLanes: { tracked: number; onDisk: number; gone: number; owing: number; owedBytes: number };
   /** DISTINCT partially-uploaded sessions sitting under NO current data root
    *  — a root was removed (or the daemon hasn't adopted one yet). They are
    *  not "behind" (nothing will ever pick them up under the current config),
@@ -1555,11 +1606,78 @@ export async function computeSyncReport(rootsOverride?: ResolvedRoots): Promise<
   // Settings filtering applies to the ELECTED set only: `discovered` and
   // `liveSessions` above stay unfiltered so an excluded-but-present file can
   // never masquerade as a vanished-source gap.
-  const elected = filterWatched(electUploaders(all, state), state, settings);
+  const preFilter = electUploaders(all, state);
+  const elected = filterWatched(preFilter, state, settings);
+  // What the settings filters removed, and WHY. filterWatched is silent by
+  // design (it runs on the hot path), so an excluded session simply stops
+  // existing as far as every surface is concerned.
+  const keptPaths = new Set(elected.map((f) => f.path));
+  const excluded = preFilter
+    .filter((f) => !keptPaths.has(f.path))
+    .map((f) => {
+      const fs = state.files[f.path];
+      const folderHit = settings.excludedFolders.some(
+        (e) => e.family === fs?.family && e.cwd === fs?.cwd,
+      );
+      const reason = !fs
+        ? "no state entry"
+        : isDeletedSession(state, fs.family, fs.sessionId)
+          ? "deleted on the server (tombstoned)"
+          : folderHit
+            ? `excluded folder ${fs.cwd ?? "?"}`
+            : settings.excludeRules.length > 0 && fs.cwd
+              ? `matched an exclude rule (cwd ${fs.cwd})`
+              : `personal-sync gate: personalSync=${settings.personalSync}, repoSlug=${fs.repoSlug ?? "null"}, attributed=${fs.attributed}`;
+      return {
+        path: f.path,
+        family: fs?.family ?? "unknown",
+        sessionId: fs?.sessionId ?? "unknown",
+        repoSlug: fs?.repoSlug ?? null,
+        cwd: fs?.cwd ?? null,
+        attributed: fs?.attributed ?? null,
+        reason,
+      };
+    });
+  // A tracked SESSION file discovery did not return. Split so "the transcript
+  // was pruned" (normal) is never confused with "discovery cannot see a file
+  // that is right there" (a bug we would otherwise never notice).
+  //
+  // Child agent lanes are excluded deliberately. state.files tracks them too —
+  // on one real device, 706 of 756 entries were `<sessionId>/subagents/*.jsonl`
+  // — but they are found by their own discovery pass, not this one. Comparing
+  // the whole map against session discovery reported 602 phantom "missing"
+  // files on a completely healthy machine, which is exactly the kind of
+  // false alarm that teaches people to ignore warnings.
+  const isChildLane = (p: string): boolean =>
+    p.includes("/subagents/") || p.includes("/workflows/");
+  let fileGone = 0;
+  let onDiskButUndiscovered = 0;
+  const childLanes = { tracked: 0, onDisk: 0, gone: 0, owing: 0, owedBytes: 0 };
+  for (const [p, fs] of Object.entries(state.files)) {
+    if (isChildLane(p)) {
+      childLanes.tracked += 1;
+      const here = existsSync(p);
+      if (here) childLanes.onDisk += 1;
+      else childLanes.gone += 1;
+      // Only an on-disk lane can still be sent; a pruned one is as final as a
+      // pruned session and must not read as backlog.
+      if (here && fs.lastKnownSize !== undefined && minOffset(fs) < fs.lastKnownSize) {
+        childLanes.owing += 1;
+        childLanes.owedBytes += fs.lastKnownSize - minOffset(fs);
+      }
+      continue;
+    }
+    if (discovered.has(p)) continue;
+    if (existsSync(p)) onDiskButUndiscovered += 1;
+    else fileGone += 1;
+  }
   return {
     snapshot: snapshotFrom(elected, state),
     behind,
     skipped: collectSkipped(elected, state),
+    excluded,
+    undiscovered: { fileGone, onDiskButUndiscovered },
+    childLanes,
     unwatched,
     ledger: buildLedger({
       files: elected,
@@ -1668,7 +1786,15 @@ export async function tickOnce(
             `[hx] backfill: ${added.length} session${added.length === 1 ? "" : "s"} older than the 30-day window still undelivered (${unseen} never ingested) — queueing`,
           );
           files = [...files, ...added];
+        } else {
+          // Silence here was ambiguous: "the sweep is not running" and "the
+          // sweep ran and found nothing" looked identical from the log.
+          log(
+            `[hx] backfill: ${older.length} session(s) older than the window, all already queued this pass — nothing to add`,
+          );
         }
+      } else {
+        log("[hx] backfill: nothing older than the 30-day window still owes bytes");
       }
     } catch (err) {
       // Never let the slow sweep break a pass: the live backlog matters more,
@@ -1690,7 +1816,15 @@ export async function tickOnce(
     // Per-file backoff: a file that keeps failing (bad request, offline vault)
     // sits out its window instead of burning a gateway round trip every poll.
     const pending = state.files[f.path];
-    if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) continue;
+    if (pending?.nextAttemptAtMs && pending.nextAttemptAtMs > Date.now()) {
+      const mins = Math.round((pending.nextAttemptAtMs - Date.now()) / 60_000);
+      logStuck(
+        f.path,
+        `waiting out a retry backoff for another ${mins} min (${pending.consecutiveFailures ?? 0} consecutive failures${pending.skipReason ? `, ${pending.skipReason}` : ""})`,
+        log,
+      );
+      continue;
+    }
     // A file seen for the first time has no state entry for filterWatched to
     // match — seed it now and re-check before any byte leaves the machine.
     // With the personal gate armed, a repo file with UNKNOWN attribution asks
@@ -1715,18 +1849,45 @@ export async function tickOnce(
           await upsertFileState(seeded, scope);
         }
       }
-      if (shouldSkipFile(settings, seeded)) continue;
+      if (shouldSkipFile(settings, seeded)) {
+        // The personal-sync gate and the folder/rule excludes drop a file for
+        // good. Silent, this is indistinguishable from "still uploading".
+        logStuck(
+          f.path,
+          `excluded by settings — personalSync=${settings.personalSync}, repoSlug=${seeded.repoSlug ?? "null"}, attributed=${seeded.attributed}`,
+          log,
+        );
+        continue;
+      }
     }
     // Server-side permanent delete: terminal per-session stop — no request, no
     // backoff, covers every rediscovered twin of the session (the flag is
     // session-keyed, not per-file).
     {
       const entry = state.files[f.path];
-      if (entry && isDeletedSession(state, entry.family, entry.sessionId)) continue;
+      if (entry && isDeletedSession(state, entry.family, entry.sessionId)) {
+        logStuck(f.path, "session was permanently deleted on the server — it will never upload again", log);
+        continue;
+      }
     }
     try {
       const did = await ingestOne(cfg, f, opts, log);
       if (did) uploaded += 1;
+      else if (pending && pending.lastKnownSize !== undefined && minOffset(pending) < f.size) {
+        // Asked the gateway, got a plan, and it produced no committable bytes —
+        // while the file still owes some. That happens when every destination
+        // the gateway actually returns is already caught up, and the shortfall
+        // is billed to a destination it no longer lists. Nothing will drain it.
+        const owed = Object.entries(pending.offsets ?? {})
+          .filter(([, v]) => f.size - v > 0)
+          .map(([k, v]) => `${k} at ${v}/${f.size}`)
+          .join(", ");
+        logStuck(
+          f.path,
+          `owes bytes but the gateway planned no upload for it — ${owed || "no destinations recorded"}. The destination may no longer exist.`,
+          log,
+        );
+      }
       if (pending?.consecutiveFailures !== undefined || pending?.nextAttemptAtMs !== undefined) {
         await clearFileFailure(f.path, scope);
       }
