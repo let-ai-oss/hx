@@ -387,6 +387,15 @@ export interface HxState {
    *  strings per lane and lanes are bounded by real agent activity, same
    *  growth class as `files`. Additive; older binaries ignore it. */
   childUploaders?: Record<string, string>;
+  /** The gateway every entry in this file is measured against. Offsets are
+   *  "how many bytes does THIS gateway's store already hold" — meaningless
+   *  against any other gateway. Stamped on first pass; when the configured
+   *  gateway later differs, the per-gateway knowledge below is reset (see
+   *  {@link reconcileGatewayInState}). Absent on files written by older
+   *  binaries: those adopt the current gateway WITHOUT a reset, because the
+   *  stamp's absence carries no evidence either way and a spurious reset
+   *  would re-upload every device's history on upgrade. */
+  gatewayBaseUrl?: string;
 }
 
 const STATE_DIR = HX_DIR;
@@ -829,6 +838,121 @@ export async function clearGenericBackoffs(scope: StateScope = "main"): Promise<
   const files = clearGenericBackoffsFromState(state);
   if (files > 0) await schedulePersist(state, scope);
   return files;
+}
+
+/** Trailing slashes and stray whitespace are cosmetic; neither may reset
+ *  offsets — nor leave a stamp permanently "pending". Exported so every
+ *  consumer shares ONE definition of "the same gateway"; a second inline
+ *  normalization that disagrees on so much as trim() splits the world into
+ *  reconcile saying "unchanged" while a display saying "pending" forever. */
+export function normalizeGatewayUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
+}
+
+/** True when the state file's entries were measured against a DIFFERENT
+ *  gateway than `gatewayBaseUrl` — i.e. a switch happened and no reconcile
+ *  has run yet. An absent stamp is NOT pending (the adopt path claims it
+ *  silently). The one shared answer to "is this stamp stale?" for read-only
+ *  surfaces that must not write (hx status). */
+export function gatewayStampPending(state: HxState, gatewayBaseUrl: string): boolean {
+  return (
+    state.gatewayBaseUrl !== undefined &&
+    normalizeGatewayUrl(state.gatewayBaseUrl) !== normalizeGatewayUrl(gatewayBaseUrl)
+  );
+}
+
+export type GatewayReconcileResult =
+  | { kind: "unchanged" }
+  | { kind: "adopted" }
+  | { kind: "reset"; filesReset: number };
+
+/**
+ * Make the state file's per-gateway knowledge match the gateway we are about
+ * to talk to.
+ *
+ * Upload offsets are a claim about ONE gateway's store: "you already hold N
+ * bytes of this file". Carried across a gateway switch they become a lie —
+ * the device believes its history is delivered while the new gateway may hold
+ * none of it. That exact lie followed the 2026-07 beta→production cutover:
+ * offsets survived the switch, every device reported itself synced, and only
+ * a canonical audit a day and a half later forced ~850 sessions to re-upload.
+ * Had any machine been wiped in between, its history would have been gone.
+ *
+ * So: the state carries a gateway stamp. Same gateway → no-op. No stamp →
+ * adopt (upgrade path; absence is not evidence of a switch, and a spurious
+ * reset would re-upload every fleet device's history). Different gateway →
+ * drop everything that was only ever true of the old gateway:
+ *
+ *   - per-file offsets, backoffs, holds and heal counters — the new gateway
+ *     answers for itself, starting from zero;
+ *   - `destinations` — the old gateway's word on stores it no longer routes;
+ *   - `artifacts` — sidecar content hashes recording "uploaded THERE";
+ *   - `deletedSessions` — server tombstones; a session deleted on one
+ *     environment is not deleted on another, and honoring a foreign tombstone
+ *     would silently withhold a session from the new gateway forever;
+ *   - `childUploaders` — election history against the old canonical objects.
+ *
+ * Local facts survive: path/family/sessionId, cwd/repoSlug/attribution
+ * capture (first-sight cache), lastKnownSize, effectiveRoots. mtime and
+ * last-attempt stamps are zeroed so the next pass re-examines every file
+ * instead of trusting "nothing moved since I last looked" — the question is
+ * no longer the same question when the gateway changed.
+ */
+export function reconcileGatewayInState(
+  state: HxState,
+  gatewayBaseUrl: string,
+): GatewayReconcileResult {
+  const next = normalizeGatewayUrl(gatewayBaseUrl);
+  const prev = state.gatewayBaseUrl === undefined ? undefined : normalizeGatewayUrl(state.gatewayBaseUrl);
+  if (prev === next) return { kind: "unchanged" };
+  if (prev === undefined) {
+    state.gatewayBaseUrl = next;
+    return { kind: "adopted" };
+  }
+  let filesReset = 0;
+  for (const entry of Object.values(state.files)) {
+    // Count only files that actually had per-gateway progress or penalties to
+    // drop — the log line quotes this number, and "dropped offsets for N"
+    // must not include files that never uploaded anywhere.
+    if (
+      Object.keys(entry.offsets).length > 0 ||
+      entry.consecutiveFailures !== undefined ||
+      entry.nextAttemptAtMs !== undefined ||
+      entry.skipReason !== undefined ||
+      entry.blocker !== undefined ||
+      entry.healCount !== undefined ||
+      entry.healPausedUntilMs !== undefined
+    ) {
+      filesReset += 1;
+    }
+    entry.offsets = {};
+    entry.lastMtimeMs = 0;
+    entry.lastUploadAtMs = 0;
+    delete entry.consecutiveFailures;
+    delete entry.nextAttemptAtMs;
+    delete entry.skipReason;
+    delete entry.blocker;
+    delete entry.healCount;
+    delete entry.healPausedUntilMs;
+  }
+  delete state.destinations;
+  delete state.artifacts;
+  delete state.deletedSessions;
+  delete state.childUploaders;
+  state.gatewayBaseUrl = next;
+  return { kind: "reset", filesReset };
+}
+
+/** Load, reconcile against the configured gateway, persist when anything
+ *  changed. Cheap when nothing did (one string compare). */
+export async function reconcileGateway(
+  gatewayBaseUrl: string,
+  scope: StateScope = "main",
+): Promise<GatewayReconcileResult> {
+  const state = await loadState(scope);
+  const result = reconcileGatewayInState(state, gatewayBaseUrl);
+  if (result.kind !== "unchanged") await schedulePersist(state, scope);
+  return result;
 }
 
 /** Past the 30-day discovery window with margin — see HxState.deletedSessions. */

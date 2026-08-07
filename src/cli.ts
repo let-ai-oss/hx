@@ -31,7 +31,7 @@ import {
 import { formatOutage, needsAttention, type SyncLedger } from "./ledger.js";
 import { collapseHome, isPaused, readSettings, writeSettings, type HxSettings } from "./settings.js";
 import { resolveDataRoots, type ResolvedRoots } from "./roots.js";
-import { loadState, resetStateCache } from "./state.js";
+import { gatewayStampPending, loadState, resetStateCache } from "./state.js";
 import { daemonAction, disconnectDevice, retryBlocked } from "./maintenance.js";
 import { checkForUpdate } from "./update.js";
 import { watch as watchDir } from "node:fs";
@@ -615,6 +615,22 @@ async function cmdStatus(): Promise<void> {
     "Watching",
     `${formatRootsRow(watchRoots)}${rootsFrom === "daemon" && daemonDown ? " (last known — daemon stopped)" : ""}`,
   ]);
+
+  // Read-only stamp check: after a gateway switch and BEFORE the daemon's
+  // first pass, every offset in state.json still describes the previous
+  // gateway — the ledger below would read as the old, comfortable 100%.
+  // Status never writes (a running daemon owns the state file), so instead of
+  // reconciling it names the situation. Placed ABOVE the connection
+  // early-return on purpose: right after a cutover the new gateway is often
+  // still unreachable, and that is exactly when "these figures describe the
+  // previous gateway" matters most.
+  const stampState = await loadState().catch(() => null);
+  if (stampState && gatewayStampPending(stampState, cfg.gatewayBaseUrl)) {
+    rows.push([
+      "Gateway switch",
+      "pending re-verification — sync figures below still describe the previous gateway",
+    ]);
+  }
 
   // Local sync state remains useful even when the network probe is down: a
   // persisted destination hold should still name the affected org/repo.
